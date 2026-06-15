@@ -1,0 +1,17 @@
+01_soc_clocks extraction report
+================================
+
+Warnings: 0
+Errors  : 0
+
+Action counts:
+  check_only: 1
+  emit_output_clock: 2
+  emit_top_clock: 1
+  emit_virtual_clock: 2
+
+Messages:
+INFO: loaded 2 instances from info_all.xlsx
+INFO: loaded 2 instance sheets from 1 port workbook(s)
+INFO: loaded 2 virtual clock(s) from virtual_clocks.csv
+INFO: wrote 5 clock command(s) to /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo_01_02/01_soc_clocks/common/01_soc_clocks.sdc

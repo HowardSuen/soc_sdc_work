@@ -446,5 +446,7 @@ exception 尽量在 clock、clock timing、clock group、IO 和 interface 之后
 
 ## 4. 相关文档
 
+- [Project Context](00_project_context.md)：当前工作状态、关键决策、脚本状态和新会话接力信息。
 - [Harden SoC Integration SDC Requirements](harden_sdc_requirements.md)：harden/IP 交付给 SoC 使用的 SDC 要求，包括 flatten/normalized 规则和 clock 声明规则。
 - [01_soc_clocks](01_soc_clocks/01_soc_clocks_extraction_rules.md)：`common/01_soc_clocks.sdc` 的提取规则和脚本说明。
+- [02_soc_clock_timing](02_soc_clock_timing/02_soc_clock_timing_form_spec.md)：`02` clock timing budget 表单、生成机制和检查规则。
