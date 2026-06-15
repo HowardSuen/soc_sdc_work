@@ -1,0 +1,4 @@
+clock_name,period,waveform,note
+v_pcie_ref_clk,10.000,{0 5},PCIe external reference clock
+v_gpio_ref_clk,20.000,,GPIO reference
+v_pcie_ref_clk,8.000,,duplicate name with different period - should warn

@@ -1,0 +1,23 @@
+01_soc_clocks extraction report
+================================
+
+Warnings: 2
+Errors  : 1
+
+Action counts:
+  check_only: 1
+  duplicate_top_clock: 1
+  duplicate_virtual_clock: 1
+  emit_output_clock: 2
+  emit_top_clock: 1
+  emit_virtual_clock: 2
+  skipped: 1
+
+Messages:
+INFO: loaded 3 instances from info_all.xlsx
+INFO: loaded 3 instance sheets from 2 port workbook(s)
+INFO: loaded 3 virtual clock(s) from virtual_clocks.csv
+ERROR: harden_c.sdc:7: u_harden_c/clk_gen_c: clock=c_gen: CLOCK_GENERATED_MISSING_SOURCE: generated clock has no parseable -source; fix harden SDC or use create_clock for an independent root clock; command: create_generated_clock -name c_gen [get_ports clk_gen_c]
+WARNING: virtual clock v_pcie_ref_clk: period mismatch 10.000 vs 8.000
+WARNING: top/clk_ref_pad: period mismatch among top clock users: u_harden_a/clk_ref=10.000, u_harden_c/clk_in_c=20.000
+INFO: wrote 5 clock command(s) to /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/01_soc_clocks/regression_test/common/01_soc_clocks.sdc
