@@ -1,0 +1,5 @@
+scenario,group_id,relation_type,group_index,explicit_clocks,auto_added_descendants,excluded_descendants,effective_clocks,review_note
+common,CG_ASYNC_BUS_AUX,asynchronous,1,u_pll_bus_clk_o,,,u_pll_bus_clk_o,
+common,CG_ASYNC_BUS_AUX,asynchronous,2,top_aux_clk_pad,,,top_aux_clk_pad,
+common,CG_ASYNC_CORE_AUX,asynchronous,1,u_pll_core_clk_o,u_fab0_fab_clk_o u_fab1_fab_clk_o u_periph_clk_o,,u_pll_core_clk_o u_fab0_fab_clk_o u_fab1_fab_clk_o u_periph_clk_o,
+common,CG_ASYNC_CORE_AUX,asynchronous,2,top_aux_clk_pad,,,top_aux_clk_pad,

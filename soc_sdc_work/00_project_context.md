@@ -10,10 +10,10 @@
 
 - `01_soc_clocks`：从 harden SoC integration SDC 和集成表单中提取 SoC clock 定义。
 - `02_soc_clock_timing`：从 stage 表单生成 resolved clock timing budget SDC。
+- `03_soc_clock_groups`：已建立 clock relationship / clock group 规则，并实现第一版生成脚本。
 
 后续待展开：
 
-- `03_soc_clock_groups`
 - `04_soc_io_pads`
 - `10_harden_x_if`
 - `20_harden_to_harden_exception`
@@ -44,6 +44,9 @@ harden_sdc_requirements.md
 02_soc_clock_timing/
   02_soc_clock_timing_form_spec.md
   extract_soc_02_clock_timing.py
+03_soc_clock_groups/
+  03_soc_clock_groups_rules.md
+  extract_soc_03_clock_groups.py
 demo_01_02/
   # 01/02 demo 和验证材料
 ```
@@ -186,7 +189,46 @@ Stage 3 特别规则：
 
 其它 stage 暂按 common + scenario 叠加模型规划，但不能依赖 source 顺序覆盖冲突。
 
-## 8. 当前验证状态
+## 8. 03_soc_clock_groups 当前规则
+
+03 只表达 clock relationship，不定义 clock，也不做 path exception。
+
+主要生成：
+
+```tcl
+set_clock_groups -asynchronous
+set_clock_groups -logically_exclusive
+set_clock_groups -physically_exclusive
+```
+
+核心原则：
+
+- 当前 03 采用默认 synchronous + 显式枚举 async/exclusive；未被 clock group 覆盖的 clock pair 仍按默认同步分析。
+- 01 的 `clock_inventory.csv` 可提供 clock genealogy 和候选证据，但不能直接自动生成 clock group。
+- 同 root source 不必然同步，不同 root source 不必然异步。
+- common 03 只放所有 mode 都成立的关系。
+- scenario 03 只追加该 scenario 下才成立的关系。
+- 如果 common group 在某个 scenario 不成立，应下沉到 scenario，而不是靠 scenario 覆盖。
+- async group 必须有架构依据和 CDC/RDC signoff 依据，不能用于消 timing violation。
+- clock mux 互斥关系必须先选方法学：per-scenario view 用 `set_case_analysis` 单腿传播；all-mode/merged view 不打单腿 case，才用 `logically_exclusive`。
+- 同一个 mux/clock pair 不应同时用 `set_case_analysis` 和 `logically_exclusive` 表达同一层互斥语义。
+- group 成员必须按 domain closure 检查：表单中的 clock 作为 seed/member，脚本用 01 genealogy 展开 generated/forwarded descendants，输出 effective group。
+- 不默认依赖工具自动让 generated clock 继承 master 的 group 关系；descendant 若不进入同 group，必须显式排除并说明。
+- `logically_exclusive` 的 descendant 展开要特别 review；mux 汇合点 clock 可能被 01 genealogy 归到单条腿，脚本必须报告并要求人工确认或排除。
+- 03 脚本需要按 `common + 当前 scenario` 建立 assembled-view pair relation map，做跨 rule/跨 scenario 冲突检测。
+- 03 必须输出 coverage report：每个 clock 的 group 参与情况、03 genealogy `tree_root` pair 覆盖情况、未覆盖且仍默认 synchronous 的跨 tree clock pair 清单。01 `root_source` 仅作诊断参考。
+- coverage report 第一版不建模 `set_case_analysis`；被 scenario case 掉的 clock 可能仍显示为 uncovered，后续可结合 pre-setup 过滤。
+- 多个 domain 两两 async/exclusive 时应放在同一条多 group rule；拆成 A/B、A/C 不会自动覆盖 B/C。
+- 03 表单的 group 列应采用可变 `group_<number>_clocks`，脚本自动识别，不固定为 4 组上限。
+
+当前文件：
+
+```text
+03_soc_clock_groups/03_soc_clock_groups_rules.md
+03_soc_clock_groups/extract_soc_03_clock_groups.py
+```
+
+## 9. 当前验证状态
 
 已做过的本地验证：
 
@@ -197,12 +239,12 @@ Stage 3 特别规则：
 - 02 resolve：func 无专属行时使用 common fallback；func 有专属行时只 emit func 胜出行。
 - 02 warnings：virtual/generated/propagated 相关误填均为 warning，不阻断。
 
-## 9. 后续工作建议
+## 10. 后续工作建议
 
 优先顺序建议：
 
 1. 继续 review/固化 `02_soc_clock_timing` 表单字段和脚本边界。
-2. 规划 `03_soc_clock_groups.sdc` 的输入表单和生成机制。
+2. review/固化 `03_soc_clock_groups.sdc` 规则，并讨论 03 表单/脚本机制。
 3. 规划 `04_soc_io_pads.sdc`，明确 delay / drive / load / input transition 的归属和 scenario 拆分。
 4. 再进入 harden interface、exception、feedthrough 等高风险文件。
 
@@ -211,4 +253,3 @@ Stage 3 特别规则：
 - `00_project_context.md`
 - 对应子目录 spec/rules md
 - `soc_sdc_architecture.md` 中的全局约定
-

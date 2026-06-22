@@ -1,0 +1,4 @@
+clock_name,direct_source,producer_object,final_action,source_file
+v_uart_rx,,,emit_virtual_clock,01
+v_uart_tx,,,emit_virtual_clock,01
+dqs_clk,,,emit_virtual_clock,01

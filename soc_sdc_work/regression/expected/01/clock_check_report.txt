@@ -1,0 +1,18 @@
+01_soc_clocks extraction report
+================================
+
+Warnings: 1
+Errors  : 0
+
+Action counts:
+  check_only: 3
+  emit_output_clock: 5
+  emit_top_clock: 3
+  emit_virtual_clock: 2
+
+Messages:
+INFO: loaded 4 instances from info_all.xlsx
+INFO: loaded 4 instance sheets from 2 port workbook(s)
+INFO: loaded 2 virtual clock(s) from virtual_clocks.csv
+WARNING: periph.sdc:3: u_periph/scan_mode_clk: clock=scan_clk: CLOCK_TEST_LIKE_NAME_REVIEW: clock name/port contains test-like token(s) scan; clock is not skipped, review scenario ownership; command: create_clock -name scan_clk -period 50.000 [get_ports scan_mode_clk]
+INFO: wrote 10 clock command(s) to <WORK>/01_soc_clocks/common/01_soc_clocks.sdc
