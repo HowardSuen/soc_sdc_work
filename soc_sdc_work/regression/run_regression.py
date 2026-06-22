@@ -27,9 +27,9 @@ from openpyxl import load_workbook
 
 BASE = Path(__file__).resolve().parent
 SOC = BASE.parent
-EX01 = SOC / "01_soc_clocks" / "extract_soc_01_clocks.py"
-EX02 = SOC / "02_soc_clock_timing" / "extract_soc_02_clock_timing.py"
-EX03 = SOC / "03_soc_clock_groups" / "extract_soc_03_clock_groups.py"
+EX01 = SOC / "01_soc_clocks" / "01_extract_soc_clocks.py"
+EX02 = SOC / "02_soc_clock_timing" / "02_extract_soc_clock_timing.py"
+EX03 = SOC / "03_soc_clock_groups" / "03_extract_soc_clock_groups.py"
 WORK = BASE / "work"
 EXP = BASE / "expected"
 ART = WORK / "artifacts"

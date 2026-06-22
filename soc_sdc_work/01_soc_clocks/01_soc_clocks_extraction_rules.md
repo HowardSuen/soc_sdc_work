@@ -347,7 +347,7 @@ u_harden_c_clk_o, u_harden_c/clk_i, u_harden_a/clk_pll
 第一版脚本入口：
 
 ```bash
-python3 /path/to/soc_sdc_work/01_soc_clocks/extract_soc_01_clocks.py
+python3 /path/to/soc_sdc_work/01_soc_clocks/01_extract_soc_clocks.py
 ```
 
 默认从执行目录读取：

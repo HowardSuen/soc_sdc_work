@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build minimal regression inputs for extract_soc_01_clocks.py."""
+"""Build minimal regression inputs for 01_extract_soc_clocks.py."""
 import pandas as pd
 
 REQ_COLS = [

@@ -117,17 +117,17 @@ scenarios/func_clock_timing_<stage>_<corner>.sdc
 ```text
 01_soc_clocks/
   01_soc_clocks_extraction_rules.md
-  extract_soc_01_clocks.py
+  01_extract_soc_clocks.py
 
 02_soc_clock_timing/
   02_soc_clock_timing_form_spec.md
-  extract_soc_02_clock_timing.py
+  02_extract_soc_clock_timing.py
   02_soc_clock_timing_budget_prects_demo.xlsx
   02_soc_clock_timing_budget_postcts_demo.xlsx
 
 03_soc_clock_groups/
   03_soc_clock_groups_rules.md
-  extract_soc_03_clock_groups.py
+  03_extract_soc_clock_groups.py
 
 04_soc_io_pads/
   04_soc_io_pads_rules.md

@@ -40,13 +40,13 @@ soc_sdc_architecture.md
 harden_sdc_requirements.md
 01_soc_clocks/
   01_soc_clocks_extraction_rules.md
-  extract_soc_01_clocks.py
+  01_extract_soc_clocks.py
 02_soc_clock_timing/
   02_soc_clock_timing_form_spec.md
-  extract_soc_02_clock_timing.py
+  02_extract_soc_clock_timing.py
 03_soc_clock_groups/
   03_soc_clock_groups_rules.md
-  extract_soc_03_clock_groups.py
+  03_extract_soc_clock_groups.py
 demo_01_02/
   # 01/02 demo 和验证材料
 ```
@@ -103,7 +103,7 @@ clock 声明建议：
 脚本：
 
 ```bash
-python3 01_soc_clocks/extract_soc_01_clocks.py
+python3 01_soc_clocks/01_extract_soc_clocks.py
 ```
 
 已实现的关键防护：
@@ -134,7 +134,7 @@ python3 01_soc_clocks/extract_soc_01_clocks.py
 脚本按三维选择生成：
 
 ```bash
-python3 02_soc_clock_timing/extract_soc_02_clock_timing.py \
+python3 02_soc_clock_timing/02_extract_soc_clock_timing.py \
   -scenario func \
   -stage prects \
   -corner ss_125
@@ -225,7 +225,7 @@ set_clock_groups -physically_exclusive
 
 ```text
 03_soc_clock_groups/03_soc_clock_groups_rules.md
-03_soc_clock_groups/extract_soc_03_clock_groups.py
+03_soc_clock_groups/03_extract_soc_clock_groups.py
 ```
 
 ## 9. 当前验证状态

@@ -254,9 +254,9 @@ set_timing_derate -data -late 1.07
 脚本必须支持 `-scenario`、`-stage` 和 `-corner`，用于确认当前执行环境要处理的 scenario、timing stage 和 corner / analysis view：
 
 ```bash
-python3 extract_soc_02_clock_timing.py -scenario common -stage prects -corner ss_125
-python3 extract_soc_02_clock_timing.py -scenario func   -stage prects -corner ss_125
-python3 extract_soc_02_clock_timing.py -scenario scan   -stage postcts -corner ff_m40
+python3 02_extract_soc_clock_timing.py -scenario common -stage prects -corner ss_125
+python3 02_extract_soc_clock_timing.py -scenario func   -stage prects -corner ss_125
+python3 02_extract_soc_clock_timing.py -scenario scan   -stage postcts -corner ff_m40
 ```
 
 `-scenario` 合法值建议为：

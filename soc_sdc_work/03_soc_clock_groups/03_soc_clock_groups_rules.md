@@ -315,8 +315,8 @@ note
 第一版脚本：
 
 ```bash
-python3 extract_soc_03_clock_groups.py -scenario common
-python3 extract_soc_03_clock_groups.py -scenario func
+python3 03_extract_soc_clock_groups.py -scenario common
+python3 03_extract_soc_clock_groups.py -scenario func
 ```
 
 选项：
