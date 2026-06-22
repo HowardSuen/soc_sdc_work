@@ -11,11 +11,11 @@
 - `01_soc_clocks`：从 harden SoC integration SDC 和集成表单中提取 SoC clock 定义。
 - `02_soc_clock_timing`：从 stage 表单生成 resolved clock timing budget SDC。
 - `03_soc_clock_groups`：已建立 clock relationship / clock group 规则，并实现第一版生成脚本。
+- `04_soc_io_pads`：已建立 IO/pad 约束归集规则，并实现第一版生成脚本。
+- `10_harden_x_if`：已建立 harden/subsys interface channel budget 规则，并实现第一版生成脚本。
 
 后续待展开：
 
-- `04_soc_io_pads`
-- `10_harden_x_if`
 - `20_harden_to_harden_exception`
 - `30_feedthrough`
 
@@ -47,6 +47,12 @@ harden_sdc_requirements.md
 03_soc_clock_groups/
   03_soc_clock_groups_rules.md
   03_extract_soc_clock_groups.py
+04_soc_io_pads/
+  04_soc_io_pads_rules.md
+  04_extract_soc_io_pads.py
+10_harden_x_if/
+  10_harden_x_if_rules.md
+  10_extract_harden_x_if.py
 demo_01_02/
   # 01/02 demo 和验证材料
 ```
@@ -228,7 +234,29 @@ set_clock_groups -physically_exclusive
 03_soc_clock_groups/03_extract_soc_clock_groups.py
 ```
 
-## 9. 当前验证状态
+## 9. 10_harden_x_if 当前规则
+
+10 表达 SoC 视角下 harden/subsys 边界的普通 interface timing budget。
+
+核心原则：
+
+- 10 不按 SDC 命令名字划分，而按约束意图划分；普通 interface budget 归 10，exception 性质的语义改写归 20。
+- 10 不是逐条 SDC 转换，而是按集成表单建立 interface channel 后归并生成。
+- harden input 的 `-from` 和 harden output 的 `-to` 优先从集成表单推断。
+- 第一版 10 只生成 reviewed `set_max_delay` / `set_min_delay`，不直接生成 instance pin 上的 `set_input_delay` / `set_output_delay`。
+- 10 生成的 max/min 是 boundary-to-boundary channel datapath budget，不是常规 clock-relative input/output delay 的等价替换。
+- 只有 `budget_model = interconnect_budget` 或 reviewer 重新推导/人工给出 `converted_max` 时，才允许生成；同一 channel 两端 interconnect max 不一致时取更紧值 `min(all_available_max_candidates)`。
+- `set_min_delay` 需要 min/sign 语义 review 后才能 emit；若两端 min 已归一为同一语义，取更紧的 `max(all_reviewed_normalized_min_candidates)`。
+- 若可见 netlist/timing model 已让普通 STA 覆盖 reg-to-reg path，10 默认不额外生成 `set_max_delay -datapath_only`。
+- 接 SoC top pad 的约束归 04；clock 相关归 01/02/03；exception 归 20；feedthrough 归 30。
+
+当前文件：
+
+```text
+10_harden_x_if/10_harden_x_if_rules.md
+```
+
+## 10. 当前验证状态
 
 已做过的本地验证：
 
@@ -238,15 +266,15 @@ set_clock_groups -physically_exclusive
 - 02 scenario/stage/corner 输出：common 和 func 输出路径分离。
 - 02 resolve：func 无专属行时使用 common fallback；func 有专属行时只 emit func 胜出行。
 - 02 warnings：virtual/generated/propagated 相关误填均为 warning，不阻断。
+- 03/04 脚本已通过对应 regression；10 脚本已通过语法检查，并用最小 demo 验证过缺表创建、review 阻断和 approved 后生成 `set_max_delay`。
 
-## 10. 后续工作建议
+## 11. 后续工作建议
 
 优先顺序建议：
 
-1. 继续 review/固化 `02_soc_clock_timing` 表单字段和脚本边界。
-2. review/固化 `03_soc_clock_groups.sdc` 规则，并讨论 03 表单/脚本机制。
-3. 规划 `04_soc_io_pads.sdc`，明确 delay / drive / load / input transition 的归属和 scenario 拆分。
-4. 再进入 harden interface、exception、feedthrough 等高风险文件。
+1. review/固化 `10_harden_x_if.sdc` 的 channel 表单字段和脚本机制。
+2. 再进入 `20_harden_to_harden_exception.sdc` 和 `30_feedthrough.sdc` 等高风险文件。
+3. 后续按项目反馈继续收敛 01/02/03/04 脚本检查项。
 
 每次重要规则变更后，应同步更新：
 
