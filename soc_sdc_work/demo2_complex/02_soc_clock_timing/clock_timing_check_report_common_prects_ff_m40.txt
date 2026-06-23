@@ -1,0 +1,17 @@
+02_soc_clock_timing extraction report
+=====================================
+
+Scenario: common
+Stage   : prects
+Corner  : ff_m40
+Form    : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/02_soc_clock_timing_budget_prects.xlsx
+Output  : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/common/02_soc_clock_timing_prects_ff_m40.sdc
+Warnings: 1
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 10 active clock(s) from /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/../01_soc_clocks/clock_inventory.csv
+WARNING: clock_budget row 23 v_ddr_ref: clock_kind=virtual_clock has no physical clock network; review filled columns: network_latency_late
+INFO: resolved 10 winning clock_budget row(s) for scenario=common, stage=prects, corner=ff_m40
+INFO: wrote SDC: /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/common/02_soc_clock_timing_prects_ff_m40.sdc

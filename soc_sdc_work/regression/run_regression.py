@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-One-shot regression for the SoC SDC 01 -> 02 -> 03 chain.
+One-shot regression for the SoC SDC 01 -> 02 -> 03 -> 04 -> 10 chain.
 
 Layout (recreated under work/ each run):
   work/01_soc_clocks/        run 01, produce clock_inventory.csv + 01 sdc
   work/02_soc_clock_timing/  fill budgets, run 02 across stage/scenario/corner
   work/03_soc_clock_groups/  fill rules, run 03 + coverage
+  work/04_soc_io_pads/       extract/review IO pad constraints and generate 04
+  work/10_harden_x_if/       extract/review interface budgets and generate 10
 
 It collects deterministic TEXT artifacts (sdc / csv / normalized reports /
 coverage extracts) into work/artifacts and diffs them against expected/.
@@ -30,6 +32,8 @@ SOC = BASE.parent
 EX01 = SOC / "01_soc_clocks" / "01_extract_soc_clocks.py"
 EX02 = SOC / "02_soc_clock_timing" / "02_extract_soc_clock_timing.py"
 EX03 = SOC / "03_soc_clock_groups" / "03_extract_soc_clock_groups.py"
+EX04 = SOC / "04_soc_io_pads" / "04_extract_soc_io_pads.py"
+EX10 = SOC / "10_harden_x_if" / "10_extract_harden_x_if.py"
 WORK = BASE / "work"
 EXP = BASE / "expected"
 ART = WORK / "artifacts"
@@ -99,7 +103,10 @@ def run_01(d: Path):
     (d / "virtual_clocks.csv").write_text(
         "clock_name,period,waveform,note\n"
         "v_ddr_ref,2.500,,DDR external reference\n"
-        "v_pcie_ref,10.000,{0 5},PCIe external reference\n")
+        "v_pcie_ref,10.000,{0 5},PCIe external reference\n"
+        "v_uart_rx,20.000,,UART RX board reference\n"
+        "v_uart_tx,20.000,,UART TX board reference\n"
+        "dqs_clk,2.500,,DDR DQS source-sync reference\n")
 
     r = sh([str(EX01)], cwd=d)
     assert r.returncode == 0, f"01 failed:\n{r.stdout}\n{r.stderr}"
@@ -223,6 +230,187 @@ def run_03(d: Path):
 
 
 # ----------------------------------------------------------------------------
+# 04: IO/pad extraction + reviewed common/scenario/view-specific generation
+# ----------------------------------------------------------------------------
+def build_04_inputs(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        {"inst_name": "u_io", "module_name": "io_ring", "owner": "carol", "sdc_path": "u_io.sdc"},
+    ]).to_excel(d / "info_all.xlsx", index=False)
+
+    with pd.ExcelWriter(d / "ports_u_io.xlsx", engine="xlsxwriter") as w:
+        port_sheet([
+            {
+                "Input": "uart0_sin", "Input Width": 1, "From Whom": "top.pad_uart0_sin",
+                "Output": "uart0_sout", "Output Width": 1, "To Top": "top.pad_uart0_sout",
+                "Inout": "gpio0", "Inout Width": 1, "Inout Connectivity": "top.pad_gpio0",
+            },
+            {"Output": "ddr_dqs", "Output Width": 1, "To Top": "top.pad_ddr_dqs"},
+        ]).to_excel(w, sheet_name="u_io", index=False)
+
+    (d / "u_io.sdc").write_text(
+        "# lower-level io_ring SDC (block signoff env)\n"
+        "set_input_delay -clock [get_clocks v_uart_rx] -max 5.0 [get_ports uart0_sin]\n"
+        "set_input_transition 0.2 [get_ports uart0_sin]\n"
+        "set_driving_cell -lib_cell BUFX2 -pin Y [get_ports uart0_sin]\n"
+        "set_output_delay -clock [get_clocks v_uart_tx] -max 4.0 [get_ports uart0_sout]\n"
+        "set_load 0.05 [get_ports uart0_sout]\n"
+        "set_input_delay -clock [get_clocks v_uart_rx] -max 3.0 [get_ports gpio0]\n",
+        encoding="utf-8",
+    )
+
+
+def fill_04_form(form: Path):
+    wb = load_workbook(form)
+    ws = wb["io_constraints"]
+    col = {cell.value: cell.column for cell in ws[1]}
+
+    def setc(row, **kv):
+        for k, v in kv.items():
+            ws.cell(row=row, column=col[k], value=v)
+
+    for r in range(2, ws.max_row + 1):
+        pad = ws.cell(r, col["pad_name"]).value
+        ctype = ws.cell(r, col["constraint_type"]).value
+        if not pad or not ctype:
+            continue
+        if pad == "pad_uart0_sin" and ctype == "input_delay":
+            setc(r, apply="yes", review_status="approved", timing_class="async", basis="UART RX board budget")
+        elif pad == "pad_uart0_sin" and ctype == "input_transition":
+            setc(r, apply="yes", review_status="approved", basis="IO spec input slew")
+        elif pad == "pad_uart0_sin" and ctype == "driving_cell":
+            setc(r, apply="no", review_status="rejected", note="rejected: input_transition used instead")
+        elif pad == "pad_uart0_sout" and ctype == "output_delay":
+            setc(r, apply="yes", review_status="approved", timing_class="async", basis="UART TX board budget")
+        elif pad == "pad_uart0_sout" and ctype == "load":
+            setc(r, apply="yes", review_status="approved", basis="package + PCB load")
+        elif pad == "pad_gpio0" and ctype == "input_delay":
+            setc(r, scenario="gpio_in", apply="yes", review_status="approved",
+                 timing_class="timed", basis="GPIO input direction budget")
+
+    # Add one view-specific electrical constraint on a pad that has no all/all load.
+    new_row = ws.max_row + 1
+    manual = {
+        "scenario": "common",
+        "stage": "prects",
+        "corner": "ss_125",
+        "pad_name": "pad_ddr_dqs",
+        "soc_object": "pad_ddr_dqs",
+        "subsys_instance": "u_io",
+        "subsys_port": "ddr_dqs",
+        "direction": "output",
+        "timing_class": "timed",
+        "constraint_type": "load",
+        "value": "0.03",
+        "object_granularity": "single_port",
+        "unit_cap": "pF",
+        "source_type": "manual",
+        "apply": "yes",
+        "review_status": "approved",
+        "owner": "carol",
+        "basis": "pre-CTS board/package estimate",
+    }
+    for key, value in manual.items():
+        ws.cell(new_row, col[key], value)
+    wb.save(form)
+
+
+def run_04(d: Path):
+    build_04_inputs(d)
+    first = sh([str(EX04), "-scenario", "common", "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+    assert first.returncode == 1, f"04 first run should stop for review:\n{first.stdout}\n{first.stderr}"
+    fill_04_form(d / "04_soc_io_pads.xlsx")
+    for args in (
+        ["-scenario", "common"],
+        ["-scenario", "gpio_in"],
+        ["-scenario", "common", "-stage", "prects", "-corner", "ss_125"],
+    ):
+        r = sh([str(EX04), *args, "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+        assert r.returncode == 0, f"04 {' '.join(args)} failed:\n{r.stdout}\n{r.stderr}"
+
+
+# ----------------------------------------------------------------------------
+# 10: harden/subsys interface budget extraction + auto-resolve + blocking checks
+# ----------------------------------------------------------------------------
+def build_10_inputs(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        {"inst_name": "u_a", "module_name": "harden_a", "owner": "dave", "sdc_path": "u_a.sdc"},
+        {"inst_name": "u_b", "module_name": "harden_b", "owner": "erin", "sdc_path": "u_b.sdc"},
+    ]).to_excel(d / "info_all.xlsx", index=False)
+
+    with pd.ExcelWriter(d / "ports.xlsx", engine="xlsxwriter") as w:
+        port_sheet([
+            {"Input": "clk_i", "From Whom": "top.sys_clk_pad", "Output": "data_o", "To Top": "fabric_bus"},
+        ]).to_excel(w, sheet_name="u_a", index=False)
+        port_sheet([
+            {"Input": "data_i", "From Whom": "u_a.data_o"},
+        ]).to_excel(w, sheet_name="u_b", index=False)
+
+    (d / "u_a.sdc").write_text(
+        "set_output_delay -max 1.5 -min -0.1 -clock [get_clocks u_pll_core_clk_o] [get_ports data_o]\n",
+        encoding="utf-8",
+    )
+    (d / "u_b.sdc").write_text(
+        "set_input_delay -max 1.2 -clock [get_clocks u_pll_core_clk_o] [get_ports data_i]\n",
+        encoding="utf-8",
+    )
+
+
+def approve_10(form: Path, async_relation: bool = False):
+    wb = load_workbook(form)
+    ws = wb["interface_budget"]
+    col = {cell.value: cell.column for cell in ws[1]}
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(r, col["channel_id"]).value != "CH_u_a_data_o__u_b_data_i":
+            continue
+        updates = {
+            "timing_model": "lib_blackbox",
+            "budget_required": "yes",
+            "budget_model": "interconnect_budget",
+            "converted_max": "",
+            "max_source": "",
+            "derivation_basis": "",
+            "tool_surface": "sta",
+            "datapath_only": "yes",
+            "budget_basis": "interconnect budget from block owners",
+            "apply": "yes",
+            "emit_max": "yes",
+            "emit_min": "no",
+            "review_status": "approved",
+            "clock_relation": "async" if async_relation else "",
+            "relationship_override_basis": "",
+        }
+        for key, value in updates.items():
+            ws.cell(r, col[key], value)
+        break
+    else:
+        raise AssertionError("10 target channel not found")
+    wb.save(form)
+
+
+def run_10(d: Path):
+    build_10_inputs(d)
+    first = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+    assert first.returncode == 1, f"10 first run should stop for review:\n{first.stdout}\n{first.stderr}"
+    approve_10(d / "10_harden_x_if.xlsx")
+    r = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv", "--max-diff-threshold", "0.1"], cwd=d)
+    assert r.returncode == 0, f"10 normal generation failed:\n{r.stdout}\n{r.stderr}"
+
+    # Confirm async/exclusive gating in the same complex case without keeping its errored report.
+    normal_report = (d / "harden_x_if_check_report_common_all_all.txt").read_text()
+    normal_sdc = (d / "common/10_harden_x_if.sdc").read_text()
+    approve_10(d / "10_harden_x_if.xlsx", async_relation=True)
+    bad = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+    assert bad.returncode == 1, "10 async relation should block generation"
+    assert "clock_relation=async blocks normal 10 budget" in (d / "harden_x_if_check_report_common_all_all.txt").read_text()
+
+    # Restore the successful artifacts for deterministic collection.
+    (d / "harden_x_if_check_report_common_all_all.txt").write_text(normal_report, encoding="utf-8")
+    (d / "common/10_harden_x_if.sdc").write_text(normal_sdc, encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
 # artifact collection + normalization
 # ----------------------------------------------------------------------------
 def norm(text: str) -> str:
@@ -252,7 +440,7 @@ def collect(name: str, text: str):
     p.write_text(text, encoding="utf-8")
 
 
-def collect_artifacts(w01, w02, w03):
+def collect_artifacts(w01, w02, w03, w04, w10):
     if ART.exists():
         shutil.rmtree(ART)
     ART.mkdir(parents=True)
@@ -284,6 +472,23 @@ def collect_artifacts(w01, w02, w03):
     collect("03/cov_participation.csv", xlsx_sheet_to_csv(
         cov, "clock_participation",
         ["clock_name", "clock_kind", "tree_root", "root_source", "direct_source", "final_action", "group_count"]))
+    # 04
+    for rel in [
+        "common/04_soc_io_pads.sdc",
+        "common/04_soc_io_pads_prects_ss_125.sdc",
+        "scenarios/gpio_in_io_pads.sdc",
+    ]:
+        collect(f"04/{rel}", (w04 / rel).read_text())
+    for rep in [
+        "io_pad_check_report_common_all_all.txt",
+        "io_pad_check_report_common_prects_ss_125.txt",
+        "io_pad_check_report_gpio_in_all_all.txt",
+    ]:
+        collect(f"04/{rep}", norm((w04 / rep).read_text()))
+    # 10
+    collect("10/common/10_harden_x_if.sdc", (w10 / "common/10_harden_x_if.sdc").read_text())
+    collect("10/harden_x_if_check_report_common_all_all.txt",
+            norm((w10 / "harden_x_if_check_report_common_all_all.txt").read_text()))
 
 
 # ----------------------------------------------------------------------------
@@ -318,13 +523,19 @@ def main():
 
     if WORK.exists():
         shutil.rmtree(WORK)
-    w01, w02, w03 = WORK / "01_soc_clocks", WORK / "02_soc_clock_timing", WORK / "03_soc_clock_groups"
+    w01 = WORK / "01_soc_clocks"
+    w02 = WORK / "02_soc_clock_timing"
+    w03 = WORK / "03_soc_clock_groups"
+    w04 = WORK / "04_soc_io_pads"
+    w10 = WORK / "10_harden_x_if"
 
     run_01(w01)
     clocks = active_clocks(w01 / "clock_inventory.csv")
     run_02(w02, w01 / "clock_inventory.csv", clocks)
     run_03(w03)
-    collect_artifacts(w01, w02, w03)
+    run_04(w04)
+    run_10(w10)
+    collect_artifacts(w01, w02, w03, w04, w10)
 
     art_files, _ = compare()
 
@@ -338,7 +549,7 @@ def main():
         return 0
 
     _, fails = compare()
-    print(f"01->02->03 regression: {len(art_files)} artifact(s) checked")
+    print(f"01->02->03->04->10 regression: {len(art_files)} artifact(s) checked")
     if not fails:
         print("RESULT: PASS (all artifacts match expected/)")
         return 0

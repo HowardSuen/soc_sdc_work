@@ -11,6 +11,6 @@ Errors  : 0
 Sync changed: no
 
 Messages:
-INFO: loaded 10 active clock(s) from <WORK>/02_soc_clock_timing/../01_soc_clocks/clock_inventory.csv
-INFO: resolved 10 winning clock_budget row(s) for scenario=common, stage=postcts, corner=ss_125
+INFO: loaded 13 active clock(s) from <WORK>/02_soc_clock_timing/../01_soc_clocks/clock_inventory.csv
+INFO: resolved 13 winning clock_budget row(s) for scenario=common, stage=postcts, corner=ss_125
 INFO: wrote SDC: <WORK>/02_soc_clock_timing/common/02_soc_clock_timing_postcts_ss_125.sdc

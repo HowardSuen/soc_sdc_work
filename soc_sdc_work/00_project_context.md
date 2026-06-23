@@ -13,11 +13,12 @@
 - `03_soc_clock_groups`：已建立 clock relationship / clock group 规则，并实现第一版生成脚本。
 - `04_soc_io_pads`：已建立 IO/pad 约束归集规则，并实现第一版生成脚本。
 - `10_harden_x_if`：已建立 harden/subsys interface channel budget 规则，并实现第一版生成脚本。
+- `20_harden_to_harden_exception`：已建立 harden-to-harden exception 规则草案，待后续脚本实现。
+- `30_feedthrough`：已记录项目 feedthrough port 命名/识别规则草案，待后续完整展开。
 
 后续待展开：
 
-- `20_harden_to_harden_exception`
-- `30_feedthrough`
+- `30_feedthrough` 完整 SDC 生成规则和脚本
 
 ## 2. 仓库和目录
 
@@ -53,6 +54,10 @@ harden_sdc_requirements.md
 10_harden_x_if/
   10_harden_x_if_rules.md
   10_extract_harden_x_if.py
+20_harden_to_harden_exception/
+  20_harden_to_harden_exception_rules.md
+30_feedthrough/
+  30_feedthrough_rules.md
 demo_01_02/
   # 01/02 demo 和验证材料
 ```
@@ -256,7 +261,58 @@ set_clock_groups -physically_exclusive
 10_harden_x_if/10_harden_x_if_rules.md
 ```
 
-## 10. 当前验证状态
+## 10. 20_harden_to_harden_exception 当前规则草案
+
+20 表达 harden/subsys 之间的 path-level exception / override，不表达普通 interface budget。
+
+核心原则：
+
+- 20 的判断依据是约束意图，不是命令名字；`set_max_delay` / `set_min_delay` 若表达普通 boundary budget 归 10，若表达 exception/override 语义才归 20。
+- harden port 上没有 `set_input_delay` / `set_output_delay` 只是候选信号，不是自动生成 20 exception 的充分条件。
+- 一条 path 进入 20，需要同时满足：没有普通 10 timing budget 语义、有明确 exception/override 语义、有可审查依据。
+- 20 应参考集成表单、harden SDC port timing/exception 证据、10 channel inventory/budget 状态、03 clock relationship 和人工协议/架构信息。
+- 20 不替代 03；整个 clock domain 的 async/exclusive 关系优先放 03，20 只表达更窄的 path-level exception。
+- 20 必须是 object-level exception；clock-to-clock 约束归 03，不应在 20 中直接用 `[get_clocks ...]`。
+- 03 async 与 20 `set_false_path` 通常冗余；但 03 async 与 20 `set_max_delay -datapath_only` 可以是 CDC/handshake 建模的互补关系。
+- 单独的 `set_max_delay -datapath_only` 不会去掉常规 setup/hold；异步路径通常需要 03 async/exclusive 或其它 CDC clock relation 配套。
+- CDC/异步 handshake 的传播窗口约束通常使用 `set_max_delay -datapath_only` 与 `set_min_delay -datapath_only` 成对表达；同 clock / related clock 的功能性 override 默认不使用 `-datapath_only`。
+- 03 async 与 20 max/min 是否能同时生效必须用目标 STA 工具验证；若 `set_clock_groups -asynchronous` 遮蔽 path-level max/min，需要采用项目确认的等效写法。
+- 20 不替代 10；同一 assembled view 中同一路径的 active 10 普通 budget 与 20 exception 不能在同一 check 维度上冲突。active 10 要按 10 `interface_budget` 中 apply/approved/emit/value 的实际生成状态判断，不是只看 channel 是否存在。
+- 10/20 overlap 要按 check 维度判断；10 max 与 20 min 可以带依据共存，10 max 与 20 max 或 false_path 覆盖才是冲突。
+- 跨 clock multicycle 必须明确 `-start` / `-end` 参照、周期比、边沿关系和 hold 推导；multicycle 默认要求 setup/hold 成对。
+- 经过 feedthrough harden 的多跳路径必须先由 30 建模，20 只在明确 through/related_30 锚点后追加 exception。
+- 同一路径多个 exception 不能依赖工具 priority 静默裁决；false path、max/min、multicycle overlap 必须拆分或报错。
+- reset false path 必须说明 recovery/removal 如何另行保证。
+- common 20 只放所有 mode 都成立的 exception；scan/mbist/test/gpio/case-dependent exception 下沉 scenario。
+- 第一版脚本应保守：只归集 candidate，approved 规则才生成，不能自动把 missing timing candidate 提升为 exception。
+
+当前文件：
+
+```text
+20_harden_to_harden_exception/20_harden_to_harden_exception_rules.md
+```
+
+## 11. 30_feedthrough 当前规则草案
+
+30 当前先记录项目 feedthrough port 命名和识别规则，用于后续脚本筛选 harden 内部 feedthrough ports。
+
+核心原则：
+
+- feedthrough input 使用 `fti_` 前缀，feedthrough output 使用 `fto_` 前缀。
+- 单 hop 示例：`fti_mmn2gms_req_xxx` / `fto_mmn2gms_req_xxx`。
+- 多 hop 示例：`fti_0_mmn2gms_req_xxx` / `fto_0_mmn2gms_req_xxx`，`fti_1_mmn2gms_req_xxx` / `fto_1_mmn2gms_req_xxx`。
+- index 按每条 end-to-end feedthrough 链路、每个方向独立计数，从第一个接收 feedthrough 信号的 harden 开始从 0 递增。
+- req/resp 反向路径各自独立编号；同一个 harden 在不同方向链路中的 index 可能不同。
+- 同一 harden 内通过 `(index, base)` 配对 `fti` / `fto`。
+- 20 若经过 feedthrough harden，必须引用 30 的 feedthrough 记录，并用 `through_collection` 锚定穿通段。
+
+当前文件：
+
+```text
+30_feedthrough/30_feedthrough_rules.md
+```
+
+## 12. 当前验证状态
 
 已做过的本地验证：
 
@@ -266,14 +322,14 @@ set_clock_groups -physically_exclusive
 - 02 scenario/stage/corner 输出：common 和 func 输出路径分离。
 - 02 resolve：func 无专属行时使用 common fallback；func 有专属行时只 emit func 胜出行。
 - 02 warnings：virtual/generated/propagated 相关误填均为 warning，不阻断。
-- 03/04 脚本已通过对应 regression；10 脚本已通过语法检查，并用最小 demo 验证过缺表创建、review 阻断和 approved 后生成 `set_max_delay`。
+- 01->02->03->04->10 complex regression 已串联通过：覆盖 clock 提取、clock timing budget、clock group、IO pad common/scenario/view-specific、10 interface auto-resolve、harden_to_fabric coverage 和 async 阻断。
 
-## 11. 后续工作建议
+## 13. 后续工作建议
 
 优先顺序建议：
 
-1. review/固化 `10_harden_x_if.sdc` 的 channel 表单字段和脚本机制。
-2. 再进入 `20_harden_to_harden_exception.sdc` 和 `30_feedthrough.sdc` 等高风险文件。
+1. 进入 `30_feedthrough.sdc` 等剩余高风险文件的规则规划。
+2. 后续将 20/30 纳入同一套 complex regression。
 3. 后续按项目反馈继续收敛 01/02/03/04 脚本检查项。
 
 每次重要规则变更后，应同步更新：

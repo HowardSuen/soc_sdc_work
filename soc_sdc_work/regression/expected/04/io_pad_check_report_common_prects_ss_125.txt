@@ -1,0 +1,35 @@
+04_soc_io_pads extraction report
+================================
+
+Scenario: common
+Stage   : prects
+Corner  : ss_125
+Tool    : sta
+Form    : <WORK>/04_soc_io_pads/04_soc_io_pads.xlsx
+Output  : <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
+Warnings: 2
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 1 instance(s) from info_all.xlsx
+INFO: loaded 1 instance port sheet(s) from 1 workbook(s)
+INFO: extracted 6 IO/pad candidate(s) from u_io.sdc
+INFO: loaded 13 clock(s) from <WORK>/01_soc_clocks/clock_inventory.csv
+WARNING: io_constraints row 3 pad_uart0_sin: input_transition is view-independent; confirm external electrical environment is shared by all stage/corner views
+WARNING: io_constraints row 6 pad_uart0_sout: load is view-independent; confirm external electrical environment is shared by all stage/corner views
+INFO: wrote <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
+
+Coverage:
+  inventory pads        : 4
+  assembled approved row: 5
+  emitted approved row  : 1
+
+  Per-pad assembled status:
+    pad_uart0_sin: dir=input class=async constraints=input_delay, input_transition sources=common/all/all
+    pad_uart0_sout: dir=output class=async constraints=load, output_delay sources=common/all/all
+    pad_ddr_dqs: dir=output class=timed constraints=load sources=common/prects/ss_125
+    pad_gpio0: dir=inout class=class-unset constraints=NO_APPROVED_CONSTRAINT sources=-
+
+  Extracted rows not emitted for this output:
+    <none>

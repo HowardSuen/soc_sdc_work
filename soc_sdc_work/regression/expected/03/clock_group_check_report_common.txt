@@ -11,7 +11,7 @@ Errors  : 0
 Sync changed: no
 
 Messages:
-INFO: loaded 10 active clock(s) from <WORK>/03_soc_clock_groups/../01_soc_clocks/clock_inventory.csv
+INFO: loaded 13 active clock(s) from <WORK>/03_soc_clock_groups/../01_soc_clocks/clock_inventory.csv
 INFO: clock_group_rules row 5 CG_ASYNC_CORE_AUX: group_1 auto-added descendant clock(s): u_fab0_fab_clk_o, u_fab1_fab_clk_o, u_periph_clk_o
 INFO: loaded 2 clock_group_rules row(s); 2 active row(s) in assembled view
 INFO: wrote coverage report: <WORK>/03_soc_clock_groups/clock_group_coverage_report_common.xlsx

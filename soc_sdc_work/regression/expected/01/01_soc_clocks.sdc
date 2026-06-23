@@ -11,6 +11,18 @@ create_clock -name v_ddr_ref -period 2.500
 # Note: PCIe external reference
 create_clock -name v_pcie_ref -period 10.000 -waveform {0 5}
 
+# virtual clock v_uart_rx from virtual_clocks.csv
+# Note: UART RX board reference
+create_clock -name v_uart_rx -period 20.000
+
+# virtual clock v_uart_tx from virtual_clocks.csv
+# Note: UART TX board reference
+create_clock -name v_uart_tx -period 20.000
+
+# virtual clock dqs_clk from virtual_clocks.csv
+# Note: DDR DQS source-sync reference
+create_clock -name dqs_clk -period 2.500
+
 # u_fab0/fab_clk_o from fab.sdc
 create_generated_clock -name u_fab0_fab_clk_o -source [get_pins {u_fab0/fab_clk_i}] -combinational [get_pins {u_fab0/fab_clk_o}]
 

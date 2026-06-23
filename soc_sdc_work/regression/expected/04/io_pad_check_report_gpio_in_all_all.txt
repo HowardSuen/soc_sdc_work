@@ -1,0 +1,36 @@
+04_soc_io_pads extraction report
+================================
+
+Scenario: gpio_in
+Stage   : all
+Corner  : all
+Tool    : sta
+Form    : <WORK>/04_soc_io_pads/04_soc_io_pads.xlsx
+Output  : <WORK>/04_soc_io_pads/scenarios/gpio_in_io_pads.sdc
+Warnings: 3
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 1 instance(s) from info_all.xlsx
+INFO: loaded 1 instance port sheet(s) from 1 workbook(s)
+INFO: extracted 6 IO/pad candidate(s) from u_io.sdc
+INFO: loaded 13 clock(s) from <WORK>/01_soc_clocks/clock_inventory.csv
+WARNING: io_constraints row 3 pad_uart0_sin: input_transition is view-independent; confirm external electrical environment is shared by all stage/corner views
+WARNING: io_constraints row 6 pad_uart0_sout: load is view-independent; confirm external electrical environment is shared by all stage/corner views
+WARNING: pad_inventory pad_ddr_dqs: output pad lacks approved set_load or NA/basis
+INFO: wrote <WORK>/04_soc_io_pads/scenarios/gpio_in_io_pads.sdc
+
+Coverage:
+  inventory pads        : 4
+  assembled approved row: 5
+  emitted approved row  : 1
+
+  Per-pad assembled status:
+    pad_uart0_sin: dir=input class=async constraints=input_delay, input_transition sources=common/all/all
+    pad_uart0_sout: dir=output class=async constraints=load, output_delay sources=common/all/all
+    pad_ddr_dqs: dir=output class=class-unset constraints=NO_APPROVED_CONSTRAINT sources=-
+    pad_gpio0: dir=inout class=timed constraints=input_delay sources=gpio_in/all/all
+
+  Extracted rows not emitted for this output:
+    <none>

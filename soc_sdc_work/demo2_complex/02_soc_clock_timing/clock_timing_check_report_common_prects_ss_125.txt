@@ -1,0 +1,16 @@
+02_soc_clock_timing extraction report
+=====================================
+
+Scenario: common
+Stage   : prects
+Corner  : ss_125
+Form    : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/02_soc_clock_timing_budget_prects.xlsx
+Output  : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/common/02_soc_clock_timing_prects_ss_125.sdc
+Warnings: 0
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 10 active clock(s) from /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/../01_soc_clocks/clock_inventory.csv
+INFO: resolved 10 winning clock_budget row(s) for scenario=common, stage=prects, corner=ss_125
+INFO: wrote SDC: /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/02_soc_clock_timing/common/02_soc_clock_timing_prects_ss_125.sdc

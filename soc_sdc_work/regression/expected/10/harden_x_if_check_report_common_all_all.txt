@@ -1,0 +1,47 @@
+10_harden_x_if extraction report
+================================
+
+Scenario: common
+Stage   : all
+Corner  : all
+Form    : <WORK>/10_harden_x_if/10_harden_x_if.xlsx
+Output  : <WORK>/10_harden_x_if/common/10_harden_x_if.sdc
+Warnings: 2
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 13 clock(s) from <WORK>/01_soc_clocks/clock_inventory.csv
+INFO: loaded 2 instance(s) from info_all.xlsx
+INFO: loaded 2 instance port sheet(s) from 1 workbook(s)
+INFO: built 3 integration channel(s)
+INFO: extracted 1 interface delay candidate(s) from u_a.sdc
+INFO: extracted 1 interface delay candidate(s) from u_b.sdc
+INFO: interface_budget row 3 CH_u_a_data_o__u_b_data_i: auto-resolved converted_max=1.2 from interconnect budget candidates
+WARNING: interface_budget row 3 CH_u_a_data_o__u_b_data_i: max candidates differ by 0.3
+WARNING: interface_budget row 3 CH_u_a_data_o__u_b_data_i: original min delay contains negative value; review set_min_delay sign convention carefully
+INFO: wrote 3 auto-resolved field(s) back to 10_harden_x_if.xlsx
+INFO: wrote <WORK>/10_harden_x_if/common/10_harden_x_if.sdc
+
+Coverage:
+  inventory channels     : 3
+  assembled approved row : 1
+  emitted approved row   : 1
+
+  Per-channel assembled status:
+    CH_top_sys_clk_pad__u_a_clk_i: type=top_pad_to_harden inventory_timing=unknown pad=yes clock=no status=NO_APPROVED_BUDGET
+    CH_u_a_data_o__u_b_data_i: type=harden_to_harden inventory_timing=unknown pad=no clock=no status=row=3 timing=lib_blackbox budget=interconnect_budget emit=max
+    CH_u_a_data_o__fabric_fabric_bus: type=harden_to_fabric inventory_timing=unknown pad=no clock=no status=NO_APPROVED_BUDGET
+
+  Rows not emitted for this output:
+    row 2: CH_top_sys_clk_pad__u_a_clk_i reason=apply!=yes,review_status!=approved,budget_model=unknown
+    row 4: CH_u_a_data_o__fabric_fabric_bus reason=apply!=yes,review_status!=approved,budget_model=unknown
+
+  Clock-relative extracted rows not directly convertible:
+    <none>
+
+  Channels with differing max candidates:
+    row 3: CH_u_a_data_o__u_b_data_i diff=0.3
+
+  10 channels without approved budget:
+    CH_u_a_data_o__fabric_fabric_bus: type=harden_to_fabric reason=candidate exists but no approved budget

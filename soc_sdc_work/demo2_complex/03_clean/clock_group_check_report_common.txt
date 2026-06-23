@@ -1,0 +1,22 @@
+03_soc_clock_groups extraction report
+=====================================
+
+Scenario: common
+Form    : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/03_soc_clock_groups.xlsx
+Input   : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/../01_soc_clocks/clock_inventory.csv
+Output  : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/common/03_soc_clock_groups.sdc
+Coverage: /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/clock_group_coverage_report_common.xlsx
+Warnings: 4
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 10 active clock(s) from /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/../01_soc_clocks/clock_inventory.csv
+INFO: clock_group_rules row 5 CG_ASYNC_CORE_AUX: group_1 auto-added descendant clock(s): u_fab0_fab_clk_o, u_fab1_fab_clk_o, u_periph_clk_o
+INFO: loaded 2 clock_group_rules row(s); 2 active row(s) in assembled view
+WARNING: assembled view asynchronous relation has top_aux_clk_pad<->u_fab0_fab_clk_o and top_aux_clk_pad<->u_pll_bus_clk_o, but u_fab0_fab_clk_o<->u_pll_bus_clk_o is uncovered; if intended pairwise, merge into one multi-group rule or add the missing pair
+WARNING: assembled view asynchronous relation has top_aux_clk_pad<->u_fab1_fab_clk_o and top_aux_clk_pad<->u_pll_bus_clk_o, but u_fab1_fab_clk_o<->u_pll_bus_clk_o is uncovered; if intended pairwise, merge into one multi-group rule or add the missing pair
+WARNING: assembled view asynchronous relation has top_aux_clk_pad<->u_periph_clk_o and top_aux_clk_pad<->u_pll_bus_clk_o, but u_periph_clk_o<->u_pll_bus_clk_o is uncovered; if intended pairwise, merge into one multi-group rule or add the missing pair
+WARNING: assembled view asynchronous relation has top_aux_clk_pad<->u_pll_bus_clk_o and top_aux_clk_pad<->u_pll_core_clk_o, but u_pll_bus_clk_o<->u_pll_core_clk_o is uncovered; if intended pairwise, merge into one multi-group rule or add the missing pair
+INFO: wrote coverage report: /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/clock_group_coverage_report_common.xlsx
+INFO: wrote SDC: /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/demo2_complex/03_clean/common/03_soc_clock_groups.sdc

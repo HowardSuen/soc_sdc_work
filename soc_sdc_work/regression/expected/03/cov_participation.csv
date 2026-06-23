@@ -1,4 +1,5 @@
 clock_name,clock_kind,tree_root,root_source,direct_source,final_action,group_count
+dqs_clk,virtual_clock,dqs_clk,virtual/dqs_clk,virtual/dqs_clk,emit_virtual_clock,0
 top_aux_clk_pad,create_clock,top_aux_clk_pad,top/aux_clk_pad,top/aux_clk_pad,emit_top_clock,2
 top_scan_clk_pad,create_clock,top_scan_clk_pad,top/scan_clk_pad,top/scan_clk_pad,emit_top_clock,0
 top_sys_clk_pad,create_clock,top_sys_clk_pad,top/sys_clk_pad,top/sys_clk_pad,emit_top_clock,0
@@ -9,3 +10,5 @@ u_pll_bus_clk_o,create_generated_clock,top_sys_clk_pad,u_pll/bus_clk_o,u_pll/ref
 u_pll_core_clk_o,create_generated_clock,top_sys_clk_pad,u_pll/core_clk_o,u_pll/ref_clk_in,emit_output_clock,1
 v_ddr_ref,virtual_clock,v_ddr_ref,virtual/v_ddr_ref,virtual/v_ddr_ref,emit_virtual_clock,0
 v_pcie_ref,virtual_clock,v_pcie_ref,virtual/v_pcie_ref,virtual/v_pcie_ref,emit_virtual_clock,0
+v_uart_rx,virtual_clock,v_uart_rx,virtual/v_uart_rx,virtual/v_uart_rx,emit_virtual_clock,0
+v_uart_tx,virtual_clock,v_uart_tx,virtual/v_uart_tx,virtual/v_uart_tx,emit_virtual_clock,0
