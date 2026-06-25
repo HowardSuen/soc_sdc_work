@@ -67,6 +67,12 @@ soc_top_port <-> subsys_instance/module_port
 - pad 方向或方向线索。
 - inout/GPIO 是否需要 scenario 拆分。
 
+默认自动扫描的 port workbook 应限制为 `port_*.xlsx` 或 `ports_*.xlsx` 这类命名，避免共享目录中的 02/03/04/20 review workbook 被误读为 port 表；其它命名需通过后续显式选项接入。
+
+04 的 coverage 和 pending 消账必须使用 `00_harden_port_inventory` 的 canonical bit key。若 SoC pad bus 或下级 module bus 存在 bit-level 连接，集成表单中的 range 必须先展开为 bit-to-bit 映射，例如 `soc_pad_gpio[3] <-> u_iobuf/gpio_i[3]`。生成 SDC 时可以把相同约束的多个 bit 合并成 port list，但表单覆盖、conflict check、removed log 必须保留 per-bit 明细。脚本解析下级 SDC collection 时必须支持带 bus bit 的 Tcl object，例如 `[get_ports {dq_i[0]}]`，不能被 bit select 中的 `]` 截断。
+
+第一版 04 不在本阶段重新猜测 bus/range bit order。集成表单中的 harden port 和 SoC top pad 必须已经是 scalar 或 exact bit key，例如 `dq_i` 或 `dq_i[0]`。若出现 `dq_i[7:0]`、`dq_i[*]`、或 `dq_i` 同时标注 `width > 1`，脚本应报 error，要求 00/集成阶段先展开。
+
 ### 3.2 下级 iobuffer/module SDC
 
 下级 SDC 中可能已经包含 pad 相关约束。04 脚本不能默认这些约束缺失。
@@ -337,8 +343,31 @@ assembled_04_view = common rows
 - view-independent 与 view-specific 对同一 pad、同一 constraint_type 生成互相冲突的 approved 约束。
 - scenario 约束试图靠后 source 覆盖 common 约束。
 - 同一个 pad 的 timed delay 与 false path 在 assembled view 中同时生效，且没有显式裁决。
+- `apply = yes` 且 `review_status = approved` 的当前输出行必须能实际 emit 至少一条 SDC 命令；例如 `false_path` 缺少可透传的 `rewritten_command` / `original_command`、或 `set_load` 缺少 value 时，应报 error，不能静默跳过。
 
 coverage report 也应按 assembled view 输出，而不是只基于静态 pad inventory。
+
+### 7.3 Pending 消账
+
+04 完成生成后可以从 `00_harden_port_inventory/pending/*.ports` 删除已被 04 覆盖的 pad-related harden port，并写入：
+
+```text
+00_harden_port_inventory/removed_log/04_soc_io_pads.removed
+```
+
+脚本默认可提供：
+
+```text
+--pending-root 00_harden_port_inventory
+--no-update-pending
+```
+
+删除规则：
+
+- 只删除 assembled view 中已有 approved 04 记录的 pad 对应 harden port，或有 approved `source_type = na` 明确说明的 pad。
+- 纯粹出现在 `pad_inventory`、但缺少必要 timing/electrical/NA review 记录的 port 不能删除。
+- 删除必须使用 exact canonical key，例如 `input dq_i[0]`；不能用整 bus、range 或 pattern 删除。
+- 若 port 已被更早 stage 删除，脚本可通过 previous removed log 豁免重复删除；若既不在 pending、也没有 previous removed 记录，应报 error。
 
 ## 8. 建议表单
 
@@ -416,7 +445,7 @@ corner            all 或项目 corner/view 名，例如 ss_125 / ff_m40；view-
 pad_name          稳定 pad 名，建议使用 SoC top pad 名或项目 pad ID
 soc_object        生成 SDC 时使用的 SoC 层级 object，例如 get_ports/get_pins 的 object 名
 subsys_instance   下级 subsys/module instance path
-subsys_port       下级 module port 名
+subsys_port       下级 module canonical port key；bus bit 使用 port[index]
 direction         input / output / inout / unknown
 timing_class      timed / async / untimed / config
 constraint_type   input_delay / output_delay / load / driving_cell / drive / input_transition / false_path / dont_touch_network / max_transition / max_capacitance
@@ -605,6 +634,8 @@ set_dont_touch_network [get_nets {pad_uart0_sout}]
 - `apply = yes` 但 `scenario` 为空。
 - `apply = yes` 但 `pad_name` 或 `soc_object` 为空。
 - `apply = yes` 但 `constraint_type` 为空。
+- 集成表单中的 `subsys_port` / top pad 不是 canonical scalar 或 bit key，例如出现 bus/range/pattern，或 width 为多 bit 却未按 bit 展开。
+- `apply = yes` 且 `review_status = approved` 的当前输出行无法生成任何 SDC 命令，例如 `false_path` 既无 `rewritten_command` 也无 `set_false_path` 原始命令，或电气约束缺少 `value`。
 - `constraint_type = input_delay/output_delay` 但 `clock_name` 为空。
 - `clock_name` 不存在于 `01_soc_clocks` 输出的 `clock_inventory.csv` 或对应 scenario clock inventory。
 - `scenario = common` 的 04 约束引用了 scenario-only clock；common 04 只能引用 common 01 中创建的 clock。
@@ -634,6 +665,7 @@ set_dont_touch_network [get_nets {pad_uart0_sout}]
 - `source_digest` 与当前下级 SDC 文件 digest 不一致，说明 extracted 记录可能已经失效，需要重抽或人工确认。
 - `object_granularity = pattern` 的行应提示 reviewer 确认 pattern 展开结果，避免误约束非 pad port。
 - `set_dont_touch_network` 行应标记为 synthesis-only；STA-only 输出中默认不生成。
+- 若命令行提供 expected unit，例如 `--time-unit ns` 或 `--cap-unit pF`，对应 `unit_time` / `unit_cap` 为空也应 warning，不能只检查“不一致”的情况。
 
 ### 10.3 覆盖率检查
 
@@ -676,26 +708,28 @@ set_dont_touch_network [get_nets {pad_uart0_sout}]
 
 ### 11.4 与 10
 
-10 描述 SoC 视角的 harden/interface 边界约束。
+10 描述结构性 harden feedthrough segment。
 
-04 与 10 的边界：
+04 与 10/20 的边界：
 
 - 04 = SoC top pad 对外部世界的环境，包括 board delay、external driver/load/slew、top pad 相关 IO DRC。
-- 10 = harden/subsys/iobuffer 边界 pin 的内部接口 timing，包括 harden integration SDC 中对 SoC 可见的边界约束。
+- 10 = harden/subsys 内部只负责穿通的 `fti_*` / `fto_*` feedthrough segment。
+- 20 = harden/subsys/iobuffer 边界 pin 的普通内部 interface timing budget，包括 harden integration SDC 中对 SoC 可见的非 pad 边界约束。
 
 如果 IO buffer / pad ring 本身是 harden：
 
 - top pad port 对外的 `set_input_delay` / `set_output_delay` / `set_load` / `set_input_transition` 属于 04。
-- harden IO buffer 内部侧 pin 到 SoC core/subsys 的边界 timing 属于 10。
-- 一条约束不能同时在 04 和 10 生成；脚本应在 report 中标记可能重复的 boundary constraint。
+- harden IO buffer 内部侧 pin 到 SoC core/subsys 的普通边界 timing 属于 20。
+- IO buffer 内部纯穿通段属于 10。
+- 一条约束不能同时在 04、10、20 生成；脚本应在 report 中标记可能重复的 boundary constraint。
 
 ### 11.5 与 20 / 30
 
-20 放 harden-to-harden path exception。
+20 放普通 harden/subsys interface timing budget。
 
-30 放结构性 feedthrough path。
+30 放 harden-to-harden path exception / override。
 
-如果某条 false path 实际描述的是 harden-to-harden 或 feedthrough，而不是 IO/pad environment，应放入 20 或 30，不应混入 04。
+如果某条 false path 实际描述的是 harden-to-harden exception 或 feedthrough，而不是 IO/pad environment，应放入 30 或先由 10 建模后再由 30 review，不应混入 04。
 
 ## 12. 当前结论
 

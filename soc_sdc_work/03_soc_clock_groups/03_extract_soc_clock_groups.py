@@ -14,9 +14,72 @@ import itertools
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from dataclasses import dataclass, field
+except ImportError:  # pragma: no cover - Python 3.6 compatibility path
+    class _CompatField:
+        def __init__(self, default_factory=None):
+            self.default_factory = default_factory
+
+    def field(default_factory=None):
+        return _CompatField(default_factory=default_factory)
+
+    def dataclass(_cls=None, frozen=False):
+        def wrap(cls):
+            annotations = getattr(cls, "__annotations__", {})
+            names = list(annotations.keys())
+            defaults = {}
+            factories = {}
+            for name in names:
+                if hasattr(cls, name):
+                    value = getattr(cls, name)
+                    if isinstance(value, _CompatField):
+                        factories[name] = value.default_factory
+                        delattr(cls, name)
+                    else:
+                        defaults[name] = value
+
+            def __init__(self, *args, **kwargs):
+                if len(args) > len(names):
+                    raise TypeError("too many positional arguments")
+                values = {}
+                for name, value in zip(names, args):
+                    values[name] = value
+                for name in names[len(args):]:
+                    if name in kwargs:
+                        values[name] = kwargs.pop(name)
+                    elif name in factories:
+                        values[name] = factories[name]()
+                    elif name in defaults:
+                        values[name] = defaults[name]
+                    else:
+                        raise TypeError("missing required argument: " + name)
+                if kwargs:
+                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
+                for name in names:
+                    object.__setattr__(self, name, values[name])
+
+            def __eq__(self, other):
+                if other.__class__ is not cls:
+                    return False
+                return all(getattr(self, name) == getattr(other, name) for name in names)
+
+            cls.__init__ = __init__
+            cls.__eq__ = __eq__
+            if frozen:
+                def __hash__(self):
+                    return hash(tuple(getattr(self, name) for name in names))
+                cls.__hash__ = __hash__
+            else:
+                cls.__hash__ = None
+            return cls
+
+        if _cls is None:
+            return wrap
+        return wrap(_cls)
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -31,6 +94,16 @@ except ImportError as exc:  # pragma: no cover - user environment guard
 
 SCENARIOS = {"common", "func", "scan", "mbist", "gpio_in", "gpio_out"}
 RELATION_TYPES = {"asynchronous", "logically_exclusive", "physically_exclusive"}
+RELATION_TYPE_ALIASES = {
+    "async": "asynchronous",
+    "asynchronous": "asynchronous",
+    "logical_exclusive": "logically_exclusive",
+    "logically_exclusive": "logically_exclusive",
+    "logically exclusive": "logically_exclusive",
+    "physical_exclusive": "physically_exclusive",
+    "physically_exclusive": "physically_exclusive",
+    "physically exclusive": "physically_exclusive",
+}
 ANALYSIS_STYLES = {"", "normal", "merged_exclusive", "per_scenario_case"}
 APPLY_VALUES = {"yes", "no"}
 REVIEW_STATUS_VALUES = {"draft", "reviewed", "approved", "rejected"}
@@ -172,6 +245,11 @@ def clean_cell(value) -> str:
 
 def normalize_key(value) -> str:
     return clean_cell(value).strip().lower()
+
+
+def canonical_relation_type(value) -> str:
+    key = normalize_key(value).replace("-", "_")
+    return RELATION_TYPE_ALIASES.get(key, key)
 
 
 def safe_filename_token(value: str) -> str:
@@ -547,6 +625,26 @@ def ensure_rule_headers(ws) -> Tuple[int, Dict[str, int], bool]:
     return header_row, mapping, changed
 
 
+def rewrite_relation_type_cells(ws, header_row: int, mapping: Dict[str, int], report: Report) -> bool:
+    relation_col = mapping.get("relation_type")
+    if not relation_col:
+        return False
+    changed = False
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        original = clean_cell(ws.cell(row_idx, relation_col).value)
+        if not original:
+            continue
+        canonical = canonical_relation_type(original)
+        if canonical not in RELATION_TYPES or original == canonical:
+            continue
+        ws.cell(row_idx, relation_col, canonical)
+        changed = True
+        report.info(
+            f"clock_group_rules row {row_idx}: relation_type {original} normalized to {canonical}"
+        )
+    return changed
+
+
 def read_rule_rows(ws, header_row: int, mapping: Dict[str, int]) -> List[ParsedRule]:
     groups = group_headers(mapping)
     rows: List[ParsedRule] = []
@@ -567,7 +665,7 @@ def read_rule_rows(ws, header_row: int, mapping: Dict[str, int]) -> List[ParsedR
                 row_idx=row_idx,
                 scenario=normalize_key(ws.cell(row_idx, mapping.get("scenario", 0)).value),
                 group_id=clean_cell(ws.cell(row_idx, mapping.get("group_id", 0)).value),
-                relation_type=normalize_key(ws.cell(row_idx, mapping.get("relation_type", 0)).value),
+                relation_type=canonical_relation_type(ws.cell(row_idx, mapping.get("relation_type", 0)).value),
                 analysis_style=normalize_key(ws.cell(row_idx, mapping.get("analysis_style", 0)).value),
                 apply=normalize_key(ws.cell(row_idx, mapping.get("apply", 0)).value),
                 review_status=normalize_key(ws.cell(row_idx, mapping.get("review_status", 0)).value),
@@ -1277,6 +1375,10 @@ def main(argv: Sequence[str]) -> int:
             print(f"Report: {report_path}")
             print("SDC was not generated because workbook headers changed.")
             return 1
+
+        if rewrite_relation_type_cells(ws, header_row, mapping, report):
+            report.sync_changed = True
+            wb.save(form_path)
 
         rows = read_rule_rows(ws, header_row, mapping)
         assembled = validate_and_expand_rules(rows, scenario, inventory, report)

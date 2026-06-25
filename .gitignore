@@ -2,3 +2,10 @@
 __pycache__/
 *.py[cod]
 soc_sdc_work/regression/work/
+soc_sdc_work/01_soc_clocks/regression_test/work_complex/
+soc_sdc_work/02_soc_clock_timing/regression_test/work_complex/
+soc_sdc_work/03_soc_clock_groups/regression_test/work_complex/
+soc_sdc_work/04_soc_io_pads/regression_test/work_complex/
+soc_sdc_work/10_feedthrough/regression_test/work_complex/
+soc_sdc_work/20_harden_x_if/regression_test/work_complex/
+soc_sdc_work/30_harden_to_harden_exception/regression_test/work_complex/

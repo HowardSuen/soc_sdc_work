@@ -12,9 +12,52 @@ stops before SDC generation.
 import argparse
 import csv
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    from dataclasses import dataclass
+except ImportError:  # pragma: no cover - Python 3.6 compatibility path
+    def dataclass(_cls=None):
+        def wrap(cls):
+            annotations = getattr(cls, "__annotations__", {})
+            names = list(annotations.keys())
+            defaults = {}
+            for name in names:
+                if hasattr(cls, name):
+                    defaults[name] = getattr(cls, name)
+
+            def __init__(self, *args, **kwargs):
+                if len(args) > len(names):
+                    raise TypeError("too many positional arguments")
+                values = {}
+                for name, value in zip(names, args):
+                    values[name] = value
+                for name in names[len(args):]:
+                    if name in kwargs:
+                        values[name] = kwargs.pop(name)
+                    elif name in defaults:
+                        values[name] = defaults[name]
+                    else:
+                        raise TypeError("missing required argument: " + name)
+                if kwargs:
+                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
+                for name in names:
+                    setattr(self, name, values[name])
+
+            def __eq__(self, other):
+                if other.__class__ is not cls:
+                    return False
+                return all(getattr(self, name) == getattr(other, name) for name in names)
+
+            cls.__init__ = __init__
+            cls.__eq__ = __eq__
+            cls.__hash__ = None
+            return cls
+
+        if _cls is None:
+            return wrap
+        return wrap(_cls)
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -126,6 +169,7 @@ class Report:
         self.warning_count = 0
         self.error_count = 0
         self.sync_changed = False
+        self.sync_blocking_changed = False
 
     def info(self, msg: str) -> None:
         self.lines.append(f"INFO: {msg}")
@@ -174,10 +218,9 @@ def get_clocks(clock_name: str) -> str:
 
 
 def format_number(value) -> str:
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return f"{value:.12g}"
+    number = parse_number(value)
+    if number is not None:
+        return f"{number:.12g}"
     return clean_cell(value)
 
 
@@ -220,7 +263,7 @@ def read_clock_inventory(path: Path, report: Report) -> Dict[str, ClockInfo]:
                 clock_name=clock_name,
                 direction=clean_cell(row.get("direction")),
                 clock_kind=clean_cell(row.get("clock_kind")),
-                source=clean_cell(row.get("producer_object") or row.get("direct_source")),
+                source=clean_cell(row.get("direct_source")),
             )
 
     if duplicates:
@@ -431,7 +474,7 @@ def row_stage_key(row: BudgetRow) -> str:
 
 
 def row_corner_key(row: BudgetRow) -> str:
-    return normalize_key(row.values.get("corner"))
+    return clean_cell(row.values.get("corner"))
 
 
 def scenario_priority(row_scenario: str, target_scenario: str) -> int:
@@ -464,7 +507,10 @@ def resolve_winning_rows(rows: Sequence[BudgetRow], scenario: str, stage: str, c
 def refresh_clock_budget_table(ws) -> None:
     header_row, mapping = find_header_row(ws)
     last_row = max(last_budget_data_row(ws, header_row, mapping), header_row + 1)
-    ref = f"A{header_row}:P{last_row}"
+    table_columns = [mapping[header] for header in CLOCK_BUDGET_HEADERS if header in mapping]
+    first_col = min(table_columns) if table_columns else 1
+    last_col = max(table_columns) if table_columns else len(CLOCK_BUDGET_HEADERS)
+    ref = f"{get_column_letter(first_col)}{header_row}:{get_column_letter(last_col)}{last_row}"
     ensure_table(ws, "ClockBudget", ref)
     for row_idx in range(header_row + 1, last_row + 1):
         style_body_row(ws, row_idx, len(CLOCK_BUDGET_HEADERS))
@@ -485,6 +531,7 @@ def sync_workbook(
     header_row, mapping, header_changed = ensure_clock_budget_headers(ws)
     if header_changed:
         report.sync_changed = True
+        report.sync_blocking_changed = True
         report.warn(f"{form_path.name}: added missing clock_budget header(s)")
 
     rows = read_budget_rows(ws, header_row, mapping)
@@ -498,6 +545,7 @@ def sync_workbook(
     for clock_name in missing:
         append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
         report.sync_changed = True
+        report.sync_blocking_changed = True
         report.warn(
             f"{form_path.name}: added clock from 01 inventory for scenario {scenario}, "
             f"corner {corner}: {clock_name}"
@@ -512,13 +560,41 @@ def sync_workbook(
             ws.cell(row.row_idx, mapping["sync_status"], "STALE_NOT_IN_01")
             style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), STALE_FILL)
             report.sync_changed = True
+            report.sync_blocking_changed = True
             report.warn(
                 f"{form_path.name} row {row.row_idx}: stale clock not found in 01 inventory: {clock_name}"
             )
+            continue
+
+        sync_status = clean_cell(row.values.get("sync_status"))
+        if sync_status in {"NEW_FROM_01", "STALE_NOT_IN_01"}:
+            if row_ready_for_sync_ok(row):
+                ws.cell(row.row_idx, mapping["sync_status"], "OK")
+                style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), CLEAR_FILL)
+                report.sync_changed = True
+                report.info(
+                    f"{form_path.name} row {row.row_idx} {clock_name}: "
+                    f"sync_status {sync_status} reset to OK"
+                )
+            else:
+                report.warn(
+                    f"{form_path.name} row {row.row_idx} {clock_name}: sync_status {sync_status} "
+                    "is still blocking; fill budget fields for apply=yes, or set apply=no with note"
+                )
 
     refresh_clock_budget_table(ws)
     rows = read_budget_rows(ws, header_row, mapping)
     return ws, header_row, mapping, rows
+
+
+def row_ready_for_sync_ok(row: BudgetRow) -> bool:
+    values = row.values
+    apply_value = normalize_key(values.get("apply"))
+    if apply_value == "yes":
+        return row_generates_any_command(values)
+    if apply_value == "no":
+        return bool(clean_cell(values.get("note")))
+    return False
 
 
 def validate_rows(
@@ -657,7 +733,7 @@ def generate_sdc(rows: Sequence[BudgetRow], scenario: str, stage: str, corner: s
             "# Auto-generated SoC clock timing constraints for "
             f"scenario: {scenario}, stage: {stage}, corner: {corner}"
         ),
-        "# Source: 02_soc_clock_timing_budget_<stage>.xlsx clock_budget sheet",
+        f"# Source: 02_soc_clock_timing_budget_{stage}.xlsx clock_budget sheet",
         "# Rows are resolved by scenario priority: selected scenario > common.",
         "################################################################################",
         "",
@@ -762,7 +838,7 @@ def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     scenario = args.scenario
     stage = args.stage
-    corner = normalize_key(args.corner)
+    corner = clean_cell(args.corner)
     if not corner:
         print("ERROR: -corner must not be blank", file=sys.stderr)
         return 2
@@ -805,11 +881,13 @@ def main(argv: Sequence[str]) -> int:
         )
         if report.sync_changed:
             wb.save(form_path)
-            write_report(report_path, report, scenario, stage, corner, form_path, output_path)
-            print(f"Updated workbook: {form_path}")
-            print(f"Report: {report_path}")
-            print("SDC was not generated because clock list sync changed the workbook.")
-            return 1
+            if report.sync_blocking_changed:
+                write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+                print(f"Updated workbook: {form_path}")
+                print(f"Report: {report_path}")
+                print("SDC was not generated because clock list sync changed the workbook.")
+                return 1
+            rows = read_budget_rows(ws, header_row, mapping)
 
         validate_rows(rows, mapping, clocks, scenario, stage, corner, report)
         if report.error_count:

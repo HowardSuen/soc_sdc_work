@@ -9,6 +9,7 @@
 - `common/01_soc_clocks.sdc`
 - `clock_inventory.csv`
 - `clock_check_report.txt`
+- `00_harden_port_inventory/removed_log/01_soc_clocks.removed`（当执行目录存在 `00_harden_port_inventory/pending` 时）
 
 其中 `01_soc_clocks.sdc` 只放 SoC 级 clock 声明，不放 clock timing budget、clock group、false path、multicycle、IO delay、mode case analysis 或 exception。
 
@@ -37,6 +38,7 @@
 - 脚本不跨目录搜索输入文件。
 - 一个 harden/module 可能被例化多次，脚本必须以 `inst_name` 作为 SoC 实例的唯一键。
 - `module_name` 只用于匹配同一种 harden 的 SDC；生成 clock name 和 SoC pin path 必须使用 `inst_name`。
+- owner 子 xlsx 的 sheet name 应与 `inst_name` 精确一致。脚本可提供大小写/首尾空格不敏感的兜底匹配，但必须 warning；完全无法对应任何 `inst_name` 的孤儿 sheet 也必须 warning。
 
 ### 2.2 owner 子 xlsx
 
@@ -51,6 +53,7 @@
 - `Output Used Width`
 - `To Top`
 - `Inout`
+- `Inout Width`
 - `Inout Connectivity`
 - `Inout Name`
 
@@ -59,6 +62,10 @@
 - `From Whom = top.xxx`：表示该 input 来源于 SoC 顶层 port/pad。
 - `From Whom = u_harden.port`：表示该 input 来源于另一个 harden 的 output port。
 - `From Whom = 1'b0/1'b1/...`：表示 tie 常量，不作为 clock source。
+
+owner 子 xlsx 中的 port/range 必须与 `00_harden_port_inventory` 的 canonical bit key 规则对齐。scalar port 直接使用 `port`；vector port 在机器处理中展开为 `port[index]`。例如 `output [1:0] clk_o` 若两个 bit 都是 clock source，应作为 `clk_o[0]`、`clk_o[1]` 两个独立 target 处理、进入 clock inventory，并分别从 pending 中删除。
+
+`From Whom` 是 input clock 来源的兜底来源。若执行目录下存在 00 `connection_inventory.csv`，并且其中有当前 input bit 的 exact edge，脚本优先使用该 edge 的 source bit；只有缺少 exact edge 时才回退到 owner 子 xlsx 的 `From Whom`。
 
 ### 2.3 harden flattened SoC integration SDC
 
@@ -97,10 +104,35 @@ create_clock -name v_pcie_ref_clk -period 10.000
 
 如果同名 virtual clock 重复出现，脚本只输出第一条，并在 report 中记录重复项。
 
-SDC 匹配约定：
+### 2.5 00 `connection_inventory.csv`
+
+可选输入文件，默认路径：
+
+```text
+00_harden_port_inventory/connection_inventory.csv
+```
+
+用途：
+
+- 为 harden input clock 提供权威 bit-to-bit source edge。
+- 解决 bus/range 重编号，例如 `u_a.clk_o[1] -> u_b.clk_i[0]`。
+- 避免 01 仅根据 owner `From Whom = u_a.clk_o` 自行猜测 source bit。
+
+优先级：
+
+```text
+00 connection_inventory exact edge
+  > owner 子 xlsx From Whom
+  > unresolved / warning
+```
+
+第一版只在文件存在时读取；若文件不存在，脚本保持旧行为，继续使用 owner 子 xlsx 的 `From Whom`。
+
+### 2.6 SDC 匹配约定
 
 - 若 `info_all.xlsx` 提供 `sdc_path` / `sdc_file` 字段，则优先使用该字段对应的本地文件名。
 - 否则脚本在执行目录中按 `<inst_name>.sdc`、`<module_name>.sdc`、`<file_path stem>.sdc` 顺序匹配。
+- 若实际文件名带 `_empty.sdc` 后缀，脚本可把去掉 `_empty` 后的 stem 作为兜底匹配名，例如 `foo_empty.sdc` 可匹配 `foo`。
 - 多个 `inst_name` 可以共享同一个 `<module_name>.sdc`，但输出 clock 必须按各自 `inst_name` 独立生成。
 
 ## 3. 基本生成原则
@@ -144,13 +176,32 @@ u_harden_b_clk_o
 
 如果一个 output port 上需要多个 clock，例如 mux 输出同时存在多个 mode clock，第一版 func-only 暂不展开；后续 scenario 版本再扩展命名规则。
 
+若 clock target 是 bus bit，clock name 必须稳定编码 bit index，避免 `[]` 进入 clock name。例如：
+
+```text
+u_harden_a_clk_o_bit0
+u_harden_a_clk_o_bit1
+```
+
+第一版不允许一条 clock 命令用整 bus/range target 隐式创建多个 clock。harden SDC 应拆成 scalar/explicit bit target；01 脚本不自行展开整 bus/range target，遇到这类命令必须报 error，不得静默只取第一个 bit。
+
 ## 4. Input Clock 处理规则
 
 harden input clock 约束需要读取，但不一定输出到 `01_soc_clocks.sdc`。
 
+input clock 的 source 解析顺序为：
+
+```text
+1. 若 00 connection_inventory.csv 中存在当前 input canonical bit key 的 edge，使用该 edge 的 src_instance/src_port。
+2. 否则使用 owner 子 xlsx 的 From Whom。
+3. 若两者都无法解析为 top 或 upstream harden output，当前 input clock 不生成，并在 report 中记录。
+```
+
+因此，对于 vector clock input，`connection_inventory.csv` 是 source bit 配对的权威来源；`From Whom` 只能作为无 edge 表时的兜底。
+
 ### 4.1 input clock 来源于 top/pad
 
-如果 harden input clock 的 `From Whom` 是：
+如果解析后的 input clock source 是：
 
 ```text
 top.xxx
@@ -174,7 +225,7 @@ create_clock \
 
 ### 4.2 input clock 来源于其他 harden output
 
-如果 harden input clock 的 `From Whom` 是：
+如果解析后的 input clock source 是：
 
 ```text
 u_harden_a.clk_o
@@ -204,7 +255,7 @@ u_harden_a/clk_o -> u_harden_b/clk_i -> u_harden_b/clk_o
 
 ### 4.3 input clock 来源于常量或非法来源
 
-如果 clock input 的 `From Whom` 是 tie 常量、空白或无法解析对象，脚本不生成 clock，并在 `clock_check_report.txt` 中报 warning/error。
+如果 clock input 的解析来源是 tie 常量、空白或无法解析对象，脚本不生成 clock，并在 `clock_check_report.txt` 中报 warning/error。
 
 ## 5. Output Clock 处理规则
 
@@ -302,6 +353,8 @@ create_generated_clock \
 - 保留局部拓扑更利于 STA 和人工 review 理解 clock path。
 - 强制上升到最源头可能丢失中间 harden 的转发关系。
 
+如果 harden SDC 使用 `-source [get_clocks <name>]`，脚本必须按同一 harden 内的 clock `name_map` 把 `<name>` 重映射到 SoC 级 clock name。无法映射的 clock name 不应静默通过，必须 warning，例如 `CLOCK_SOURCE_GET_CLOCKS_UNMAPPED`。
+
 ### 6.2 报告中的 root source
 
 脚本内部应追溯每个 clock 的 root source，用于检查和报告。
@@ -319,16 +372,21 @@ u_harden_c_clk_o, u_harden_c/clk_i, u_harden_a/clk_pll
 脚本至少生成以下检查：
 
 - `info_all.xlsx` 中的 harden instance 是否都有对应 harden SDC。
-- 子 xlsx 中的 sheet 是否能对应到 `inst_name`。
-- harden input clock 是否都有 `From Whom`。
-- `From Whom = u_xxx.port` 的上游 output clock 是否存在。
+- 子 xlsx 中的 sheet 是否能对应到 `inst_name`，包括 inst->sheet 和 sheet->inst 两个方向；大小写/首尾空格兜底匹配必须 warning。
+- 若 00 `connection_inventory.csv` 存在，是否能读取其中的 bit-to-bit edge；不完整或重复 dst edge 应 warning。
+- harden input clock 是否能通过 00 `connection_inventory.csv` 或 owner `From Whom` 解析来源。
+- 解析后来源为 `u_xxx.port` 的上游 output clock 是否存在。
 - input clock 期望 period 是否与上游 output clock period 一致。
+- `create_clock` 是否填写 `-period`；缺失时 warning。
 - 同名 clock 是否冲突。
 - `create_generated_clock` 是否带可解析 `-source`；缺失或无法解析时为 error，并跳过该 clock。
-- `create_generated_clock -source` 是否能映射到当前 harden port 或已知 SoC 对象。
+- `create_generated_clock -source` 是否能映射到当前 harden port 或已知 SoC 对象；若 `-source [get_ports ...]` 中的 port 不在 owner sheet 的 Input/Output/Inout 中，应报 error 并跳过该 clock。
+- 单条 clock 命令是否作用于多个 target port；第一版不自动拆分，多 target 应报 error 并跳过，要求 harden SDC 拆成一端口一条 clock 命令。
+- clock target/source 是否符合 00 canonical bit key。整 bus/range target/source 第一版不由 01 自行展开；必须拆成 scalar/explicit bit，或由 00 edge 表给出 input source bit。否则 error。
+- clock 命令是否带 `-add`；第一版不语义展开同一 target pin 多 clock/mux 场景，遇到 `-add` 必须 warning，例如 `CLOCK_ADD_OPTION_OUT_OF_SCOPE`。
 - harden SDC 中是否出现内部层级对象，若出现则 warning。
 - scan/mbist/test/gpio 相关 clock 是否被误放入 func-only 生成结果。
-- clock name/port 中出现 scan/mbist/bist/jtag/test 等 token 时，只能产生 warning，不能自动 skip；scenario 分类和删除必须依赖显式表单/场景规则。
+- clock name/port 中出现 scan/mbist/bist/jtag/test/gpio 等 token 时，只能产生 warning，不能自动 skip；scenario 分类和删除必须依赖显式表单/场景规则。
 
 检查报告应给出可交付给 harden owner 的定位信息：
 
@@ -357,6 +415,7 @@ info_all.xlsx
 port_*.xlsx
 *.sdc
 virtual_clocks.csv   # optional
+00_harden_port_inventory/connection_inventory.csv   # optional
 ```
 
 默认输出：
@@ -366,6 +425,26 @@ common/01_soc_clocks.sdc
 clock_inventory.csv
 clock_check_report.txt
 ```
+
+`01_soc_clocks.sdc` 的输出顺序应尽量按 clock 依赖拓扑排序：被 `-source [get_clocks ...]`、`-source [get_ports ...]` 上溯到的已 emitted clock，或 `root_source` 对应的已 emitted clock，应先于依赖它的 generated/forwarded clock 输出。无法解析的依赖保持原稳定顺序；检测到排序环时 warning 并保留剩余原顺序。
+
+若执行目录存在 `00_harden_port_inventory/pending`，01 只按 exact canonical bit key 删除 clock port，并在 `removed_log/01_soc_clocks.removed` 记录同一个 key。对于 vector clock，不能用 `clk_o` 或 `clk_o[1:0]` 删除 `clk_o[0]` / `clk_o[1]`；必须逐 bit 删除。
+
+如果执行目录下存在 `00_harden_port_inventory/pending`，脚本还会按 00 规则消费已由 01 覆盖的 harden clock port，并写：
+
+```text
+00_harden_port_inventory/removed_log/01_soc_clocks.removed
+```
+
+相关参数：
+
+```bash
+--connection-inventory 00_harden_port_inventory/connection_inventory.csv
+--pending-root 00_harden_port_inventory
+--no-update-pending
+```
+
+默认只有在 `<pending-root>/pending` 已存在时才更新 pending；若该目录不存在，01 仍按旧 flow 只生成 clock SDC/inventory/report。`--connection-inventory` 指向的文件若不存在，01 不报错，改用 owner 子 xlsx 的 `From Whom` 解析 input clock 来源。
 
 ### 8.2 `clock_inventory.csv`
 
@@ -408,6 +487,31 @@ note
 ERROR: blk.sdc:12: u_blk/clk_o: clock=out_clk: CLOCK_GENERATED_MISSING_SOURCE: generated clock has no parseable -source; command: create_generated_clock ...
 ```
 
+### 8.4 `removed_log/01_soc_clocks.removed`
+
+当 00 pending 机制启用时，01 可以从 pending 中删除：
+
+- `emit_top_clock`：harden input/inout clock 已提升为 SoC top clock。
+- `duplicate_top_clock`：多个 harden input 共用同一个 top clock，后续用户不重复 emit，但该 port 已由 top clock 覆盖。
+- `check_only`：harden input clock 来自上游 harden output，01 已完成 upstream clock sink 检查。
+- `emit_output_clock`：harden output clock / forwarded clock 已显式生成。
+
+不删除：
+
+- `emit_virtual_clock` / `duplicate_virtual_clock`，因为它们不是 harden port。
+- `skipped` 或有 error 的 clock port。
+- 非 clock data/control/reset port。
+
+removed log 示例：
+
+```text
+u_pll output core_clk_o covered_by=01_soc_clocks reason=generated_clock clock=u_pll_core_clk_o action=emit_output_clock source=pll_top.sdc:2
+u_fab0 input fab_clk_i covered_by=01_soc_clocks reason=upstream_clock_sink clock=u_fab0_fab_clk_i action=check_only from_whom=u_pll.core_clk_o source=fab.sdc:1
+u_periph input ref2_i covered_by=01_soc_clocks reason=top_clock clock=top_aux_clk_pad action=emit_top_clock from_whom=top.aux_clk_pad source=periph.sdc:2
+```
+
+pending 消账必须是幂等的。若 01 试图删除的 port 已不在 pending 中，但 `00_harden_port_inventory/removed_log/*.removed` 中已有对应 `previous_removed` 记录，则不应报错；只有既不在 pending、也无 previous_removed 记录时才是流程错误。01 重写自己的 removed log 时应保留既有记录，只追加新的删除项。
+
 ## 9. 当前阶段限制
 
 第一版仅支持 func 单一模式。
@@ -415,7 +519,8 @@ ERROR: blk.sdc:12: u_blk/clk_o: clock=out_clk: CLOCK_GENERATED_MISSING_SOURCE: g
 暂不处理：
 
 - scan/mbist/gpio scenario clock。
-- 同一 target pin 上多 clock/mux 的 `-add` 复杂场景。
+- 同一 target pin 上多 clock/mux 的 `-add` 复杂场景；脚本只保留原命令并报告 out-of-scope warning，不做自动裁决。
+- 单条 clock 命令作用于多个 target port 的批量定义；应在 harden SDC 中拆成多条单 target 命令。
 - 复杂 Tcl proc 或外部 include。
 - 从 harden 内部 pin 自动推断边界 clock。
 - 根据名字自动猜测 clock 类型并据此删除/跳过 clock。

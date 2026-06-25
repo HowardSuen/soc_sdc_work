@@ -1,6 +1,6 @@
 ################################################################################
 # Auto-generated SoC clock timing constraints for scenario: common, stage: prects, corner: ss_125
-# Source: 02_soc_clock_timing_budget_<stage>.xlsx clock_budget sheet
+# Source: 02_soc_clock_timing_budget_prects.xlsx clock_budget sheet
 # Rows are resolved by scenario priority: selected scenario > common.
 ################################################################################
 

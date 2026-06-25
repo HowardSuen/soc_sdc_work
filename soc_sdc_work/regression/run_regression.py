@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-One-shot regression for the SoC SDC 01 -> 02 -> 03 -> 04 -> 10 chain.
+One-shot regression for the SoC SDC 01 -> 02 -> 03 -> 04 -> 20 chain.
 
 Layout (recreated under work/ each run):
   work/01_soc_clocks/        run 01, produce clock_inventory.csv + 01 sdc
   work/02_soc_clock_timing/  fill budgets, run 02 across stage/scenario/corner
   work/03_soc_clock_groups/  fill rules, run 03 + coverage
   work/04_soc_io_pads/       extract/review IO pad constraints and generate 04
-  work/10_harden_x_if/       extract/review interface budgets and generate 10
+  work/20_harden_x_if/       extract/review interface budgets and generate 20
 
 It collects deterministic TEXT artifacts (sdc / csv / normalized reports /
 coverage extracts) into work/artifacts and diffs them against expected/.
@@ -33,7 +33,7 @@ EX01 = SOC / "01_soc_clocks" / "01_extract_soc_clocks.py"
 EX02 = SOC / "02_soc_clock_timing" / "02_extract_soc_clock_timing.py"
 EX03 = SOC / "03_soc_clock_groups" / "03_extract_soc_clock_groups.py"
 EX04 = SOC / "04_soc_io_pads" / "04_extract_soc_io_pads.py"
-EX10 = SOC / "10_harden_x_if" / "10_extract_harden_x_if.py"
+EX20 = SOC / "20_harden_x_if" / "20_extract_harden_x_if.py"
 WORK = BASE / "work"
 EXP = BASE / "expected"
 ART = WORK / "artifacts"
@@ -91,7 +91,8 @@ def run_01(d: Path):
     (d / "pll_top.sdc").write_text(
         "create_clock -name pll_ref -period 20.000 [get_ports ref_clk_in]\n"
         "create_generated_clock -name pll_core -source [get_ports ref_clk_in] -multiply_by 4 [get_ports core_clk_o]\n"
-        "create_generated_clock -name pll_bus  -source [get_ports ref_clk_in] -multiply_by 2 [get_ports bus_clk_o]\n")
+        "create_generated_clock -name pll_bus  -source [get_ports ref_clk_in] -multiply_by 2 [get_ports bus_clk_o]\n"
+        "set_false_path -from [get_ports ref_clk_in]\n")
     (d / "fab.sdc").write_text(
         "create_clock -name fab_in -period 5.000 [get_ports fab_clk_i]\n"
         "create_generated_clock -name fab_out -source [get_ports fab_clk_i] -combinational [get_ports fab_clk_o]\n")
@@ -108,8 +109,136 @@ def run_01(d: Path):
         "v_uart_tx,20.000,,UART TX board reference\n"
         "dqs_clk,2.500,,DDR DQS source-sync reference\n")
 
+    pending = d / "00_harden_port_inventory/pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    (pending / "u_pll.ports").write_text(
+        "input ref_clk_in\n"
+        "output bus_clk_o\n"
+        "output core_clk_o\n"
+        "input cfg_i\n",
+        encoding="utf-8",
+    )
+    (pending / "u_fab0.ports").write_text(
+        "input fab_clk_i\n"
+        "output fab_clk_o\n"
+        "output data_o\n",
+        encoding="utf-8",
+    )
+    (pending / "u_fab1.ports").write_text(
+        "input fab_clk_i\n"
+        "output fab_clk_o\n"
+        "output data_o\n",
+        encoding="utf-8",
+    )
+    (pending / "u_periph.ports").write_text(
+        "input clk_i\n"
+        "input ref2_i\n"
+        "input scan_mode_clk\n"
+        "output clk_o\n"
+        "input cfg_i\n",
+        encoding="utf-8",
+    )
+
     r = sh([str(EX01)], cwd=d)
     assert r.returncode == 0, f"01 failed:\n{r.stdout}\n{r.stderr}"
+
+
+def run_01_edge_checks(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        {"module_name": "edge_mod", "inst_name": "u_edge", "owner": "eve", "file_path": ""},
+    ]).to_excel(d / "info_all.xlsx", index=False)
+
+    with pd.ExcelWriter(d / "port_eve.xlsx", engine="xlsxwriter") as w:
+        port_sheet([
+            {"Input": "ref_i", "Input Width": 1, "From Whom": "top.ref_pad"},
+            {"Input": "no_period_i", "Input Width": 1, "From Whom": "top.no_period_pad"},
+            {"Output": "gen_o", "Output Width": 1},
+            {"Output": "add_o", "Output Width": 1},
+        ]).to_excel(w, sheet_name="U_EDGE", index=False)
+        port_sheet([
+            {"Input": "unused_i", "Input Width": 1, "From Whom": "top.unused_pad"},
+        ]).to_excel(w, sheet_name="u_orphan", index=False)
+
+    (d / "edge_mod.sdc").write_text(
+        "create_clock -name local_ref -period 10.000 [get_ports ref_i]\n"
+        "create_generated_clock -name gen_clk -source [get_clocks local_ref] -divide_by 2 [get_ports gen_o]\n"
+        "create_generated_clock -add -name add_clk -source [get_ports ref_i] -divide_by 4 [get_ports add_o]\n"
+        "create_clock -name no_period [get_ports no_period_i]\n",
+        encoding="utf-8",
+    )
+
+    pending = d / "00_harden_port_inventory/pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    (pending / "u_edge.ports").write_text(
+        "input ref_i\n"
+        "input no_period_i\n"
+        "output gen_o\n"
+        "output add_o\n",
+        encoding="utf-8",
+    )
+
+    r = sh([str(EX01)], cwd=d)
+    assert r.returncode == 0, f"01 edge checks failed:\n{r.stdout}\n{r.stderr}"
+    rerun = sh([str(EX01)], cwd=d)
+    assert rerun.returncode == 0, f"01 pending update should be idempotent:\n{rerun.stdout}\n{rerun.stderr}"
+    sdc = (d / "common/01_soc_clocks.sdc").read_text()
+    report = (d / "clock_check_report.txt").read_text()
+    assert "-source [get_clocks {top_ref_pad}]" in sdc, "01 did not remap -source [get_clocks local_ref]"
+    assert "matched instance 'u_edge' by case/space-insensitive fallback" in report
+    assert "port workbook sheet 'u_orphan' does not match any inst_name; ignored" in report
+    assert "CLOCK_CREATE_CLOCK_MISSING_PERIOD" in report
+    assert "CLOCK_ADD_OPTION_OUT_OF_SCOPE" in report
+    assert "not present in pending and no previous_removed" not in report
+
+
+def run_01_bad_source_checks(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        {"module_name": "bad_src_mod", "inst_name": "u_bad_src", "owner": "eve", "file_path": ""},
+    ]).to_excel(d / "info_all.xlsx", index=False)
+
+    with pd.ExcelWriter(d / "port_eve.xlsx", engine="xlsxwriter") as w:
+        port_sheet([
+            {"Input": "ref_i", "Input Width": 1, "From Whom": "top.ref_pad"},
+            {"Output": "gen_o", "Output Width": 1},
+        ]).to_excel(w, sheet_name="u_bad_src", index=False)
+
+    (d / "bad_src_mod.sdc").write_text(
+        "create_clock -name local_ref -period 10.000 [get_ports ref_i]\n"
+        "create_generated_clock -name bad_gen -source [get_ports ref_typo] -divide_by 2 [get_ports gen_o]\n",
+        encoding="utf-8",
+    )
+
+    r = sh([str(EX01), "--no-update-pending"], cwd=d)
+    assert r.returncode == 1, "01 should fail when generated clock -source get_ports is not in owner sheet"
+    report = (d / "clock_check_report.txt").read_text()
+    assert "CLOCK_GENERATED_SOURCE_NOT_IN_OWNER_SHEET" in report
+
+
+def run_01_multi_target_checks(d: Path):
+    d.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([
+        {"module_name": "multi_mod", "inst_name": "u_multi", "owner": "eve", "file_path": ""},
+    ]).to_excel(d / "info_all.xlsx", index=False)
+
+    with pd.ExcelWriter(d / "port_eve.xlsx", engine="xlsxwriter") as w:
+        port_sheet([
+            {"Input": "clk_a", "Input Width": 1, "From Whom": "top.clk_a_pad"},
+            {"Input": "clk_b", "Input Width": 1, "From Whom": "top.clk_b_pad"},
+        ]).to_excel(w, sheet_name="u_multi", index=False)
+
+    (d / "multi_mod.sdc").write_text(
+        "create_clock -period 10.000 [get_ports {clk_a clk_b}]\n",
+        encoding="utf-8",
+    )
+
+    r = sh([str(EX01), "--no-update-pending"], cwd=d)
+    assert r.returncode == 1, "01 should fail fast on multi-target clock commands"
+    report = (d / "clock_check_report.txt").read_text()
+    inv = (d / "clock_inventory.csv").read_text()
+    assert "CLOCK_MULTI_TARGET_NOT_SUPPORTED" in report
+    assert "clk_a" in inv and "clk_b" in inv and "skipped" in inv
 
 
 def active_clocks(inv_csv: Path):
@@ -330,9 +459,9 @@ def run_04(d: Path):
 
 
 # ----------------------------------------------------------------------------
-# 10: harden/subsys interface budget extraction + auto-resolve + blocking checks
+# 20: harden/subsys interface budget extraction + auto-resolve + blocking checks
 # ----------------------------------------------------------------------------
-def build_10_inputs(d: Path):
+def build_20_inputs(d: Path):
     d.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([
         {"inst_name": "u_a", "module_name": "harden_a", "owner": "dave", "sdc_path": "u_a.sdc"},
@@ -355,9 +484,30 @@ def build_10_inputs(d: Path):
         "set_input_delay -max 1.2 -clock [get_clocks u_pll_core_clk_o] [get_ports data_i]\n",
         encoding="utf-8",
     )
+    inv = d / "00_harden_port_inventory"
+    pending = inv / "pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    (pending / "u_a.ports").write_text(
+        "input clk_i\n"
+        "output data_o\n",
+        encoding="utf-8",
+    )
+    (pending / "u_b.ports").write_text(
+        "input data_i\n",
+        encoding="utf-8",
+    )
+    (inv / "connection_inventory.csv").write_text(
+        "connection_id,connection_type,src_instance,src_direction,src_port,src_bit_index,src_endpoint_key,src_soc_object,"
+        "dst_instance,dst_direction,dst_port,dst_bit_index,dst_endpoint_key,dst_soc_object,validation_status,note\n"
+        "CONN_u_a_data_o__u_b_data_i,harden_to_harden,u_a,output,data_o,,u_a:output:data_o,u_a/data_o,"
+        "u_b,input,data_i,,u_b:input:data_i,u_b/data_i,matched,\n"
+        "CONN_u_a_data_o__fabric_bus,harden_to_fabric,u_a,output,data_o,,u_a:output:data_o,u_a/data_o,"
+        "fabric,,fabric_bus,,fabric::fabric_bus,,matched,\n",
+        encoding="utf-8",
+    )
 
 
-def approve_10(form: Path, async_relation: bool = False):
+def approve_20(form: Path, async_relation: bool = False):
     wb = load_workbook(form)
     ws = wb["interface_budget"]
     col = {cell.value: cell.column for cell in ws[1]}
@@ -385,29 +535,29 @@ def approve_10(form: Path, async_relation: bool = False):
             ws.cell(r, col[key], value)
         break
     else:
-        raise AssertionError("10 target channel not found")
+        raise AssertionError("20 target channel not found")
     wb.save(form)
 
 
-def run_10(d: Path):
-    build_10_inputs(d)
-    first = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
-    assert first.returncode == 1, f"10 first run should stop for review:\n{first.stdout}\n{first.stderr}"
-    approve_10(d / "10_harden_x_if.xlsx")
-    r = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv", "--max-diff-threshold", "0.1"], cwd=d)
-    assert r.returncode == 0, f"10 normal generation failed:\n{r.stdout}\n{r.stderr}"
+def run_20(d: Path):
+    build_20_inputs(d)
+    first = sh([str(EX20), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+    assert first.returncode == 1, f"20 first run should stop for review:\n{first.stdout}\n{first.stderr}"
+    approve_20(d / "20_harden_x_if.xlsx")
+    r = sh([str(EX20), "-input", "../01_soc_clocks/clock_inventory.csv", "--max-diff-threshold", "0.1"], cwd=d)
+    assert r.returncode == 0, f"20 normal generation failed:\n{r.stdout}\n{r.stderr}"
 
     # Confirm async/exclusive gating in the same complex case without keeping its errored report.
     normal_report = (d / "harden_x_if_check_report_common_all_all.txt").read_text()
-    normal_sdc = (d / "common/10_harden_x_if.sdc").read_text()
-    approve_10(d / "10_harden_x_if.xlsx", async_relation=True)
-    bad = sh([str(EX10), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
-    assert bad.returncode == 1, "10 async relation should block generation"
-    assert "clock_relation=async blocks normal 10 budget" in (d / "harden_x_if_check_report_common_all_all.txt").read_text()
+    normal_sdc = (d / "common/20_harden_x_if.sdc").read_text()
+    approve_20(d / "20_harden_x_if.xlsx", async_relation=True)
+    bad = sh([str(EX20), "-input", "../01_soc_clocks/clock_inventory.csv"], cwd=d)
+    assert bad.returncode == 1, "20 async relation should block generation"
+    assert "clock_relation=asynchronous blocks normal 20 budget" in (d / "harden_x_if_check_report_common_all_all.txt").read_text()
 
     # Restore the successful artifacts for deterministic collection.
     (d / "harden_x_if_check_report_common_all_all.txt").write_text(normal_report, encoding="utf-8")
-    (d / "common/10_harden_x_if.sdc").write_text(normal_sdc, encoding="utf-8")
+    (d / "common/20_harden_x_if.sdc").write_text(normal_sdc, encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -440,7 +590,7 @@ def collect(name: str, text: str):
     p.write_text(text, encoding="utf-8")
 
 
-def collect_artifacts(w01, w02, w03, w04, w10):
+def collect_artifacts(w01, w02, w03, w04, w20):
     if ART.exists():
         shutil.rmtree(ART)
     ART.mkdir(parents=True)
@@ -448,6 +598,10 @@ def collect_artifacts(w01, w02, w03, w04, w10):
     collect("01/01_soc_clocks.sdc", (w01 / "common/01_soc_clocks.sdc").read_text())
     collect("01/clock_inventory.csv", (w01 / "clock_inventory.csv").read_text())
     collect("01/clock_check_report.txt", norm((w01 / "clock_check_report.txt").read_text()))
+    collect("01/removed_log/01_soc_clocks.removed",
+            (w01 / "00_harden_port_inventory/removed_log/01_soc_clocks.removed").read_text())
+    for path in sorted((w01 / "00_harden_port_inventory/pending").glob("*.ports")):
+        collect(f"01/pending/{path.name}", path.read_text())
     # 02
     for rel in ["common/02_soc_clock_timing_prects_ss_125.sdc",
                 "scenarios/func_clock_timing_prects_ss_125.sdc",
@@ -485,10 +639,10 @@ def collect_artifacts(w01, w02, w03, w04, w10):
         "io_pad_check_report_gpio_in_all_all.txt",
     ]:
         collect(f"04/{rep}", norm((w04 / rep).read_text()))
-    # 10
-    collect("10/common/10_harden_x_if.sdc", (w10 / "common/10_harden_x_if.sdc").read_text())
-    collect("10/harden_x_if_check_report_common_all_all.txt",
-            norm((w10 / "harden_x_if_check_report_common_all_all.txt").read_text()))
+    # 20
+    collect("20/common/20_harden_x_if.sdc", (w20 / "common/20_harden_x_if.sdc").read_text())
+    collect("20/harden_x_if_check_report_common_all_all.txt",
+            norm((w20 / "harden_x_if_check_report_common_all_all.txt").read_text()))
 
 
 # ----------------------------------------------------------------------------
@@ -527,15 +681,18 @@ def main():
     w02 = WORK / "02_soc_clock_timing"
     w03 = WORK / "03_soc_clock_groups"
     w04 = WORK / "04_soc_io_pads"
-    w10 = WORK / "10_harden_x_if"
+    w20 = WORK / "20_harden_x_if"
 
     run_01(w01)
+    run_01_edge_checks(WORK / "01_soc_clocks_edge_checks")
+    run_01_bad_source_checks(WORK / "01_soc_clocks_bad_source_checks")
+    run_01_multi_target_checks(WORK / "01_soc_clocks_multi_target_checks")
     clocks = active_clocks(w01 / "clock_inventory.csv")
     run_02(w02, w01 / "clock_inventory.csv", clocks)
     run_03(w03)
     run_04(w04)
-    run_10(w10)
-    collect_artifacts(w01, w02, w03, w04, w10)
+    run_20(w20)
+    collect_artifacts(w01, w02, w03, w04, w20)
 
     art_files, _ = compare()
 
@@ -549,7 +706,7 @@ def main():
         return 0
 
     _, fails = compare()
-    print(f"01->02->03->04->10 regression: {len(art_files)} artifact(s) checked")
+    print(f"01->02->03->04->20 regression: {len(art_files)} artifact(s) checked")
     if not fails:
         print("RESULT: PASS (all artifacts match expected/)")
         return 0

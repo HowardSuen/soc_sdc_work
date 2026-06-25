@@ -1,0 +1,11 @@
+u_fab0 input fab_clk_i covered_by=01_soc_clocks reason=upstream_clock_sink clock=u_fab0_fab_clk_i action=check_only from_whom=u_pll.core_clk_o source=fab.sdc:1
+u_fab0 output fab_clk_o covered_by=01_soc_clocks reason=forwarded_clock clock=u_fab0_fab_clk_o action=emit_output_clock source=fab.sdc:2
+u_fab1 input fab_clk_i covered_by=01_soc_clocks reason=upstream_clock_sink clock=u_fab1_fab_clk_i action=check_only from_whom=u_pll.core_clk_o source=fab.sdc:1
+u_fab1 output fab_clk_o covered_by=01_soc_clocks reason=forwarded_clock clock=u_fab1_fab_clk_o action=emit_output_clock source=fab.sdc:2
+u_periph input clk_i covered_by=01_soc_clocks reason=upstream_clock_sink clock=u_periph_clk_i action=check_only from_whom=u_fab0.fab_clk_o source=periph.sdc:1
+u_periph input ref2_i covered_by=01_soc_clocks reason=top_clock clock=top_aux_clk_pad action=emit_top_clock from_whom=top.aux_clk_pad source=periph.sdc:2
+u_periph input scan_mode_clk covered_by=01_soc_clocks reason=top_clock clock=top_scan_clk_pad action=emit_top_clock from_whom=top.scan_clk_pad source=periph.sdc:3
+u_periph output clk_o covered_by=01_soc_clocks reason=forwarded_clock clock=u_periph_clk_o action=emit_output_clock source=periph.sdc:4
+u_pll input ref_clk_in covered_by=01_soc_clocks reason=top_clock clock=top_sys_clk_pad action=emit_top_clock from_whom=top.sys_clk_pad source=pll_top.sdc:1
+u_pll output bus_clk_o covered_by=01_soc_clocks reason=generated_clock clock=u_pll_bus_clk_o action=emit_output_clock source=pll_top.sdc:3
+u_pll output core_clk_o covered_by=01_soc_clocks reason=generated_clock clock=u_pll_core_clk_o action=emit_output_clock source=pll_top.sdc:2

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Approve the main harden-to-harden row for 10 regression."""
+"""Approve the main harden-to-harden row for 20 regression."""
 
 import argparse
 from pathlib import Path
@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--async-relation", action="store_true")
     args = parser.parse_args()
 
-    path = Path("10_harden_x_if.xlsx")
+    path = Path("20_harden_x_if.xlsx")
     wb = load_workbook(path)
     ws = wb["interface_budget"]
     headers = {cell.value: cell.column for cell in ws[1]}

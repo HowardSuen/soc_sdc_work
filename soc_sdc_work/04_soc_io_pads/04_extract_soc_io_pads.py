@@ -16,10 +16,73 @@ import hashlib
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from dataclasses import dataclass, field
+except ImportError:  # pragma: no cover - Python 3.6 compatibility path
+    class _CompatField:
+        def __init__(self, default_factory=None):
+            self.default_factory = default_factory
+
+    def field(default_factory=None):
+        return _CompatField(default_factory=default_factory)
+
+    def dataclass(_cls=None, frozen=False):
+        def wrap(cls):
+            annotations = getattr(cls, "__annotations__", {})
+            names = list(annotations.keys())
+            defaults = {}
+            factories = {}
+            for name in names:
+                if hasattr(cls, name):
+                    value = getattr(cls, name)
+                    if isinstance(value, _CompatField):
+                        factories[name] = value.default_factory
+                        delattr(cls, name)
+                    else:
+                        defaults[name] = value
+
+            def __init__(self, *args, **kwargs):
+                if len(args) > len(names):
+                    raise TypeError("too many positional arguments")
+                values = {}
+                for name, value in zip(names, args):
+                    values[name] = value
+                for name in names[len(args):]:
+                    if name in kwargs:
+                        values[name] = kwargs.pop(name)
+                    elif name in factories:
+                        values[name] = factories[name]()
+                    elif name in defaults:
+                        values[name] = defaults[name]
+                    else:
+                        raise TypeError("missing required argument: " + name)
+                if kwargs:
+                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
+                for name in names:
+                    object.__setattr__(self, name, values[name])
+
+            def __eq__(self, other):
+                if other.__class__ is not cls:
+                    return False
+                return all(getattr(self, name) == getattr(other, name) for name in names)
+
+            cls.__init__ = __init__
+            cls.__eq__ = __eq__
+            if frozen:
+                def __hash__(self):
+                    return hash(tuple(getattr(self, name) for name in names))
+                cls.__hash__ = __hash__
+            else:
+                cls.__hash__ = None
+            return cls
+
+        if _cls is None:
+            return wrap
+        return wrap(_cls)
 
 try:
     import pandas as pd
@@ -45,6 +108,7 @@ REVIEW_STATUS_VALUES = {"", "pending", "approved", "rejected"}
 SOURCE_TYPES = {"", "extracted", "manual", "na"}
 TOOLS = {"sta", "synth", "both"}
 ACTIVE_01_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
+PORT_BIT_RE = re.compile(r"^[^\s\[\]]+(?:\[\d+\])?$")
 
 SUPPORTED_COMMANDS = {
     "set_input_delay": "input_delay",
@@ -221,6 +285,13 @@ class ClockInfo:
 class FormRow:
     row_idx: int
     values: Dict[str, object]
+
+
+@dataclass(frozen=True)
+class PortKey:
+    inst_name: str
+    direction: str
+    port: str
 
 
 class Report:
@@ -429,6 +500,24 @@ def read_port_workbooks(paths: Sequence[Path], report: Report) -> Dict[str, Dict
                 report.error(f"failed to read {path.name}:{sheet_name}: {exc}")
     report.info(f"loaded {len(sheets)} instance port sheet(s) from {len(paths)} workbook(s)")
     return sheets
+
+
+def default_port_workbooks(cwd: Path, info_name: str, form_name: str, report: Report) -> List[Path]:
+    excluded = {info_name, form_name}
+    candidates: List[Path] = []
+    skipped: List[str] = []
+    for path in sorted(cwd.glob("*.xlsx")):
+        if path.name in excluded or path.name.startswith("~$"):
+            continue
+        if path.name.startswith(("port_", "ports_")):
+            candidates.append(path)
+        else:
+            skipped.append(path.name)
+    if skipped:
+        report.warn(
+            "ignored non-port workbook(s) in 04 input directory: " + ", ".join(skipped[:10])
+        )
+    return candidates
 
 
 def attach_port_data(instances: Dict[str, InstInfo], sheets: Dict[str, Dict[str, Dict[str, PortInfo]]], report: Report) -> None:
@@ -688,16 +777,49 @@ def split_object_list(text: str) -> List[str]:
     return [part for part in re.split(r"[\s,;]+", text) if part]
 
 
-COLLECTION_RE = re.compile(r"\[(get_ports|get_pins|get_nets|get_clocks)\s+([^\]]+)\]")
+COLLECTION_KINDS = {"get_ports", "get_pins", "get_nets", "get_clocks"}
 
 
 def parse_collection(token: str) -> Optional[Tuple[str, List[str]]]:
-    match = COLLECTION_RE.fullmatch(clean_cell(token))
-    if not match:
+    text = clean_cell(token)
+    if not (text.startswith("[") and text.endswith("]")):
         return None
-    kind = match.group(1)
-    objects = split_object_list(match.group(2))
+    end = find_matching(text, 0, "[", "]")
+    if end != len(text) - 1:
+        return None
+    words = tokenize_tcl_words(text[1:-1].strip())
+    if not words or words[0] not in COLLECTION_KINDS:
+        return None
+    kind = words[0]
+    objects: List[str] = []
+    idx = 1
+    while idx < len(words):
+        word = words[idx]
+        if word.startswith("-"):
+            idx += 1
+            continue
+        objects.extend(split_object_list(word))
+        idx += 1
     return kind, objects
+
+
+def iter_collection_spans(text: str) -> Iterable[Tuple[int, int, str, List[str]]]:
+    idx = 0
+    while idx < len(text):
+        start = text.find("[", idx)
+        if start < 0:
+            return
+        end = find_matching(text, start, "[", "]")
+        if end < 0:
+            return
+        token = text[start : end + 1]
+        parsed = parse_collection(token)
+        if parsed:
+            kind, objects = parsed
+            yield start, end + 1, kind, objects
+            idx = end + 1
+        else:
+            idx = start + 1
 
 
 def top_port_from_connection(value: str) -> str:
@@ -747,6 +869,55 @@ def build_pad_records(instances: Dict[str, InstInfo]) -> List[PadRecord]:
             top = clean_top_name(port.inout_name) or top_port_from_connection(port.connectivity) or port.name
             add(PadRecord(top, top, inst.inst_name, port.name, "inout", "yes", "gpio_in,gpio_out"))
     return records
+
+
+def is_multi_bit_width(value: str) -> bool:
+    text = clean_cell(value)
+    if not text:
+        return False
+    match = re.fullmatch(r"\d+", text)
+    return bool(match and int(text) > 1)
+
+
+def validate_canonical_port_key(inst_name: str, direction: str, port: PortInfo, report: Report) -> None:
+    if not PORT_BIT_RE.fullmatch(port.name):
+        report.error(
+            f"{inst_name}: {direction} port {port.name} is not a canonical scalar/bit key; "
+            "expand bus/range ports to per-bit keys like name[0]"
+        )
+    if "[" not in port.name and (is_multi_bit_width(port.width) or is_multi_bit_width(port.used_width)):
+        report.error(
+            f"{inst_name}: {direction} port {port.name} has width={port.width or '-'} "
+            f"used_width={port.used_width or '-'} but is not bit-expanded"
+        )
+
+
+def validate_canonical_top_key(inst_name: str, direction: str, port_name: str, top_name: str, report: Report) -> None:
+    if top_name and not PORT_BIT_RE.fullmatch(top_name):
+        report.error(
+            f"{inst_name}: {direction} port {port_name} maps to non-canonical top pad {top_name}; "
+            "expand bus/range pads to per-bit keys like pad[0]"
+        )
+
+
+def validate_integration_port_keys(instances: Dict[str, InstInfo], report: Report) -> None:
+    for inst in instances.values():
+        for port in inst.inputs.values():
+            validate_canonical_port_key(inst.inst_name, "input", port, report)
+            validate_canonical_top_key(
+                inst.inst_name,
+                "input",
+                port.name,
+                top_port_from_connection(port.from_whom),
+                report,
+            )
+        for port in inst.outputs.values():
+            validate_canonical_port_key(inst.inst_name, "output", port, report)
+            validate_canonical_top_key(inst.inst_name, "output", port.name, clean_top_name(port.to_top), report)
+        for port in inst.inouts.values():
+            validate_canonical_port_key(inst.inst_name, "inout", port, report)
+            top = clean_top_name(port.inout_name) or top_port_from_connection(port.connectivity) or port.name
+            validate_canonical_top_key(inst.inst_name, "inout", port.name, top, report)
 
 
 def map_single_object(inst: InstInfo, kind: str, obj: str) -> ObjectMapping:
@@ -828,20 +999,28 @@ def rewrite_command(raw: str, inst: InstInfo) -> Tuple[str, List[str], bool, str
     pads: List[str] = []
     unresolved = False
     messages: List[str] = []
+    replacements: List[Tuple[int, int, str]] = []
 
-    def repl(match) -> str:
-        nonlocal unresolved
-        kind = match.group(1)
-        objects = split_object_list(match.group(2))
+    for start, end, kind, objects in iter_collection_spans(raw):
         mappings = [map_single_object(inst, kind, obj) for obj in objects]
         merged = merge_mappings(mappings)
         pads.extend(merged.pad_names)
         unresolved = unresolved or merged.unresolved
         if merged.message:
             messages.append(merged.message)
-        return merged.collection or match.group(0)
+        replacements.append((start, end, merged.collection or raw[start:end]))
 
-    rewritten = COLLECTION_RE.sub(repl, raw)
+    if not replacements:
+        rewritten = raw
+    else:
+        chunks: List[str] = []
+        cursor = 0
+        for start, end, value in replacements:
+            chunks.append(raw[cursor:start])
+            chunks.append(value)
+            cursor = end
+        chunks.append(raw[cursor:])
+        rewritten = "".join(chunks)
     return rewritten, sorted(set(pads)), unresolved, "; ".join(dict.fromkeys(messages))
 
 
@@ -1352,6 +1531,7 @@ def validate_rows(
     current_digests: Dict[str, str],
     expected_time_unit: str,
     expected_cap_unit: str,
+    tool: str,
     report: Report,
 ) -> None:
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
@@ -1478,6 +1658,15 @@ def validate_rows(
             if row_scenario(row) == "common" and normalize_key(values.get("direction")) == "inout" and ctype in DELAY_TYPES:
                 report.warn(
                     f"io_constraints row {row.row_idx} {pad}: inout/GPIO direction-specific delay is in common"
+                )
+
+        if is_apply_approved(row) and row_selected_for_output(row, scenario, stage, corner):
+            if normalize_key(values.get("constraint_type")) == "dont_touch_network" and tool == "sta":
+                continue
+            if not commands_for_row(row, tool, True):
+                report.error(
+                    f"io_constraints row {row.row_idx} {pad}: approved row cannot emit an SDC command; "
+                    "check required value fields or false_path rewritten/original command"
                 )
 
     for key, group in approved_by_key.items():
@@ -1633,7 +1822,10 @@ def commands_for_row(row: FormRow, tool: str, is_first_delay_command: bool) -> L
         return []
     if ctype == "false_path":
         rewritten = extra_option_value(clean_cell(values.get("extra_options")), "rewritten_command")
-        return [rewritten] if rewritten else []
+        if rewritten:
+            return [rewritten]
+        original = clean_cell(values.get("original_command"))
+        return [original] if original.startswith("set_false_path") else []
     if ctype in DELAY_TYPES:
         return delay_commands(values, ctype, obj, is_first_delay_command)
     if ctype == "load":
@@ -1878,16 +2070,214 @@ def check_source_digest(row: FormRow, current_digests: Dict[str, str], report: R
 def check_units(row: FormRow, expected_time_unit: str, expected_cap_unit: str, report: Report) -> None:
     unit_time = clean_cell(row.values.get("unit_time"))
     unit_cap = clean_cell(row.values.get("unit_cap"))
-    if expected_time_unit and unit_time and normalize_key(unit_time) != normalize_key(expected_time_unit):
-        report.warn(
-            f"io_constraints row {row.row_idx} {clean_cell(row.values.get('pad_name'))}: "
-            f"unit_time={unit_time} differs from expected {expected_time_unit}"
-        )
-    if expected_cap_unit and unit_cap and normalize_key(unit_cap) != normalize_key(expected_cap_unit):
-        report.warn(
-            f"io_constraints row {row.row_idx} {clean_cell(row.values.get('pad_name'))}: "
-            f"unit_cap={unit_cap} differs from expected {expected_cap_unit}"
-        )
+    pad = clean_cell(row.values.get("pad_name"))
+    if expected_time_unit:
+        if not unit_time:
+            report.warn(f"io_constraints row {row.row_idx} {pad}: unit_time is blank; expected {expected_time_unit}")
+        elif normalize_key(unit_time) != normalize_key(expected_time_unit):
+            report.warn(
+                f"io_constraints row {row.row_idx} {pad}: unit_time={unit_time} differs from expected {expected_time_unit}"
+            )
+    if expected_cap_unit:
+        if not unit_cap:
+            report.warn(f"io_constraints row {row.row_idx} {pad}: unit_cap is blank; expected {expected_cap_unit}")
+        elif normalize_key(unit_cap) != normalize_key(expected_cap_unit):
+            report.warn(
+                f"io_constraints row {row.row_idx} {pad}: unit_cap={unit_cap} differs from expected {expected_cap_unit}"
+            )
+
+
+def pending_line_key(line: str) -> Optional[Tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 2:
+        return None
+    direction, port = parts[0], parts[1]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return direction, port
+
+
+def removed_line_key(line: str) -> Optional[PortKey]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 3:
+        return None
+    inst_name, direction, port = parts[:3]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return PortKey(inst_name, direction, port)
+
+
+def read_removed_keys(log_dir: Path) -> Set[PortKey]:
+    keys: Set[PortKey] = set()
+    if not log_dir.is_dir():
+        return keys
+    for path in sorted(log_dir.glob("*.removed")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key = removed_line_key(line)
+            if key is not None:
+                keys.add(key)
+    return keys
+
+
+def is_approved_na(row: FormRow) -> bool:
+    return (
+        normalize_key(row.values.get("apply")) == "yes"
+        and normalize_key(row.values.get("review_status")) == "approved"
+        and normalize_key(row.values.get("source_type")) == "na"
+    )
+
+
+def removable_pad_records_for_04(
+    rows: Sequence[FormRow],
+    pads: Sequence[PadRecord],
+    scenario: str,
+    stage: str,
+    corner: str,
+) -> List[PadRecord]:
+    confirmed_pads: Set[str] = set()
+    for row in rows:
+        if not row_selected_for_assembled(row, scenario, stage, corner):
+            continue
+        if not (is_apply_approved(row) or is_approved_na(row)):
+            continue
+        pad = clean_cell(row.values.get("pad_name"))
+        ctype = normalize_key(row.values.get("constraint_type"))
+        if pad and (ctype in set(SUPPORTED_COMMANDS.values()) or is_approved_na(row)):
+            confirmed_pads.add(pad)
+
+    result: List[PadRecord] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    for pad in pads:
+        key = (pad.subsys_instance, pad.direction, pad.subsys_port)
+        if pad.pad_name in confirmed_pads and key not in seen:
+            seen.add(key)
+            result.append(pad)
+    return result
+
+
+def removed_log_line_04(pad: PadRecord, scenario: str, stage: str, corner: str) -> str:
+    return " ".join(
+        [
+            pad.subsys_instance,
+            pad.direction,
+            pad.subsys_port,
+            "covered_by=04_soc_io_pads",
+            "reason=pad_environment",
+            f"pad={pad.pad_name}",
+            f"scenario={scenario}",
+            f"stage={stage}",
+            f"corner={corner}",
+        ]
+    )
+
+
+def update_pending_for_04(
+    cwd: Path,
+    pending_root: Path,
+    rows: Sequence[FormRow],
+    pads: Sequence[PadRecord],
+    scenario: str,
+    stage: str,
+    corner: str,
+    report: Report,
+) -> None:
+    pending_dir = pending_root / "pending"
+    if not pending_dir.exists():
+        return
+    if not pending_dir.is_dir():
+        report.error(f"{pending_dir}: pending path exists but is not a directory")
+        return
+
+    removable = removable_pad_records_for_04(rows, pads, scenario, stage, corner)
+    if not removable:
+        return
+
+    log_dir = pending_root / "removed_log"
+    previous_removed = read_removed_keys(log_dir)
+    by_inst: Dict[str, List[PadRecord]] = defaultdict(list)
+    for pad in removable:
+        by_inst[pad.subsys_instance].append(pad)
+
+    removed_records: List[PadRecord] = []
+    for inst_name, inst_pads in sorted(by_inst.items()):
+        pending_file = pending_dir / f"{inst_name}.ports"
+        if not pending_file.is_file():
+            for pad in inst_pads:
+                key = PortKey(pad.subsys_instance, pad.direction, pad.subsys_port)
+                if key in previous_removed:
+                    continue
+                report.error(
+                    f"{pending_file}: missing pending file for 04 pad port "
+                    f"{pad.subsys_instance}/{pad.subsys_port}"
+                )
+            continue
+
+        lines = pending_file.read_text(encoding="utf-8").splitlines()
+        index: Dict[Tuple[str, str], int] = {}
+        duplicate_keys: Set[Tuple[str, str]] = set()
+        for idx, line in enumerate(lines):
+            key = pending_line_key(line)
+            if key is None:
+                continue
+            if key in index:
+                duplicate_keys.add(key)
+            else:
+                index[key] = idx
+        for direction, port in sorted(duplicate_keys):
+            report.error(f"{pending_file}: duplicate pending port line {direction} {port}")
+
+        remove_line_indices: Set[int] = set()
+        for pad in inst_pads:
+            key = (pad.direction, pad.subsys_port)
+            port_key = PortKey(pad.subsys_instance, pad.direction, pad.subsys_port)
+            if key not in index:
+                if port_key in previous_removed:
+                    continue
+                report.error(
+                    f"{pending_file}: 04 wants to remove {pad.direction} {pad.subsys_port}, "
+                    "but it is not present in pending and no previous_removed record exists"
+                )
+                continue
+            remove_line_indices.add(index[key])
+            removed_records.append(pad)
+
+        if remove_line_indices:
+            kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
+            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+
+    if removed_records:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "04_soc_io_pads.removed"
+        existing_lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.is_file() else []
+        existing_keys = {
+            key
+            for key in (removed_line_key(line) for line in existing_lines)
+            if key is not None
+        }
+        new_lines = []
+        for pad in sorted(removed_records, key=lambda item: (item.subsys_instance, item.direction, item.subsys_port)):
+            key = PortKey(pad.subsys_instance, pad.direction, pad.subsys_port)
+            if key not in existing_keys:
+                new_lines.append(removed_log_line_04(pad, scenario, stage, corner))
+                existing_keys.add(key)
+        if new_lines:
+            log_lines = [line for line in existing_lines if line.strip()] + new_lines
+            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+        try:
+            display_path = log_path.relative_to(cwd)
+        except ValueError:
+            display_path = log_path
+        report.info(f"removed {len(removed_records)} harden pad port(s) from pending; log={display_path}")
 
 
 def write_report(
@@ -1935,6 +2325,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--time-unit", default="", help="optional expected time unit for unit_time checks, e.g. ns")
     parser.add_argument("--cap-unit", default="", help="optional expected capacitance unit for unit_cap checks, e.g. pF")
     parser.add_argument("--force-generate-after-sync", action="store_true", help="generate SDC even if workbook was synchronized")
+    parser.add_argument(
+        "--pending-root",
+        default="00_harden_port_inventory",
+        help=(
+            "optional 00 harden port inventory root. If <root>/pending exists, "
+            "04 removes covered pad ports and writes removed_log/04_soc_io_pads.removed"
+        ),
+    )
+    parser.add_argument(
+        "--no-update-pending",
+        action="store_true",
+        help="do not consume 00_harden_port_inventory/pending even if it exists",
+    )
     parser.add_argument("--report", help="output report path")
     return parser.parse_args(argv)
 
@@ -1948,9 +2351,10 @@ def main(argv: Sequence[str]) -> int:
     if not info_all.is_file():
         raise RuntimeError(f"integration file not found: {info_all}")
     instances = read_info_all(info_all, report)
-    port_paths = sorted(path for path in cwd.glob("*.xlsx") if path.name not in {Path(args.info_all).name, Path(args.form).name})
+    port_paths = default_port_workbooks(cwd, Path(args.info_all).name, Path(args.form).name, report)
     port_sheets = read_port_workbooks(port_paths, report)
     attach_port_data(instances, port_sheets, report)
+    validate_integration_port_keys(instances, report)
     resolve_sdc_paths(instances, cwd, report)
     current_digests = collect_current_sdc_digests(instances)
 
@@ -1981,12 +2385,14 @@ def main(argv: Sequence[str]) -> int:
         current_digests,
         args.time_unit,
         args.cap_unit,
+        args.tool,
         report,
     )
 
     output_path = output_sdc_path(cwd, args.scenario, args.stage, args.corner)
     rpt_path = Path(args.report) if args.report else report_path(cwd, args.scenario, args.stage, args.corner)
 
+    generated = False
     if report.sync_changed and not args.force_generate_after_sync:
         report.warn("workbook changed during sync; review 04_soc_io_pads.xlsx before SDC generation")
     elif report.error_count == 0:
@@ -1996,8 +2402,21 @@ def main(argv: Sequence[str]) -> int:
             encoding="utf-8",
         )
         report.info(f"wrote {output_path}")
+        generated = True
     else:
         report.warn("SDC generation skipped because errors were reported")
+
+    if generated and not args.no_update_pending and args.pending_root:
+        update_pending_for_04(
+            cwd,
+            cwd / args.pending_root,
+            rows,
+            pad_records,
+            args.scenario,
+            args.stage,
+            args.corner,
+            report,
+        )
 
     coverage_lines = build_coverage_lines(rows, pad_records, args.scenario, args.stage, args.corner)
     write_report(rpt_path, report, args.scenario, args.stage, args.corner, args.tool, form_path, output_path, coverage_lines)

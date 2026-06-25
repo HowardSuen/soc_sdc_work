@@ -1,0 +1,48 @@
+20_harden_x_if extraction report
+================================
+
+Scenario: common
+Stage   : all
+Corner  : all
+Form    : <WORK>/20_harden_x_if/20_harden_x_if.xlsx
+Output  : <WORK>/20_harden_x_if/common/20_harden_x_if.sdc
+Warnings: 2
+Errors  : 0
+Sync changed: no
+
+Messages:
+INFO: loaded 13 clock(s) from <WORK>/01_soc_clocks/clock_inventory.csv
+INFO: loaded 2 instance(s) from info_all.xlsx
+INFO: loaded 2 instance port sheet(s) from 1 workbook(s)
+INFO: loaded 2 connection edge(s) from <WORK>/20_harden_x_if/00_harden_port_inventory/connection_inventory.csv
+INFO: feedthrough inventory not found: <WORK>/20_harden_x_if/feedthrough_inventory.csv; no stitched feedthrough channel will be added
+INFO: built 2 channel_inventory record(s) from 00/10 inventories
+INFO: extracted 1 interface delay candidate(s) from u_a.sdc
+INFO: extracted 1 interface delay candidate(s) from u_b.sdc
+INFO: interface_budget row 2 CH_u_a_data_o__u_b_data_i: auto-resolved converted_max=1.2 from interconnect budget candidates
+WARNING: interface_budget row 2 CH_u_a_data_o__u_b_data_i: max candidates differ by 0.3
+WARNING: interface_budget row 2 CH_u_a_data_o__u_b_data_i: original min delay contains negative value; review set_min_delay sign convention carefully
+INFO: wrote 3 auto-resolved field(s) back to 20_harden_x_if.xlsx
+INFO: wrote <WORK>/20_harden_x_if/common/20_harden_x_if.sdc
+INFO: removed 2 harden interface endpoint(s) from pending; log=00_harden_port_inventory/removed_log/20_harden_x_if.removed
+
+Coverage:
+  inventory channels     : 2
+  assembled approved row : 1
+  emitted approved row   : 1
+
+  Per-channel assembled status:
+    CH_u_a_data_o__u_b_data_i: type=harden_to_harden inventory_timing=unknown pad=no clock=no status=row=2 timing=lib_blackbox budget=interconnect_budget emit=max
+    CH_u_a_data_o__fabric_fabric_bus: type=harden_to_fabric inventory_timing=unknown pad=no clock=no status=NO_APPROVED_BUDGET
+
+  Rows not emitted for this output:
+    row 3: CH_u_a_data_o__fabric_fabric_bus reason=apply!=yes,review_status!=approved,budget_model=unknown
+
+  Clock-relative extracted rows not directly convertible:
+    <none>
+
+  Channels with differing max candidates:
+    row 2: CH_u_a_data_o__u_b_data_i diff=0.3
+
+  20 channels without approved budget:
+    CH_u_a_data_o__fabric_fabric_bus: type=harden_to_fabric reason=candidate exists but no approved budget

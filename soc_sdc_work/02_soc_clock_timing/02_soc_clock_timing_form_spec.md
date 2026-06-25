@@ -61,18 +61,19 @@ derate_ocv
 ## 3. 通用约定
 
 - `clock_name` / `from_clock` / `to_clock` 必须引用 `01_soc_clocks.sdc` 已创建的 clock name。
-- 脚本读取 `01_soc_clocks` 生成的 `clock_inventory.csv` 做 clock name 合法性检查。
+- 脚本读取 `01_soc_clocks` 生成的 `clock_inventory.csv` 做 clock name 合法性检查。02 只依赖 01 CSV 中真实输出的字段，例如 `clock_name`、`clock_kind`、`direction`、`direct_source`、`final_action`；不应假设存在 01 内部 dataclass 才有的临时字段。
+- 02 不直接读取或删除 `00_harden_port_inventory/pending/*.ports`。若某个 vector harden port 的不同 bit 被 01 创建成多个 clock object，02 只看到这些 bit 对应的独立 `clock_name`，例如 `u_x_clk_o_bit0`、`u_x_clk_o_bit1`；不能再用 bus/range 语义推导 budget。
 - `scenario` 建议使用 `common`、`func`、`scan`、`mbist`、`gpio_in`、`gpio_out`。
 - `scenario = common` 表示所有 mode 都成立的 clock timing budget，只能输出到 `common/`。
 - `scenario != common` 表示 scenario 专属 clock timing budget，必须输出到 `scenarios/`。
 - `stage` 建议使用 `synth`、`prects`、`postcts`、`postroute`；表单按 stage 独立后，同一份表单内的 `stage` 应保持一致。
-- `corner` 使用项目 flow 中的 corner / analysis view 名称，例如 `ss_125`、`ff_m40`。
+- `corner` 使用项目 flow 中的 corner / analysis view 名称，例如 `ss_125`、`ff_m40` 或 `SS_125`。脚本保留用户输入的大小写并用于表单匹配和输出文件名；若项目 MMMC view 名大小写敏感，表单与 assembly 必须使用同一写法。
 - SDC 本身没有 corner 条件化能力；同一个输出 SDC 中不能同时平铺多个 corner 的 `set_clock_uncertainty`、`set_clock_latency`、`set_clock_transition`、`set_timing_derate`。
 - SDC 也没有 scenario 条件化能力；同一个 common 输出 SDC 中不能混入 `func` / `scan` / `mbist` 等 scenario 专属 timing。
 - 02 脚本必须按 `scenario + stage + corner` 生成一个 resolved effective SDC，由 scenario assembly 和 MMMC analysis view 选择性 source。
 - 对于 `scenario != common`，生成时按优先级选择胜出行：当前具体 scenario 行优先于 `common` 行；同一 clock/stage/corner 最终只 emit 一个胜出行。
 - 如果具体 scenario 行 `apply = no`，它仍然是胜出行，可用于显式压掉较低优先级的 common 默认约束。
-- 所有数值使用当前 STA/综合 flow 的 SDC 时间单位；建议项目统一在 flow 文档中声明，例如 ns。
+- 所有数值使用当前 STA/综合 flow 的 SDC 时间单位；建议项目统一在 flow 文档中声明，例如 ns。脚本生成 SDC 时会把可解析数值规范化为稳定的十进制表示，避免 xlsx 单元格是文本还是数字导致输出精度风格漂移。
 - 空白数值表示不生成对应命令。
 - `apply = yes` 才生成约束；`apply = no` 表示保留记录但不生成。
 - `note` 只用于人工审查，不参与生成。
@@ -126,6 +127,19 @@ apply                    yes/no
 sync_status              脚本同步状态，人工不建议手填；OK / NEW_FROM_01 / STALE_NOT_IN_01
 note                     人工说明
 ```
+
+`sync_status` 由脚本维护，不应作为人工 review 状态使用：
+
+- `NEW_FROM_01`：脚本发现 01 中新增 clock 后自动追加的行。用户补齐该行 budget 后，脚本在下一轮 sync 自动复位为 `OK`。
+- `STALE_NOT_IN_01`：脚本发现该 clock 已不在 01 inventory 中。若后续 clock 又回到 01 inventory，且该行仍有明确约束意图，脚本自动复位为 `OK`。
+- `OK` / 空白：可参与生成。
+
+自动复位到 `OK` 的条件：
+
+- `apply = yes` 且至少会生成一条 timing/propagated 命令。
+- 或 `apply = no` 且 `note` 非空，用于显式说明该 clock 在当前 scenario/corner 不生成 02 约束。
+
+因此用户通常只需要填写 `apply`、数值字段和 `note`，不需要手动改 `sync_status`。
 
 示例：
 
@@ -376,16 +390,17 @@ stage 表单 clock_budget 中当前 -scenario/-corner 的有效胜出 clock_name
 
 若当前 scenario/corner 的有效胜出 clock 与 01 完全一致，且不存在 stale clock：
 
-1. 脚本可将正常行 `sync_status` 标为 `OK`，或保持空白并在生成时视为空白等价于 `OK`。
-2. 进入字段合法性检查。
+1. 脚本应将已具备明确约束意图的 `NEW_FROM_01` / 已恢复的 `STALE_NOT_IN_01` 行自动复位为 `OK`，并清除旧的黄色/红色标记。
+2. `sync_status = OK` 或空白在生成时视为可用。
+3. 进入字段合法性检查。
 
 ### 7.5 中断条件
 
 以下情况必须中断，不生成 SDC：
 
 - 新生成了 stage 表单，用户尚未填写 budget。
-- 当前 `-scenario/-corner` 有 `NEW_FROM_01` 行。
-- 任意 scenario/corner 有 `STALE_NOT_IN_01` 行。
+- 当前 `-scenario/-corner` 有尚未补齐约束意图、无法自动复位为 `OK` 的 `NEW_FROM_01` 行。
+- 任意 scenario/corner 有仍不在 01 inventory 中的 `STALE_NOT_IN_01` 行。
 - 当前 `-scenario/-corner` 的有效胜出 clock 与 01 clock inventory 不一致。
 - 当前 `-scenario/-corner` 的 `apply`、`propagated` 等枚举字段非法。
 - 当前 `-scenario/-corner` 的数值字段填写了非数字内容。

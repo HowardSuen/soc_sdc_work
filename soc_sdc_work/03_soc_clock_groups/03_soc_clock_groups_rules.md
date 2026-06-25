@@ -18,15 +18,36 @@ set_clock_groups -physically_exclusive
 
 03 依赖 `01_soc_clocks.sdc` 已经创建好的 clock object，也依赖 `01_soc_clocks` 生成的 `clock_inventory.csv` 做 clock name 检查和候选关系辅助分析。
 
+03 不直接读取或删除 `00_harden_port_inventory/pending/*.ports`。若某个 vector harden clock port 被 01 展开为 per-bit clock object，03 只按 01 inventory 中的实际 `clock_name` 分组；表单不得用整 bus/range 代替这些 clock name。
+
 ### 1.1 默认 STA 姿态
 
-当前 03 规则采用 **默认 synchronous + 显式枚举 async/exclusive** 的姿态：
+当前 03 规则采用 **默认 synchronous + 显式枚举 asynchronous / logically_exclusive / physically_exclusive** 的姿态：
 
 - 未被 `set_clock_groups` 覆盖的 clock pair，在 STA 中保持默认 synchronous 分析。
-- 表单主要枚举需要切断或互斥处理的 async / logically exclusive / physically exclusive 关系。
+- 表单主要枚举需要切断或互斥处理的 `asynchronous` / `logically_exclusive` / `physically_exclusive` 关系。
 - coverage report 中的 `uncovered_cross_root_pairs` 表示这些跨 03 genealogy `tree_root` clock pair 仍按默认 synchronous 分析，供 reviewer 判断是否应新增 group 或保留默认。
 
 如果项目决定采用 **默认 async + 显式声明 synchronous 例外** 的反向姿态，需要单独规划 03 表单语义、检查规则和 coverage report 读法；不能与当前规则混用。
+
+### 1.2 共享 clock relation 枚举
+
+03 是 SoC clock relationship 的权威来源。后续 20/30 若需要记录两端 clock 关系，必须使用同一套 canonical enum：
+
+```text
+synchronous
+asynchronous
+logically_exclusive
+physically_exclusive
+unknown
+```
+
+规则：
+
+- 03 `relation_type` 生成时只使用 `asynchronous` / `logically_exclusive` / `physically_exclusive`。
+- `synchronous` 表示在当前 assembled view 中没有被 03 group 切断或互斥，仍按默认同步/相关时钟关系分析。
+- `unknown` 表示尚未完成 03 assembled view 查询或人工判断，不应被脚本当作 safe relation。
+- 下游表单可接受旧别名作为输入，例如 `async`、`sync`、`logically exclusive`，但脚本必须归一成 canonical enum 后再检查、报告和回写 xlsx。文档、review 记录和跨 stage 接口只使用 canonical enum。
 
 ## 2. 放什么
 
@@ -43,7 +64,7 @@ set_clock_groups -physically_exclusive
 - `set_clock_uncertainty` / `set_clock_latency` / `set_clock_transition` / `set_propagated_clock`，这些放 02。
 - IO delay / driving / load / input transition，这些放 04。
 - `set_false_path` / `set_multicycle_path` / `set_max_delay` / `set_min_delay`。
-- harden-to-harden 特定 path exception，这些放 20。
+- harden-to-harden 特定 path exception，这些放 30。
 
 ## 3. 与 01 的关系
 
@@ -60,7 +81,7 @@ set_clock_groups -physically_exclusive
 - 生成 clock group candidate，辅助人工 review。
 - 对已批准的 clock group 做 domain closure 展开和完整性检查，避免只把 master clock 放进 group、漏掉 generated/forwarded 子时钟。
 
-01 信息不能直接决定两个 domain 是否 async/exclusive，但可以判断一个已确认 domain 内还包含哪些派生 clock。
+01 信息不能直接决定两个 domain 是否 asynchronous/exclusive，但可以判断一个已确认 domain 内还包含哪些派生 clock。
 
 重要原则：
 
@@ -303,7 +324,7 @@ note
 
 候选来源可以包括：
 
-- 03 genealogy `tree_root` 不同的 clock pair；01 `root_source` 仅作为参考字段保留。
+- 第一版脚本自动生成的 candidate 只覆盖 03 genealogy `tree_root` 不同的 clock pair；01 `root_source` 仅作为参考字段保留。
 - 01 中明确经过 mux/bypass/test source 的 clock。
 - integration 表中跨 harden 的 clock domain 边界。
 - 用户手工导入的 clock relationship review list。
@@ -411,7 +432,7 @@ root_pair_summary
 
 注意：
 
-- `uncovered_cross_root_pairs` 只是 review 抓手，不表示这些 pair 一定应该 async/exclusive。
+- `uncovered_cross_root_pairs` 只是 review 抓手，不表示这些 pair 一定应该 asynchronous/exclusive。
 - 脚本不能因为 01 `root_source` 字符串不同就自动生成 asynchronous group；报告使用 03 基于 parent map 计算的 genealogy `tree_root` 判断独立时钟树，只报告“当前仍默认同步”的跨 tree pair，等待架构/CDC owner 决策。
 - 已知限制：coverage report 不建模 `set_case_analysis`；被 scenario case 掉的时钟参与的 pair 可能仍显示为 uncovered，实际在该 scenario 中并不分析。后续可让 03 读取 scenario pre-setup 的 case_analysis 列表再过滤。
 
@@ -449,9 +470,11 @@ root_pair_summary
 - 同一个 clock pair 在 assembled view 中不应同时出现多个不同 `relation_type`；例如 common 说 A/B asynchronous，scenario 又说 A/B logically_exclusive，应 error。
 - scenario rule 不应与 common rule 对同一 clock pair 表达不同语义；若 scenario 需要不同关系，说明 common rule 归属错误，应下沉或拆分。
 - 同一个 clock pair 被多条 rule 重复声明相同 `relation_type` 时，建议 warning 并在 report 中列出来源 rule，方便去重。
-- 如果两个 clock 在某条 active rule 的同一个 effective group 内，但又在另一条 active rule 中被分到不同 group 并赋予 async/exclusive/physical exclusive 关系，应 warning 或 error。
+- 如果两个 clock 在某条 active rule 的同一个 effective group 内，但又在另一条 active rule 中被分到不同 group 并赋予 `asynchronous` / `logically_exclusive` / `physically_exclusive` 关系，应 warning 或 error。
 - 对同一种 `relation_type`，若 assembled view 中存在 A/B 和 A/C 关系、但 B/C 未覆盖，应 warning 提醒 reviewer 确认是否需要 B/C 也同属该关系；若 A/B/C 本意是两两异步或两两互斥，应合并到同一条多 group rule 或补齐缺失 pair。
+- 若 B/C 已在同一 genealogy tree 内，则可视为默认同步兄弟，脚本可跳过该条 non-clique warning。
 - scenario 03 只能追加该 scenario 专属关系，不能靠 source 顺序覆盖 common 03。
+- non-clique warning 允许截断，达到上限后应提示 `limit reached` 并依赖 coverage report 继续 review；v1 上限建议 50 条。
 
 ### 8.3 Coverage 检查
 

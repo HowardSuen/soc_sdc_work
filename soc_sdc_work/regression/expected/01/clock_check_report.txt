@@ -15,4 +15,6 @@ INFO: loaded 4 instances from info_all.xlsx
 INFO: loaded 4 instance sheets from 2 port workbook(s)
 INFO: loaded 5 virtual clock(s) from virtual_clocks.csv
 WARNING: periph.sdc:3: u_periph/scan_mode_clk: clock=scan_clk: CLOCK_TEST_LIKE_NAME_REVIEW: clock name/port contains test-like token(s) scan; clock is not skipped, review scenario ownership; command: create_clock -name scan_clk -period 50.000 [get_ports scan_mode_clk]
+INFO: pll_top.sdc:4: IGNORED_NON_CLOCK_COMMAND: skipped non-clock SDC command set_false_path; command: set_false_path -from [get_ports ref_clk_in]
 INFO: wrote 13 clock command(s) to <WORK>/01_soc_clocks/common/01_soc_clocks.sdc
+INFO: removed 11 harden clock port(s) from pending; log=00_harden_port_inventory/removed_log/01_soc_clocks.removed

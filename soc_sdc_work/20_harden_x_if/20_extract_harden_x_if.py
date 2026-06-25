@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Generate 10 SoC harden/subsys interface budget SDC from integration
+Generate 20 SoC harden/subsys interface budget SDC from integration
 spreadsheets, harden/subsys SDC files, and a reviewed channel workbook.
 
 Current scope:
   * all xlsx and SDC inputs live in the command execution directory
-  * first run creates/synchronizes 10_harden_x_if.xlsx, then stops for review
+  * first run creates/synchronizes 20_harden_x_if.xlsx, then stops for review
   * constraints are grouped by integration-table channel, not by raw SDC line
   * only apply=yes + review_status=approved rows are emitted
   * scenario/stage/corner-specific generation is supported
@@ -17,10 +17,73 @@ import hashlib
 import re
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from dataclasses import dataclass, field
+except ImportError:  # pragma: no cover - Python 3.6 compatibility path
+    class _CompatField:
+        def __init__(self, default_factory=None):
+            self.default_factory = default_factory
+
+    def field(default_factory=None):
+        return _CompatField(default_factory=default_factory)
+
+    def dataclass(_cls=None, frozen=False):
+        def wrap(cls):
+            annotations = getattr(cls, "__annotations__", {})
+            names = list(annotations.keys())
+            defaults = {}
+            factories = {}
+            for name in names:
+                if hasattr(cls, name):
+                    value = getattr(cls, name)
+                    if isinstance(value, _CompatField):
+                        factories[name] = value.default_factory
+                        delattr(cls, name)
+                    else:
+                        defaults[name] = value
+
+            def __init__(self, *args, **kwargs):
+                if len(args) > len(names):
+                    raise TypeError("too many positional arguments")
+                values = {}
+                for name, value in zip(names, args):
+                    values[name] = value
+                for name in names[len(args):]:
+                    if name in kwargs:
+                        values[name] = kwargs.pop(name)
+                    elif name in factories:
+                        values[name] = factories[name]()
+                    elif name in defaults:
+                        values[name] = defaults[name]
+                    else:
+                        raise TypeError("missing required argument: " + name)
+                if kwargs:
+                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
+                for name in names:
+                    object.__setattr__(self, name, values[name])
+
+            def __eq__(self, other):
+                if other.__class__ is not cls:
+                    return False
+                return all(getattr(self, name) == getattr(other, name) for name in names)
+
+            cls.__init__ = __init__
+            cls.__eq__ = __eq__
+            if frozen:
+                def __hash__(self):
+                    return hash(tuple(getattr(self, name) for name in names))
+                cls.__hash__ = __hash__
+            else:
+                cls.__hash__ = None
+            return cls
+
+        if _cls is None:
+            return wrap
+        return wrap(_cls)
 
 try:
     import pandas as pd
@@ -35,14 +98,14 @@ try:
     from openpyxl.worksheet.datavalidation import DataValidation
     from openpyxl.worksheet.table import Table, TableStyleInfo
 except ImportError as exc:  # pragma: no cover - user environment guard
-    print("ERROR: openpyxl is required to read/write 10 harden IF xlsx files.", file=sys.stderr)
+    print("ERROR: openpyxl is required to read/write 20 harden IF xlsx files.", file=sys.stderr)
     raise SystemExit(2) from exc
 
 
 SCENARIOS = {"common", "func", "scan", "mbist", "gpio_in", "gpio_out"}
 STAGES = {"all", "synth", "prects", "postcts", "postroute"}
-CHANNEL_TYPES_10 = {"harden_to_harden", "fabric_to_harden", "harden_to_fabric"}
-NON_10_CHANNEL_TYPES = {
+CHANNEL_TYPES_20 = {"harden_to_harden", "fabric_to_harden", "harden_to_fabric"}
+NON_20_CHANNEL_TYPES = {
     "top_pad_to_harden",
     "harden_to_top_pad",
     "pad_to_pad",
@@ -58,8 +121,25 @@ YES_NO = {"", "yes", "no"}
 REVIEW_STATUS_VALUES = {"", "pending", "approved", "rejected"}
 SOURCE_TYPES = {"", "extracted", "manual", "na"}
 MIN_REVIEW_VALUES = {"", "approved", "reviewed", "yes", "waived"}
-RELATION_BLOCKING = {"async", "asynchronous", "logically_exclusive", "physically_exclusive"}
+CLOCK_RELATION_CANONICAL = {"synchronous", "asynchronous", "logically_exclusive", "physically_exclusive", "unknown"}
+CLOCK_RELATION_ALIASES = {
+    "": "",
+    "sync": "synchronous",
+    "synchronous": "synchronous",
+    "async": "asynchronous",
+    "asynchronous": "asynchronous",
+    "logically_exclusive": "logically_exclusive",
+    "logically exclusive": "logically_exclusive",
+    "physically_exclusive": "physically_exclusive",
+    "physically exclusive": "physically_exclusive",
+    "unknown": "unknown",
+}
+RELATION_BLOCKING = {"asynchronous", "logically_exclusive", "physically_exclusive"}
 ACTIVE_01_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
+PORT_BIT_RE = re.compile(r"^[^\s\[\]]+(?:\[\d+\])?$")
+PORT_RANGE_RE = re.compile(r"^(.+)\[(\d+)\s*:\s*(\d+)\]$")
+PORT_EXACT_BIT_RE = re.compile(r"^(.+)\[(\d+)\]$")
+MATCHED_STATUSES = {"", "matched", "ok", "valid"}
 
 CHANNEL_HEADERS = [
     "channel_id",
@@ -67,13 +147,18 @@ CHANNEL_HEADERS = [
     "stage",
     "corner",
     "channel_type",
+    "connection_id",
     "src_instance",
     "src_module",
+    "src_direction",
     "src_port",
+    "src_bit_index",
     "src_endpoint",
     "dst_instance",
     "dst_module",
+    "dst_direction",
     "dst_port",
+    "dst_bit_index",
     "dst_endpoint",
     "connection_source",
     "is_pad_related",
@@ -206,13 +291,18 @@ class ChannelRecord:
     stage: str
     corner: str
     channel_type: str
+    connection_id: str
     src_instance: str
     src_module: str
+    src_direction: str
     src_port: str
+    src_bit_index: str
     src_endpoint: str
     dst_instance: str
     dst_module: str
+    dst_direction: str
     dst_port: str
+    dst_bit_index: str
     dst_endpoint: str
     connection_source: str
     is_pad_related: str = "no"
@@ -222,6 +312,55 @@ class ChannelRecord:
     budget_required: str = ""
     clock_relation: str = ""
     note: str = ""
+
+
+@dataclass(frozen=True)
+class PortKey:
+    inst_name: str
+    direction: str
+    port_name: str
+
+
+@dataclass
+class ConnectionEdge:
+    connection_id: str
+    connection_type: str
+    src_instance: str
+    src_direction: str
+    src_port: str
+    src_bit_index: str = ""
+    src_endpoint_key: str = ""
+    src_soc_object: str = ""
+    dst_instance: str = ""
+    dst_direction: str = ""
+    dst_port: str = ""
+    dst_bit_index: str = ""
+    dst_endpoint_key: str = ""
+    dst_soc_object: str = ""
+    validation_status: str = ""
+    note: str = ""
+
+
+@dataclass
+class ConnectionIndex:
+    edges: List[ConnectionEdge] = field(default_factory=list)
+    by_dst: Dict[Tuple[str, str], List[ConnectionEdge]] = field(default_factory=lambda: defaultdict(list))
+    by_src: Dict[Tuple[str, str], List[ConnectionEdge]] = field(default_factory=lambda: defaultdict(list))
+
+
+@dataclass
+class FeedthroughRecord:
+    feedthrough_id: str
+    scenario: str
+    feedthrough_instance: str
+    hop_index: str
+    base: str
+    fti_port: str
+    fto_port: str
+    bit_index: str
+    chain_id: str
+    hop_order: str
+    validation_status: str
 
 
 @dataclass
@@ -293,6 +432,21 @@ def clean_cell(value) -> str:
 
 def normalize_key(value) -> str:
     return clean_cell(value).strip().lower()
+
+
+def canonical_clock_relation(value) -> str:
+    text = normalize_key(value)
+    if not text:
+        return ""
+    text = re.sub(r"[\s-]+", " ", text)
+    text = text.replace("_", " ")
+    alias_key = text.strip()
+    if alias_key in CLOCK_RELATION_ALIASES:
+        return CLOCK_RELATION_ALIASES[alias_key]
+    underscore_key = alias_key.replace(" ", "_")
+    if underscore_key in CLOCK_RELATION_CANONICAL:
+        return underscore_key
+    return ""
 
 
 def normalize_col(name: str) -> str:
@@ -486,15 +640,55 @@ def read_port_workbooks(paths: Sequence[Path], report: Report) -> Dict[str, Dict
     return sheets
 
 
+def default_port_workbooks(cwd: Path, info_name: str, form_name: str, report: Report) -> List[Path]:
+    excluded = {info_name, form_name}
+    candidates: List[Path] = []
+    skipped: List[str] = []
+    for path in sorted(cwd.glob("*.xlsx")):
+        if path.name in excluded or path.name.startswith("~$"):
+            continue
+        if path.name == "ports.xlsx" or path.name.startswith(("port_", "ports_")):
+            candidates.append(path)
+        else:
+            skipped.append(path.name)
+    if skipped:
+        report.warn("ignored non-port workbook(s) in 20 input directory: " + ", ".join(skipped[:10]))
+    return candidates
+
+
 def attach_port_data(instances: Dict[str, InstInfo], sheets: Dict[str, Dict[str, Dict[str, PortInfo]]], report: Report) -> None:
+    sheet_names_by_norm: Dict[str, List[str]] = {}
+    for sheet_name in sheets:
+        sheet_names_by_norm.setdefault(sheet_name.strip().lower(), []).append(sheet_name)
+    claimed_sheets: Set[str] = set()
+
     for inst in instances.values():
         data = sheets.get(inst.inst_name)
+        matched_sheet = inst.inst_name if data else ""
         if not data:
-            report.warn(f"no port sheet found for instance {inst.inst_name}")
+            candidates = sheet_names_by_norm.get(inst.inst_name.strip().lower(), [])
+            if len(candidates) == 1:
+                matched_sheet = candidates[0]
+                data = sheets[matched_sheet]
+                report.warn(
+                    f"port sheet {matched_sheet!r} matched instance {inst.inst_name!r} "
+                    "by case/space-insensitive fallback"
+                )
+            elif len(candidates) > 1:
+                report.error(
+                    f"multiple port sheets match instance {inst.inst_name!r} by case/space-insensitive fallback: "
+                    f"{', '.join(repr(name) for name in candidates)}"
+                )
+        if not data:
+            report.warn(f"no owner port sheet found for instance {inst.inst_name}")
             continue
+        claimed_sheets.add(matched_sheet)
         inst.inputs = data["inputs"]
         inst.outputs = data["outputs"]
         inst.inouts = data["inouts"]
+
+    for sheet_name in sorted(set(sheets) - claimed_sheets):
+        report.warn(f"port workbook sheet {sheet_name!r} does not match any inst_name; ignored")
 
 
 def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> None:
@@ -577,23 +771,343 @@ def parse_endpoint_ref(value: str) -> Tuple[str, str, str]:
     return "unknown", "", text
 
 
+def parse_endpoint_key(value: str) -> Tuple[str, str, str]:
+    value = clean_cell(value)
+    if not value:
+        return "", "", ""
+    parts = value.split(":", 2)
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    return "", "", ""
+
+
 def endpoint_collection(inst_name: str, port_name: str) -> str:
     if not inst_name or not port_name:
         return ""
     return get_collection("get_pins", [f"{inst_name}/{port_name}"])
 
 
+def split_port_key(port: str) -> Tuple[str, str, bool, bool]:
+    port = clean_cell(port)
+    range_match = PORT_RANGE_RE.fullmatch(port)
+    if range_match:
+        return range_match.group(1), "", True, False
+    bit_match = PORT_EXACT_BIT_RE.fullmatch(port)
+    if bit_match:
+        return bit_match.group(1), bit_match.group(2), False, False
+    if "[" in port or "]" in port:
+        return port, "", False, True
+    return port, "", False, False
+
+
+def port_base(port: str) -> str:
+    base, _, _, _ = split_port_key(port)
+    return base
+
+
+def inferred_bit_index(port: str, explicit: str = "") -> str:
+    if clean_cell(explicit):
+        return clean_cell(explicit)
+    _, bit_index, _, _ = split_port_key(port)
+    return bit_index
+
+
+def is_canonical_port_key(port: str) -> bool:
+    return bool(PORT_BIT_RE.fullmatch(clean_cell(port)))
+
+
+def is_feedthrough_port(port: str) -> bool:
+    return port_base(port).startswith(("fti_", "fto_"))
+
+
 def build_channel_id(src_inst: str, src_port: str, dst_inst: str, dst_port: str) -> str:
+    def port_token(port: str) -> str:
+        return re.sub(r"\[(\d+)\]", r"_bit\1", clean_cell(port))
+
     return "CH_" + "__".join(
         [
-            f"{sanitize_id(src_inst)}_{sanitize_id(src_port)}",
-            f"{sanitize_id(dst_inst)}_{sanitize_id(dst_port)}",
+            f"{sanitize_id(src_inst)}_{sanitize_id(port_token(src_port))}",
+            f"{sanitize_id(dst_inst)}_{sanitize_id(port_token(dst_port))}",
         ]
     )
 
 
-def build_channels(
+def endpoint_from_soc_object(inst_name: str, port_name: str, soc_object: str, endpoint_key: str) -> str:
+    obj = clean_cell(soc_object)
+    inst = clean_cell(inst_name)
+    port = clean_cell(port_name)
+    if obj:
+        if obj.startswith("["):
+            return obj
+        if "/" in obj:
+            return get_collection("get_pins", [obj])
+        if normalize_key(inst) == "top":
+            return get_collection("get_ports", [obj])
+        if normalize_key(inst) in {"fabric", "unknown", "constant", "const"}:
+            return obj
+        return get_collection("get_pins", [f"{inst}/{obj}"])
+    key_inst, _, key_port = parse_endpoint_key(endpoint_key)
+    inst = inst or key_inst
+    port = port or key_port
+    if not inst or not port:
+        return ""
+    if normalize_key(inst) == "top":
+        return get_collection("get_ports", [port])
+    if normalize_key(inst) in {"fabric", "unknown", "constant", "const"}:
+        return ""
+    return endpoint_collection(inst, port)
+
+
+def read_connection_inventory(path: Path, report: Report) -> ConnectionIndex:
+    index = ConnectionIndex()
+    if not path.is_file():
+        report.error(f"connection inventory not found: {path}")
+        return index
+    seen_ids: Set[str] = set()
+    seen_pairs: Set[Tuple[str, str, str, str]] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        if not reader.fieldnames:
+            report.error(f"{path}: connection_inventory.csv has no header")
+            return index
+        for row_idx, row in enumerate(reader, start=2):
+            src_inst = clean_cell(row.get("src_instance"))
+            src_dir = clean_cell(row.get("src_direction"))
+            src_port = clean_cell(row.get("src_port"))
+            dst_inst = clean_cell(row.get("dst_instance"))
+            dst_dir = clean_cell(row.get("dst_direction"))
+            dst_port = clean_cell(row.get("dst_port"))
+            if not (src_inst and src_port):
+                key_inst, key_dir, key_port = parse_endpoint_key(clean_cell(row.get("src_endpoint_key")))
+                src_inst = src_inst or key_inst
+                src_dir = src_dir or key_dir
+                src_port = src_port or key_port
+            if not (dst_inst and dst_port):
+                key_inst, key_dir, key_port = parse_endpoint_key(clean_cell(row.get("dst_endpoint_key")))
+                dst_inst = dst_inst or key_inst
+                dst_dir = dst_dir or key_dir
+                dst_port = dst_port or key_port
+            if not (src_inst and src_port and dst_inst and dst_port):
+                report.warn(f"{path.name} row {row_idx}: skipped connection edge with incomplete src/dst endpoint")
+                continue
+            connection_id = clean_cell(row.get("connection_id")) or build_channel_id(src_inst, src_port, dst_inst, dst_port).replace("CH_", "CONN_", 1)
+            if connection_id in seen_ids:
+                report.error(f"{path.name} row {row_idx}: duplicate connection_id {connection_id}")
+            seen_ids.add(connection_id)
+            pair_key = (src_inst, src_port, dst_inst, dst_port)
+            if pair_key in seen_pairs:
+                report.error(f"{path.name} row {row_idx}: duplicate direct bit pair {src_inst}/{src_port} -> {dst_inst}/{dst_port}")
+            seen_pairs.add(pair_key)
+            for role, port in (("src", src_port), ("dst", dst_port)):
+                if port and not is_canonical_port_key(port):
+                    report.error(
+                        f"{path.name} row {row_idx}: {role}_port {port} is not a canonical scalar/bit key; "
+                        "00 must expand bus/range connections before 20"
+                    )
+            edge = ConnectionEdge(
+                connection_id=connection_id,
+                connection_type=clean_cell(row.get("connection_type")),
+                src_instance=src_inst,
+                src_direction=src_dir,
+                src_port=src_port,
+                src_bit_index=inferred_bit_index(src_port, clean_cell(row.get("src_bit_index"))),
+                src_endpoint_key=clean_cell(row.get("src_endpoint_key")),
+                src_soc_object=clean_cell(row.get("src_soc_object")),
+                dst_instance=dst_inst,
+                dst_direction=dst_dir,
+                dst_port=dst_port,
+                dst_bit_index=inferred_bit_index(dst_port, clean_cell(row.get("dst_bit_index"))),
+                dst_endpoint_key=clean_cell(row.get("dst_endpoint_key")),
+                dst_soc_object=clean_cell(row.get("dst_soc_object")),
+                validation_status=clean_cell(row.get("validation_status")),
+                note=clean_cell(row.get("note")),
+            )
+            index.edges.append(edge)
+            index.by_src[(src_inst, src_port)].append(edge)
+            index.by_dst[(dst_inst, dst_port)].append(edge)
+    report.info(f"loaded {len(index.edges)} connection edge(s) from {path}")
+    return index
+
+
+def read_feedthrough_inventory(path: Path, report: Report) -> List[FeedthroughRecord]:
+    if not path.is_file():
+        report.info(f"feedthrough inventory not found: {path}; no stitched feedthrough channel will be added")
+        return []
+    records: List[FeedthroughRecord] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        if not reader.fieldnames:
+            report.warn(f"{path}: feedthrough_inventory.csv has no header")
+            return records
+        for row_idx, row in enumerate(reader, start=2):
+            ft_id = clean_cell(row.get("feedthrough_id"))
+            inst = clean_cell(row.get("feedthrough_instance"))
+            fti = clean_cell(row.get("fti_port"))
+            fto = clean_cell(row.get("fto_port"))
+            if not (ft_id and inst and fti and fto):
+                report.warn(f"{path.name} row {row_idx}: skipped incomplete feedthrough record")
+                continue
+            records.append(
+                FeedthroughRecord(
+                    feedthrough_id=ft_id,
+                    scenario=normalize_key(row.get("scenario")) or "common",
+                    feedthrough_instance=inst,
+                    hop_index=clean_cell(row.get("hop_index")),
+                    base=clean_cell(row.get("base")),
+                    fti_port=fti,
+                    fto_port=fto,
+                    bit_index=clean_cell(row.get("bit_index")),
+                    chain_id=clean_cell(row.get("chain_id")) or clean_cell(row.get("base")),
+                    hop_order=clean_cell(row.get("hop_order")),
+                    validation_status=clean_cell(row.get("validation_status")),
+                )
+            )
+    report.info(f"loaded {len(records)} feedthrough segment(s) from {path}")
+    return records
+
+
+def edge_status_ok(edge: ConnectionEdge) -> bool:
+    return normalize_key(edge.validation_status) in MATCHED_STATUSES
+
+
+def feedthrough_status_ok(record: FeedthroughRecord) -> bool:
+    return normalize_key(record.validation_status) in MATCHED_STATUSES
+
+
+def instance_module(instances: Dict[str, InstInfo], inst_name: str) -> str:
+    inst = instances.get(inst_name)
+    if inst:
+        return inst.module_name
+    if normalize_key(inst_name) == "top":
+        return "top"
+    if normalize_key(inst_name) == "fabric":
+        return "fabric"
+    return ""
+
+
+def classify_edge_type(edge: ConnectionEdge, instances: Dict[str, InstInfo]) -> str:
+    raw = normalize_key(edge.connection_type)
+    if raw in CHANNEL_TYPES_20 or raw in NON_20_CHANNEL_TYPES:
+        return raw
+    if "feedthrough" in raw:
+        return "feedthrough"
+    if normalize_key(edge.src_instance) == "top" or normalize_key(edge.dst_instance) == "top":
+        if normalize_key(edge.src_instance) == "top" and normalize_key(edge.dst_instance) == "top":
+            return "pad_to_pad"
+        return "top_pad_to_harden" if normalize_key(edge.src_instance) == "top" else "harden_to_top_pad"
+    if edge.src_instance in instances and edge.dst_instance in instances:
+        return "harden_to_harden"
+    if edge.src_instance in instances:
+        return "harden_to_fabric"
+    if edge.dst_instance in instances:
+        return "fabric_to_harden"
+    return "unknown"
+
+
+def edge_to_channel(
+    edge: ConnectionEdge,
     instances: Dict[str, InstInfo],
+    clock_objects: Set[str],
+    report: Report,
+    force_type: str = "",
+    connection_source: str = "",
+    note: str = "",
+) -> ChannelRecord:
+    channel_type = force_type or classify_edge_type(edge, instances)
+    if is_feedthrough_port(edge.src_port) or is_feedthrough_port(edge.dst_port):
+        channel_type = "feedthrough"
+    is_pad_related = "yes" if channel_type in {"top_pad_to_harden", "harden_to_top_pad", "pad_to_pad"} else "no"
+    is_feedthrough = "yes" if channel_type == "feedthrough" else "no"
+    src_endpoint = endpoint_from_soc_object(edge.src_instance, edge.src_port, edge.src_soc_object, edge.src_endpoint_key)
+    dst_endpoint = endpoint_from_soc_object(edge.dst_instance, edge.dst_port, edge.dst_soc_object, edge.dst_endpoint_key)
+    is_clock_related = "no"
+    if endpoint_hits_clock(src_endpoint, clock_objects) or endpoint_hits_clock(dst_endpoint, clock_objects):
+        is_clock_related = "yes"
+        if channel_type in CHANNEL_TYPES_20:
+            channel_type = "clock_connection"
+    messages = []
+    if note:
+        messages.append(note)
+    if edge.validation_status and not edge_status_ok(edge):
+        messages.append(f"00 connection validation_status={edge.validation_status}")
+    if channel_type not in CHANNEL_TYPES_20:
+        messages.append("not a 20 channel by default")
+    return ChannelRecord(
+        channel_id=build_channel_id(edge.src_instance, edge.src_port, edge.dst_instance, edge.dst_port),
+        scenario="common",
+        stage="all",
+        corner="all",
+        channel_type=channel_type,
+        connection_id=edge.connection_id,
+        src_instance=edge.src_instance,
+        src_module=instance_module(instances, edge.src_instance),
+        src_direction=edge.src_direction,
+        src_port=edge.src_port,
+        src_bit_index=edge.src_bit_index,
+        src_endpoint=src_endpoint,
+        dst_instance=edge.dst_instance,
+        dst_module=instance_module(instances, edge.dst_instance),
+        dst_direction=edge.dst_direction,
+        dst_port=edge.dst_port,
+        dst_bit_index=edge.dst_bit_index,
+        dst_endpoint=dst_endpoint,
+        connection_source=connection_source or edge.connection_id,
+        is_pad_related=is_pad_related,
+        is_clock_related=is_clock_related,
+        is_feedthrough=is_feedthrough,
+        timing_model="unknown",
+        note="; ".join(dict.fromkeys(messages)),
+    )
+
+
+def synthetic_edge_from_feedthrough_chain(
+    records: Sequence[FeedthroughRecord],
+    connections: ConnectionIndex,
+    report: Report,
+) -> Optional[Tuple[ConnectionEdge, str]]:
+    ordered = sorted(records, key=lambda rec: int(rec.hop_order or rec.hop_index or "0") if (rec.hop_order or rec.hop_index or "0").isdigit() else 0)
+    first = ordered[0]
+    last = ordered[-1]
+    incoming = connections.by_dst.get((first.feedthrough_instance, first.fti_port), [])
+    outgoing = connections.by_src.get((last.feedthrough_instance, last.fto_port), [])
+    label = f"{first.chain_id or first.base}/{first.bit_index or 'scalar'}"
+    if len(incoming) != 1 or len(outgoing) != 1:
+        report.warn(
+            f"{label}: cannot stitch 20 feedthrough channel; "
+            f"incoming_edges={len(incoming)} outgoing_edges={len(outgoing)}"
+        )
+        return None
+    if not all(feedthrough_status_ok(record) for record in ordered):
+        report.warn(f"{label}: feedthrough chain has non-matched segment; stitched 20 channel skipped")
+        return None
+    ft_ids = [record.feedthrough_id for record in ordered]
+    src = incoming[0]
+    dst = outgoing[0]
+    edge = ConnectionEdge(
+        connection_id=";".join([src.connection_id] + ft_ids + [dst.connection_id]),
+        connection_type="harden_to_harden",
+        src_instance=src.src_instance,
+        src_direction=src.src_direction,
+        src_port=src.src_port,
+        src_bit_index=src.src_bit_index,
+        src_endpoint_key=src.src_endpoint_key,
+        src_soc_object=src.src_soc_object,
+        dst_instance=dst.dst_instance,
+        dst_direction=dst.dst_direction,
+        dst_port=dst.dst_port,
+        dst_bit_index=dst.dst_bit_index,
+        dst_endpoint_key=dst.dst_endpoint_key,
+        dst_soc_object=dst.dst_soc_object,
+        validation_status="matched",
+        note="via feedthrough " + ",".join(ft_ids),
+    )
+    return edge, "via_10_feedthrough:" + ",".join(ft_ids)
+
+
+def build_channels_from_inventories(
+    instances: Dict[str, InstInfo],
+    connections: ConnectionIndex,
+    feedthroughs: Sequence[FeedthroughRecord],
     clock_objects: Set[str],
     report: Report,
 ) -> List[ChannelRecord]:
@@ -602,125 +1116,25 @@ def build_channels(
 
     def add(record: ChannelRecord) -> None:
         if record.channel_id in seen:
+            report.warn(f"duplicate channel_id {record.channel_id}; keeping first channel_inventory record")
             return
         seen.add(record.channel_id)
-        if endpoint_hits_clock(record.src_endpoint, clock_objects) or endpoint_hits_clock(record.dst_endpoint, clock_objects):
-            record.is_clock_related = "yes"
-            if record.channel_type in CHANNEL_TYPES_10:
-                record.channel_type = "clock_connection"
         channels.append(record)
 
-    for dst in instances.values():
-        for port in dst.inputs.values():
-            refs = parse_connections(port.from_whom)
-            if not refs:
-                channel_id = build_channel_id("unknown", "unknown", dst.inst_name, port.name)
-                add(
-                    ChannelRecord(
-                        channel_id=channel_id,
-                        scenario="common",
-                        stage="all",
-                        corner="all",
-                        channel_type="unknown",
-                        src_instance="",
-                        src_module="",
-                        src_port="",
-                        src_endpoint="",
-                        dst_instance=dst.inst_name,
-                        dst_module=dst.module_name,
-                        dst_port=port.name,
-                        dst_endpoint=endpoint_collection(dst.inst_name, port.name),
-                        connection_source="",
-                        note="input source is blank in integration table",
-                    )
-                )
-                continue
-            for ref in refs:
-                kind, src_inst, src_port = parse_endpoint_ref(ref)
-                if kind == "inst" and src_inst in instances:
-                    src = instances[src_inst]
-                    channel_type = "harden_to_harden"
-                    src_endpoint = endpoint_collection(src_inst, src_port)
-                    src_module = src.module_name
-                elif kind == "top":
-                    channel_type = "top_pad_to_harden"
-                    src_endpoint = get_collection("get_ports", [src_port])
-                    src_module = "top"
-                    src_inst = "top"
-                else:
-                    channel_type = "fabric_to_harden" if kind == "unknown" else "unknown"
-                    src_endpoint = ""
-                    src_module = ""
-                channel_id = build_channel_id(src_inst or "fabric", src_port or "unknown", dst.inst_name, port.name)
-                add(
-                    ChannelRecord(
-                        channel_id=channel_id,
-                        scenario="common",
-                        stage="all",
-                        corner="all",
-                        channel_type=channel_type,
-                        src_instance=src_inst,
-                        src_module=src_module,
-                        src_port=src_port,
-                        src_endpoint=src_endpoint,
-                        dst_instance=dst.inst_name,
-                        dst_module=dst.module_name,
-                        dst_port=port.name,
-                        dst_endpoint=endpoint_collection(dst.inst_name, port.name),
-                        connection_source=ref,
-                        is_pad_related="yes" if channel_type == "top_pad_to_harden" else "no",
-                        timing_model="unknown",
-                        note="" if channel_type in CHANNEL_TYPES_10 else "not a 10 channel by default",
-                    )
-                )
+    for edge in connections.edges:
+        add(edge_to_channel(edge, instances, clock_objects, report))
 
-    for src in instances.values():
-        for port in src.outputs.values():
-            dst_refs = parse_connections(port.to_top)
-            if not dst_refs:
-                continue
-            for ref in dst_refs:
-                kind, dst_inst, dst_port = parse_endpoint_ref(ref)
-                if kind == "top":
-                    channel_type = "harden_to_top_pad"
-                    dst_instance = "top"
-                    dst_module = "top"
-                    dst_endpoint = get_collection("get_ports", [dst_port])
-                    is_pad_related = "yes"
-                    note = "pad-related output channel; handled by 04"
-                elif kind == "inst" and dst_inst in instances:
-                    # harden_to_harden is primarily built from the destination input.
-                    continue
-                else:
-                    channel_type = "harden_to_fabric"
-                    dst_instance = "fabric"
-                    dst_module = "fabric"
-                    dst_endpoint = ""
-                    is_pad_related = "no"
-                    note = "fabric sink endpoint cannot be fully resolved from output-side table; review dst_endpoint"
-                channel_id = build_channel_id(src.inst_name, port.name, dst_instance, dst_port or "unknown")
-                add(
-                    ChannelRecord(
-                        channel_id=channel_id,
-                        scenario="common",
-                        stage="all",
-                        corner="all",
-                        channel_type=channel_type,
-                        src_instance=src.inst_name,
-                        src_module=src.module_name,
-                        src_port=port.name,
-                        src_endpoint=endpoint_collection(src.inst_name, port.name),
-                        dst_instance=dst_instance,
-                        dst_module=dst_module,
-                        dst_port=dst_port,
-                        dst_endpoint=dst_endpoint,
-                        connection_source=ref,
-                        is_pad_related=is_pad_related,
-                        timing_model="unknown",
-                        note=note,
-                    )
-                )
-    report.info(f"built {len(channels)} integration channel(s)")
+    feedthrough_groups: Dict[Tuple[str, str], List[FeedthroughRecord]] = defaultdict(list)
+    for record in feedthroughs:
+        feedthrough_groups[(record.chain_id or record.base, record.bit_index)].append(record)
+    for _, records in sorted(feedthrough_groups.items()):
+        stitched = synthetic_edge_from_feedthrough_chain(records, connections, report)
+        if not stitched:
+            continue
+        edge, source = stitched
+        add(edge_to_channel(edge, instances, clock_objects, report, connection_source=source, note=edge.note))
+
+    report.info(f"built {len(channels)} channel_inventory record(s) from 00/10 inventories")
     return channels
 
 
@@ -899,14 +1313,30 @@ def split_object_list(text: str) -> List[str]:
     return [part for part in re.split(r"[\s,;]+", text) if part]
 
 
-COLLECTION_RE = re.compile(r"\[(get_ports|get_pins|get_nets|get_clocks)\s+([^\]]+)\]")
+COLLECTION_KINDS = {"get_ports", "get_pins", "get_nets", "get_clocks"}
 
 
 def parse_collection(token: str) -> Optional[Tuple[str, List[str]]]:
-    match = COLLECTION_RE.fullmatch(clean_cell(token))
-    if not match:
+    text = clean_cell(token)
+    if not (text.startswith("[") and text.endswith("]")):
         return None
-    return match.group(1), split_object_list(match.group(2))
+    end = find_matching(text, 0, "[", "]")
+    if end != len(text) - 1:
+        return None
+    words = tokenize_tcl_words(text[1:-1].strip())
+    if not words or words[0] not in COLLECTION_KINDS:
+        return None
+    kind = words[0]
+    objects: List[str] = []
+    idx = 1
+    while idx < len(words):
+        word = words[idx]
+        if word.startswith("-"):
+            idx += 1
+            continue
+        objects.extend(split_object_list(word))
+        idx += 1
+    return kind, objects
 
 
 OPTIONS_WITH_VALUE = {"-clock", "-min", "-max"}
@@ -968,6 +1398,23 @@ def normalize_sdc_port(kind: str, obj: str, inst: InstInfo) -> str:
     return obj
 
 
+def lookup_port_direction(inst: InstInfo, port_name: str) -> str:
+    if port_name in inst.inputs:
+        return "input"
+    if port_name in inst.outputs:
+        return "output"
+    if port_name in inst.inouts:
+        return "inout"
+    base = port_base(port_name)
+    if base in inst.inputs:
+        return "input"
+    if base in inst.outputs:
+        return "output"
+    if base in inst.inouts:
+        return "inout"
+    return "unknown"
+
+
 def parse_delay_candidate(inst: InstInfo, cmd: TclCommand, digest: str, now: str) -> Optional[DelayCandidate]:
     tokens = tokenize_tcl_words(cmd.raw)
     if not tokens or tokens[0] not in {"set_input_delay", "set_output_delay"}:
@@ -1004,7 +1451,7 @@ def parse_delay_candidate(inst: InstInfo, cmd: TclCommand, digest: str, now: str
         port_name = normalize_sdc_port(kind, objects[0], inst)
         status = "ok"
         message = ""
-    direction = "input" if port_name in inst.inputs else "output" if port_name in inst.outputs else "inout" if port_name in inst.inouts else "unknown"
+    direction = lookup_port_direction(inst, port_name)
     if ctype == "input_delay" and direction != "input":
         status = "needs_review"
         message = "; ".join(filter(None, [message, "set_input_delay target is not an input port in integration table"]))
@@ -1131,9 +1578,20 @@ def create_budget_seeds(channels: Sequence[ChannelRecord], candidates: Sequence[
 
     seeds: List[BudgetSeed] = []
     matched_candidate_ids: Set[int] = set()
+
+    def candidate_list(index: Dict[Tuple[str, str], List[DelayCandidate]], inst_name: str, port_name: str) -> List[DelayCandidate]:
+        result: List[DelayCandidate] = []
+        seen: Set[int] = set()
+        for key in ((inst_name, port_name), (inst_name, port_base(port_name))):
+            for cand in index.get(key, []):
+                if id(cand) not in seen:
+                    seen.add(id(cand))
+                    result.append(cand)
+        return result
+
     for ch in channels:
-        source_cands = src_by_key.get((ch.src_instance, ch.src_port), [])
-        dest_cands = dst_by_key.get((ch.dst_instance, ch.dst_port), [])
+        source_cands = candidate_list(src_by_key, ch.src_instance, ch.src_port)
+        dest_cands = candidate_list(dst_by_key, ch.dst_instance, ch.dst_port)
         related = source_cands + dest_cands
         matched_candidate_ids.update(id(cand) for cand in related)
         values = {header: "" for header in BUDGET_HEADERS}
@@ -1178,9 +1636,9 @@ def create_budget_seeds(channels: Sequence[ChannelRecord], candidates: Sequence[
             }
         )
         messages = [c.message for c in related if c.message]
-        if ch.channel_type not in CHANNEL_TYPES_10:
-            messages.append("channel_type is not emitted by 10")
-        if not related and ch.channel_type in CHANNEL_TYPES_10:
+        if ch.channel_type not in CHANNEL_TYPES_20:
+            messages.append("channel_type is not emitted by 20")
+        if not related and ch.channel_type in CHANNEL_TYPES_20:
             messages.append("no input/output delay candidate found on either side")
         if any(c.complex_options for c in related):
             messages.append("complex delay options require review")
@@ -1191,7 +1649,7 @@ def create_budget_seeds(channels: Sequence[ChannelRecord], candidates: Sequence[
         if id(cand) not in matched_candidate_ids and cand.direction in {"input", "output"}:
             report.warn(
                 f"{cand.source_sdc_file}:{cand.source_line} {cand.inst_name}/{cand.port_name}: "
-                f"{cand.constraint_type} candidate has no matching 10 channel in integration table"
+                f"{cand.constraint_type} candidate has no matching 20 channel in integration table"
             )
     return seeds
 
@@ -1373,7 +1831,7 @@ def add_validations(wb: Workbook) -> None:
 
     add_list("scenario", sorted(SCENARIOS))
     add_list("stage", sorted(STAGES))
-    add_list("channel_type", sorted(CHANNEL_TYPES_10 | NON_10_CHANNEL_TYPES))
+    add_list("channel_type", sorted(CHANNEL_TYPES_20 | NON_20_CHANNEL_TYPES))
     add_list("timing_model", sorted(TIMING_MODELS - {""}))
     add_list("budget_required", ["yes", "no"])
     add_list("budget_model", sorted(BUDGET_MODELS - {""}))
@@ -1486,7 +1944,8 @@ def validate_rows(
         budget_required = normalize_key(values.get("budget_required"))
         tool_surface = normalize_key(values.get("tool_surface"))
         datapath_only = normalize_key(values.get("datapath_only"))
-        clock_relation = normalize_key(values.get("clock_relation"))
+        clock_relation_raw = normalize_key(values.get("clock_relation"))
+        clock_relation = canonical_clock_relation(values.get("clock_relation"))
         relation_basis = clean_cell(values.get("relationship_override_basis"))
         channel = channel_by_id.get(channel_id)
         is_pad_related = normalize_key(values.get("is_pad_related")) or (channel.is_pad_related if channel else "")
@@ -1505,6 +1964,11 @@ def validate_rows(
             report.error(f"interface_budget row {row.row_idx}: invalid timing_model {timing_model}")
         if budget_model and budget_model not in BUDGET_MODELS:
             report.error(f"interface_budget row {row.row_idx}: invalid budget_model {budget_model}")
+        if clock_relation_raw and not clock_relation:
+            report.error(
+                f"interface_budget row {row.row_idx}: invalid clock_relation {clock_relation_raw}; "
+                "use synchronous/asynchronous/logically_exclusive/physically_exclusive/unknown"
+            )
         for flag_name, flag_value in (
             ("is_pad_related", is_pad_related),
             ("is_clock_related", is_clock_related),
@@ -1531,11 +1995,11 @@ def validate_rows(
             if is_clock_related == "yes":
                 report.error(f"interface_budget row {row.row_idx} {channel_id}: clock-related channel must be handled by 01/02/03")
             if is_feedthrough == "yes":
-                report.error(f"interface_budget row {row.row_idx} {channel_id}: feedthrough channel must be handled by 30")
-            if channel_type not in CHANNEL_TYPES_10:
-                report.error(f"interface_budget row {row.row_idx} {channel_id}: channel_type={channel_type} is not generated by 10")
+                report.error(f"interface_budget row {row.row_idx} {channel_id}: feedthrough channel must be handled by 10")
+            if channel_type not in CHANNEL_TYPES_20:
+                report.error(f"interface_budget row {row.row_idx} {channel_id}: channel_type={channel_type} is not generated by 20")
             if timing_model == "visible_netlist" and budget_required != "yes":
-                report.error(f"interface_budget row {row.row_idx} {channel_id}: visible_netlist path needs budget_required=yes to emit 10")
+                report.error(f"interface_budget row {row.row_idx} {channel_id}: visible_netlist path needs budget_required=yes to emit 20")
             if not timing_model or timing_model == "unknown":
                 report.error(f"interface_budget row {row.row_idx} {channel_id}: timing_model must be reviewed before emit")
             if not budget_model or budget_model == "unknown":
@@ -1545,9 +2009,9 @@ def validate_rows(
                     f"interface_budget row {row.row_idx} {channel_id}: clock_relative_io_delay requires derivation_basis"
                 )
             auto_resolve_interconnect_max(row, report)
-            if relation_blocks_10(clock_relation) and not relation_basis:
+            if relation_blocks_20(clock_relation) and not relation_basis:
                 report.error(
-                    f"interface_budget row {row.row_idx} {channel_id}: clock_relation={clock_relation} blocks normal 10 budget"
+                    f"interface_budget row {row.row_idx} {channel_id}: clock_relation={clock_relation} blocks normal 20 budget"
                 )
             if normalize_key(values.get("emit_max")) == "yes" and not clean_cell(values.get("converted_max")):
                 report.error(f"interface_budget row {row.row_idx} {channel_id}: emit_max=yes but converted_max is blank")
@@ -1582,11 +2046,11 @@ def validate_rows(
     warn_manual_fanout_reuse(assembled, report)
 
 
-def relation_blocks_10(value: str) -> bool:
-    text = normalize_key(value)
-    if not text:
+def relation_blocks_20(value: str) -> bool:
+    relation = canonical_clock_relation(value)
+    if not relation:
         return False
-    return any(item in text for item in RELATION_BLOCKING)
+    return relation in RELATION_BLOCKING
 
 
 def warn_manual_fanout_reuse(rows: Sequence[FormRow], report: Report) -> None:
@@ -1713,8 +2177,8 @@ def check_source_digest(row: FormRow, current_digests: Dict[str, str], report: R
 def output_sdc_path(cwd: Path, scenario: str, stage: str, corner: str) -> Path:
     if scenario == "common":
         if stage == "all" and corner == "all":
-            return cwd / "common/10_harden_x_if.sdc"
-        return cwd / f"common/10_harden_x_if_{stage}_{safe_filename_token(corner)}.sdc"
+            return cwd / "common/20_harden_x_if.sdc"
+        return cwd / f"common/20_harden_x_if_{stage}_{safe_filename_token(corner)}.sdc"
     if stage == "all" and corner == "all":
         return cwd / f"scenarios/{scenario}_harden_x_if.sdc"
     return cwd / f"scenarios/{scenario}_harden_x_if_{stage}_{safe_filename_token(corner)}.sdc"
@@ -1732,7 +2196,7 @@ def generate_sdc(rows: Sequence[FormRow], scenario: str, stage: str, corner: str
             "# Auto-generated SoC harden/subsys interface budget constraints for "
             f"scenario: {scenario}, stage: {stage}, corner: {corner}"
         ),
-        "# Source: 10_harden_x_if.xlsx interface_budget sheet",
+        "# Source: 20_harden_x_if.xlsx interface_budget sheet",
         "# Only apply=yes and review_status=approved rows are emitted.",
         "################################################################################",
         "",
@@ -1903,7 +2367,7 @@ def build_coverage_lines(rows: Sequence[FormRow], channels: Sequence[ChannelReco
             rows_by_channel[clean_cell(row.values.get("channel_id"))].append(row)
     missing_budget_channels = []
     for ch in channels:
-        if ch.channel_type not in CHANNEL_TYPES_10:
+        if ch.channel_type not in CHANNEL_TYPES_20:
             continue
         group = rows_by_channel.get(ch.channel_id, [])
         if not group:
@@ -1918,7 +2382,7 @@ def build_coverage_lines(rows: Sequence[FormRow], channels: Sequence[ChannelReco
                 for row in group
             )
             missing_budget_channels.append((ch, "candidate exists but no approved budget" if has_candidate else "no extracted budget candidate"))
-    lines.extend(["", "  10 channels without approved budget:"])
+    lines.extend(["", "  20 channels without approved budget:"])
     if not missing_budget_channels:
         lines.append("    <none>")
     else:
@@ -1940,7 +2404,7 @@ def write_report(
     coverage_lines: Sequence[str],
 ) -> None:
     lines = [
-        "10_harden_x_if extraction report",
+        "20_harden_x_if extraction report",
         "================================",
         "",
         f"Scenario: {scenario}",
@@ -1959,14 +2423,215 @@ def write_report(
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def pending_line_key(line: str) -> Optional[Tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 2:
+        return None
+    direction, port = parts[0], parts[1]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return direction, port
+
+
+def removed_line_key(line: str) -> Optional[PortKey]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 3:
+        return None
+    inst_name, direction, port = parts[:3]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return PortKey(inst_name, direction, port)
+
+
+def read_removed_keys(log_dir: Path) -> Set[PortKey]:
+    keys: Set[PortKey] = set()
+    if not log_dir.is_dir():
+        return keys
+    for path in sorted(log_dir.glob("*.removed")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key = removed_line_key(line)
+            if key is not None:
+                keys.add(key)
+    return keys
+
+
+def harden_pending_key(inst_name: str, direction: str, port_name: str) -> Optional[PortKey]:
+    if not inst_name or normalize_key(inst_name) in {"top", "fabric", "unknown", "constant", "const"}:
+        return None
+    if direction not in {"input", "output", "inout"}:
+        return None
+    if not port_name:
+        return None
+    return PortKey(inst_name, direction, port_name)
+
+
+def emitted_rows_for_pending(rows: Sequence[FormRow], scenario: str, stage: str, corner: str) -> List[FormRow]:
+    result = []
+    for row in rows:
+        if not row_selected_for_output(row, scenario, stage, corner) or not is_apply_approved(row):
+            continue
+        if commands_for_row(row):
+            result.append(row)
+    return result
+
+
+def removed_log_line_20(row: FormRow, ch: ChannelRecord, key: PortKey) -> str:
+    values = row.values
+    emit = []
+    if normalize_key(values.get("emit_max")) == "yes":
+        emit.append("max")
+    if normalize_key(values.get("emit_min")) == "yes":
+        emit.append("min")
+    return " ".join(
+        [
+            key.inst_name,
+            key.direction,
+            key.port_name,
+            "covered_by=20_harden_x_if",
+            "reason=normal_channel_budget",
+            f"channel={ch.channel_id}",
+            f"scenario={row_scenario(row)}",
+            f"stage={row_stage(row)}",
+            f"corner={row_corner(row)}",
+            f"emit={'+'.join(emit) or 'none'}",
+        ]
+    )
+
+
+def update_pending_for_20(
+    cwd: Path,
+    pending_root: Path,
+    rows: Sequence[FormRow],
+    channels: Sequence[ChannelRecord],
+    scenario: str,
+    stage: str,
+    corner: str,
+    report: Report,
+) -> None:
+    pending_dir = pending_root / "pending"
+    if not pending_dir.exists():
+        return
+    if not pending_dir.is_dir():
+        report.error(f"{pending_dir}: pending path exists but is not a directory")
+        return
+
+    channel_by_id = {ch.channel_id: ch for ch in channels}
+    removals: List[Tuple[FormRow, ChannelRecord, PortKey]] = []
+    for row in emitted_rows_for_pending(rows, scenario, stage, corner):
+        ch = channel_by_id.get(clean_cell(row.values.get("channel_id")))
+        if not ch:
+            continue
+        if ch.channel_type not in CHANNEL_TYPES_20:
+            continue
+        src_key = harden_pending_key(ch.src_instance, ch.src_direction or "output", ch.src_port)
+        dst_key = harden_pending_key(ch.dst_instance, ch.dst_direction or "input", ch.dst_port)
+        for key in (src_key, dst_key):
+            if key is not None:
+                removals.append((row, ch, key))
+    if not removals:
+        return
+
+    log_dir = pending_root / "removed_log"
+    previous_removed = read_removed_keys(log_dir)
+    by_inst: Dict[str, List[Tuple[FormRow, ChannelRecord, PortKey]]] = defaultdict(list)
+    for item in removals:
+        by_inst[item[2].inst_name].append(item)
+
+    removed_items: List[Tuple[FormRow, ChannelRecord, PortKey]] = []
+    for inst_name, inst_items in sorted(by_inst.items()):
+        pending_file = pending_dir / f"{inst_name}.ports"
+        if not pending_file.is_file():
+            for row, ch, key in inst_items:
+                if key in previous_removed:
+                    continue
+                report.error(f"{pending_file}: missing pending file for 20 channel endpoint {key.inst_name}/{key.port_name}")
+            continue
+        lines = pending_file.read_text(encoding="utf-8").splitlines()
+        index: Dict[Tuple[str, str], int] = {}
+        duplicate_keys: Set[Tuple[str, str]] = set()
+        for idx, line in enumerate(lines):
+            key = pending_line_key(line)
+            if key is None:
+                continue
+            if key in index:
+                duplicate_keys.add(key)
+            else:
+                index[key] = idx
+        for direction, port in sorted(duplicate_keys):
+            report.error(f"{pending_file}: duplicate pending port line {direction} {port}")
+
+        remove_line_indices: Set[int] = set()
+        for row, ch, port_key in inst_items:
+            key = (port_key.direction, port_key.port_name)
+            if key not in index:
+                if port_key in previous_removed:
+                    continue
+                report.error(
+                    f"{pending_file}: 20 wants to remove {port_key.direction} {port_key.port_name}, "
+                    "but it is not present in pending and no previous_removed record exists"
+                )
+                continue
+            remove_line_indices.add(index[key])
+            removed_items.append((row, ch, port_key))
+
+        if remove_line_indices:
+            kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
+            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+
+    if removed_items:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "20_harden_x_if.removed"
+        existing_lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.is_file() else []
+        existing_keys = {
+            key
+            for key in (removed_line_key(line) for line in existing_lines)
+            if key is not None
+        }
+        new_lines = []
+        for row, ch, key in sorted(removed_items, key=lambda item: (item[2].inst_name, item[2].direction, item[2].port_name)):
+            if key not in existing_keys:
+                new_lines.append(removed_log_line_20(row, ch, key))
+                existing_keys.add(key)
+        if new_lines:
+            log_lines = [line for line in existing_lines if line.strip()] + new_lines
+            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+        try:
+            display_path = log_path.relative_to(cwd)
+        except ValueError:
+            display_path = log_path
+        report.info(f"removed {len(removed_items)} harden interface endpoint(s) from pending; log={display_path}")
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate 10 SoC harden/subsys interface budget SDC.")
+    parser = argparse.ArgumentParser(description="Generate 20 SoC harden/subsys interface budget SDC.")
     parser.add_argument("-scenario", "--scenario", default="common", choices=sorted(SCENARIOS), help="target scenario")
     parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES), help="target stage/view")
     parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
     parser.add_argument("-input", "--input", default="../01_soc_clocks/clock_inventory.csv", help="common 01 clock inventory CSV")
     parser.add_argument("--info-all", default="info_all.xlsx", help="integration summary xlsx")
-    parser.add_argument("--form", default="10_harden_x_if.xlsx", help="harden interface budget workbook")
+    parser.add_argument("--form", default="20_harden_x_if.xlsx", help="harden interface budget workbook")
+    parser.add_argument(
+        "--connection-inventory",
+        default="00_harden_port_inventory/connection_inventory.csv",
+        help="00 bit-to-bit connection inventory",
+    )
+    parser.add_argument(
+        "--feedthrough-inventory",
+        default="feedthrough_inventory.csv",
+        help="10 feedthrough inventory CSV",
+    )
+    parser.add_argument("--pending-root", default="00_harden_port_inventory", help="00 pending inventory root")
+    parser.add_argument("--no-update-pending", action="store_true", help="do not remove emitted channel endpoints from pending")
     parser.add_argument("--max-diff-threshold", type=float, help="warn when source/destination max budget differs by more than this")
     parser.add_argument("--force-generate-after-sync", action="store_true", help="generate SDC even if workbook was synchronized")
     parser.add_argument("--report", help="output report path")
@@ -1986,13 +2651,15 @@ def main(argv: Sequence[str]) -> int:
     clock_objects = clock_object_set(clocks)
 
     instances = read_info_all(info_all, report)
-    port_paths = sorted(path for path in cwd.glob("*.xlsx") if path.name not in {Path(args.info_all).name, Path(args.form).name})
+    port_paths = default_port_workbooks(cwd, Path(args.info_all).name, Path(args.form).name, report)
     port_sheets = read_port_workbooks(port_paths, report)
     attach_port_data(instances, port_sheets, report)
     resolve_sdc_paths(instances, cwd, report)
     current_digests = collect_current_sdc_digests(instances)
 
-    channels = build_channels(instances, clock_objects, report)
+    connections = read_connection_inventory(cwd / args.connection_inventory, report)
+    feedthroughs = read_feedthrough_inventory(cwd / args.feedthrough_inventory, report)
+    channels = build_channels_from_inventories(instances, connections, feedthroughs, clock_objects, report)
     candidates = extract_delay_candidates(instances, report)
     seeds = create_budget_seeds(channels, candidates, report)
 
@@ -2006,8 +2673,9 @@ def main(argv: Sequence[str]) -> int:
     output_path = output_sdc_path(cwd, args.scenario, args.stage, args.corner)
     rpt_path = Path(args.report) if args.report else report_path(cwd, args.scenario, args.stage, args.corner)
 
+    generated = False
     if report.sync_changed and not args.force_generate_after_sync:
-        report.warn("workbook changed during sync; review 10_harden_x_if.xlsx before SDC generation")
+        report.warn("workbook changed during sync; review 20_harden_x_if.xlsx before SDC generation")
     elif report.error_count == 0:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
@@ -2015,8 +2683,21 @@ def main(argv: Sequence[str]) -> int:
             encoding="utf-8",
         )
         report.info(f"wrote {output_path}")
+        generated = True
     else:
         report.warn("SDC generation skipped because errors were reported")
+
+    if generated and not args.no_update_pending and args.pending_root:
+        update_pending_for_20(
+            cwd,
+            cwd / args.pending_root,
+            rows,
+            channels,
+            args.scenario,
+            args.stage,
+            args.corner,
+            report,
+        )
 
     coverage_lines = build_coverage_lines(rows, channels, args.scenario, args.stage, args.corner)
     write_report(rpt_path, report, args.scenario, args.stage, args.corner, form_path, output_path, coverage_lines)

@@ -14,9 +14,72 @@ import csv
 import glob
 import re
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from dataclasses import dataclass, field
+except ImportError:  # pragma: no cover - Python 3.6 compatibility path
+    class _CompatField:
+        def __init__(self, default_factory=None):
+            self.default_factory = default_factory
+
+    def field(default_factory=None):
+        return _CompatField(default_factory=default_factory)
+
+    def dataclass(_cls=None, frozen=False):
+        def wrap(cls):
+            annotations = getattr(cls, "__annotations__", {})
+            names = list(annotations.keys())
+            defaults = {}
+            factories = {}
+            for name in names:
+                if hasattr(cls, name):
+                    value = getattr(cls, name)
+                    if isinstance(value, _CompatField):
+                        factories[name] = value.default_factory
+                        delattr(cls, name)
+                    else:
+                        defaults[name] = value
+
+            def __init__(self, *args, **kwargs):
+                if len(args) > len(names):
+                    raise TypeError("too many positional arguments")
+                values = {}
+                for name, value in zip(names, args):
+                    values[name] = value
+                for name in names[len(args):]:
+                    if name in kwargs:
+                        values[name] = kwargs.pop(name)
+                    elif name in factories:
+                        values[name] = factories[name]()
+                    elif name in defaults:
+                        values[name] = defaults[name]
+                    else:
+                        raise TypeError("missing required argument: " + name)
+                if kwargs:
+                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
+                for name in names:
+                    object.__setattr__(self, name, values[name])
+
+            def __eq__(self, other):
+                if other.__class__ is not cls:
+                    return False
+                return all(getattr(self, name) == getattr(other, name) for name in names)
+
+            cls.__init__ = __init__
+            cls.__eq__ = __eq__
+            if frozen:
+                def __hash__(self):
+                    return hash(tuple(getattr(self, name) for name in names))
+                cls.__hash__ = __hash__
+            else:
+                cls.__hash__ = None
+            return cls
+
+        if _cls is None:
+            return wrap
+        return wrap(_cls)
 
 try:
     import pandas as pd
@@ -56,6 +119,8 @@ CLOCK_OPTIONS_NO_VALUE = {
     "-add",
     "-combinational",
 }
+
+EMITTED_CLOCK_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
 
 
 @dataclass
@@ -135,6 +200,36 @@ class VirtualClockSpec:
     waveform: str = ""
     note: str = ""
     source_file: str = ""
+
+
+@dataclass(frozen=True)
+class PortKey:
+    inst_name: str
+    direction: str
+    port_name: str
+
+
+@dataclass
+class PortLookup:
+    direction: str
+    canonical_port: str
+    declared_port: str
+    bit_index: str = ""
+    is_range: bool = False
+    info: Optional[PortInfo] = None
+
+
+@dataclass
+class ConnectionEdge:
+    connection_id: str
+    src_instance: str
+    src_direction: str
+    src_port: str
+    dst_instance: str
+    dst_direction: str
+    dst_port: str
+    connection_type: str = ""
+    validation_status: str = ""
 
 
 class Report:
@@ -315,6 +410,68 @@ def read_virtual_clock_csv(path: Path, report: Report) -> List[VirtualClockSpec]
     return specs
 
 
+def parse_endpoint_key(value: str) -> Tuple[str, str, str]:
+    value = clean_cell(value)
+    if not value:
+        return "", "", ""
+    parts = value.split(":", 2)
+    if len(parts) == 3:
+        return parts[0], parts[1], parts[2]
+    return "", "", ""
+
+
+def read_connection_inventory(path: Path, report: Report) -> Dict[Tuple[str, str], ConnectionEdge]:
+    edges: Dict[Tuple[str, str], ConnectionEdge] = {}
+    if not path.is_file():
+        return edges
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        if not reader.fieldnames:
+            report.warn(f"{path}: connection_inventory.csv has no header")
+            return edges
+        for row_idx, row in enumerate(reader, start=2):
+            dst_inst = clean_cell(row.get("dst_instance"))
+            dst_dir = clean_cell(row.get("dst_direction"))
+            dst_port = clean_cell(row.get("dst_port"))
+            src_inst = clean_cell(row.get("src_instance"))
+            src_dir = clean_cell(row.get("src_direction"))
+            src_port = clean_cell(row.get("src_port"))
+            if not (dst_inst and dst_port):
+                key_inst, key_dir, key_port = parse_endpoint_key(clean_cell(row.get("dst_endpoint_key")))
+                dst_inst = dst_inst or key_inst
+                dst_dir = dst_dir or key_dir
+                dst_port = dst_port or key_port
+            if not (src_inst and src_port):
+                key_inst, key_dir, key_port = parse_endpoint_key(clean_cell(row.get("src_endpoint_key")))
+                src_inst = src_inst or key_inst
+                src_dir = src_dir or key_dir
+                src_port = src_port or key_port
+            if not (dst_inst and dst_port and src_port):
+                report.warn(f"{path.name} row {row_idx}: skipped connection edge with incomplete src/dst endpoint")
+                continue
+            key = (dst_inst, dst_port)
+            edge = ConnectionEdge(
+                connection_id=clean_cell(row.get("connection_id")),
+                src_instance=src_inst,
+                src_direction=src_dir,
+                src_port=src_port,
+                dst_instance=dst_inst,
+                dst_direction=dst_dir,
+                dst_port=dst_port,
+                connection_type=clean_cell(row.get("connection_type")),
+                validation_status=clean_cell(row.get("validation_status")),
+            )
+            if key in edges:
+                report.warn(
+                    f"{path.name} row {row_idx}: duplicate dst edge for {dst_inst}/{dst_port}; "
+                    f"keeping {edges[key].connection_id or 'first edge'}"
+                )
+                continue
+            edges[key] = edge
+    report.info(f"loaded {len(edges)} connection edge(s) from {path}")
+    return edges
+
+
 def parse_port_sheet(df: pd.DataFrame) -> Dict[str, Dict[str, PortInfo]]:
     input_col = get_col(df, ["Input"])
     input_width_col = get_col(df, ["Input Width"])
@@ -368,14 +525,38 @@ def parse_port_sheet(df: pd.DataFrame) -> Dict[str, Dict[str, PortInfo]]:
 
 
 def attach_port_data(instances: Dict[str, InstInfo], sheets: Dict[str, Dict[str, Dict[str, PortInfo]]], report: Report) -> None:
+    sheet_names_by_norm: Dict[str, List[str]] = {}
+    for sheet_name in sheets:
+        sheet_names_by_norm.setdefault(sheet_name.strip().lower(), []).append(sheet_name)
+    claimed_sheets: Set[str] = set()
+
     for inst in instances.values():
         data = sheets.get(inst.inst_name)
+        matched_sheet = inst.inst_name if data else ""
+        if not data:
+            candidates = sheet_names_by_norm.get(inst.inst_name.strip().lower(), [])
+            if len(candidates) == 1:
+                matched_sheet = candidates[0]
+                data = sheets[matched_sheet]
+                report.warn(
+                    f"port sheet {matched_sheet!r} matched instance {inst.inst_name!r} "
+                    "by case/space-insensitive fallback"
+                )
+            elif len(candidates) > 1:
+                report.error(
+                    f"multiple port sheets match instance {inst.inst_name!r} by case/space-insensitive fallback: "
+                    f"{', '.join(repr(name) for name in candidates)}"
+                )
         if not data:
             report.warn(f"no owner port sheet found for instance {inst.inst_name}")
             continue
+        claimed_sheets.add(matched_sheet)
         inst.inputs = data["inputs"]
         inst.outputs = data["outputs"]
         inst.inouts = data["inouts"]
+
+    for sheet_name in sorted(set(sheets) - claimed_sheets):
+        report.warn(f"port workbook sheet {sheet_name!r} does not match any inst_name; ignored")
 
 
 def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> None:
@@ -733,6 +914,10 @@ def parse_clock_commands(text: str, report: Report, sdc_name: str) -> List[Parse
             continue
         command = tokens[0]
         if command not in CLOCK_COMMANDS:
+            report.info(
+                f"{clock_location(sdc_name, tcl_cmd.line_no)}: IGNORED_NON_CLOCK_COMMAND: "
+                f"skipped non-clock SDC command {command}; command: {compact_command(raw)}"
+            )
             continue
         target_ports: List[str] = []
         target_token_indices: List[int] = []
@@ -787,21 +972,33 @@ def parse_clock_commands(text: str, report: Report, sdc_name: str) -> List[Parse
 
 
 def port_direction(inst: InstInfo, port: str) -> str:
-    if port in inst.outputs:
-        return "output"
-    if port in inst.inputs:
-        return "input"
-    if port in inst.inouts:
-        return "inout"
-    return "unknown"
+    return lookup_port(inst, port).direction
 
 
 def from_whom_for(inst: InstInfo, port: str, direction: str) -> str:
-    if direction == "input" and port in inst.inputs:
-        return inst.inputs[port].from_whom
-    if direction == "inout" and port in inst.inouts:
-        return inst.inouts[port].connectivity
+    lookup = lookup_port(inst, port)
+    info = lookup.info
+    if direction == "input" and info is not None:
+        return info.from_whom
+    if direction == "inout" and info is not None:
+        return info.connectivity
     return ""
+
+
+def from_whom_with_connections(
+    inst: InstInfo,
+    port: str,
+    direction: str,
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+) -> str:
+    lookup = lookup_port(inst, port)
+    if lookup.direction == "input":
+        edge = connection_by_dst.get((inst.inst_name, lookup.canonical_port))
+        if edge:
+            if edge.src_instance in {"", "top"}:
+                return "top." + edge.src_port
+            return edge.src_instance + "." + edge.src_port
+    return from_whom_for(inst, port, direction)
 
 
 def parse_connection(text: str) -> Tuple[str, str]:
@@ -819,12 +1016,117 @@ def parse_connection(text: str) -> Tuple[str, str]:
     return "unknown", text
 
 
+def split_port_key(port: str) -> Tuple[str, str, bool]:
+    port = clean_cell(port)
+    range_match = re.match(r"^(.+)\[(\d+)\s*:\s*(\d+)\]$", port)
+    if range_match:
+        return range_match.group(1), "", True
+    bit_match = re.match(r"^(.+)\[(\d+)\]$", port)
+    if bit_match:
+        return bit_match.group(1), bit_match.group(2), False
+    return port, "", False
+
+
+def port_maps_by_direction(inst: InstInfo) -> List[Tuple[str, Dict[str, PortInfo]]]:
+    return [
+        ("output", inst.outputs),
+        ("input", inst.inputs),
+        ("inout", inst.inouts),
+    ]
+
+
+def lookup_port(inst: InstInfo, port: str) -> PortLookup:
+    port = clean_cell(port)
+    for direction, mapping in port_maps_by_direction(inst):
+        if port in mapping:
+            return PortLookup(direction, port, port, "", False, mapping[port])
+    base, bit_index, is_range = split_port_key(port)
+    for direction, mapping in port_maps_by_direction(inst):
+        if base in mapping:
+            return PortLookup(direction, port, base, bit_index, is_range, mapping[base])
+    return PortLookup("unknown", port, base, bit_index, is_range, None)
+
+
+def parse_width_bounds(text: str) -> Optional[Tuple[int, int]]:
+    text = clean_cell(text)
+    if not text:
+        return None
+    range_match = re.match(r"^\[?\s*(\d+)\s*:\s*(\d+)\s*\]?$", text)
+    if range_match:
+        a = int(range_match.group(1))
+        b = int(range_match.group(2))
+        return min(a, b), max(a, b)
+    if re.fullmatch(r"\d+", text):
+        width = int(text)
+        if width <= 0:
+            return None
+        return 0, width - 1
+    return None
+
+
+def port_declared_vector(info: Optional[PortInfo]) -> bool:
+    if info is None:
+        return False
+    for text in (info.used_width, info.width):
+        bounds = parse_width_bounds(text)
+        if bounds is not None:
+            return bounds[1] > bounds[0]
+    return False
+
+
+def port_bit_in_declared_width(info: Optional[PortInfo], bit_index: str) -> bool:
+    if info is None or not bit_index:
+        return True
+    for text in (info.used_width, info.width):
+        bounds = parse_width_bounds(text)
+        if bounds is None:
+            continue
+        bit = int(bit_index)
+        return bounds[0] <= bit <= bounds[1]
+    return True
+
+
 def clock_name_for(inst_name: str, port: str) -> str:
+    base, bit_index, _ = split_port_key(port)
+    if bit_index:
+        return sanitize_name(f"{inst_name}_{base}_bit{bit_index}")
     return sanitize_name(f"{inst_name}_{port}")
 
 
 def top_clock_name(port: str) -> str:
+    base, bit_index, _ = split_port_key(port)
+    if bit_index:
+        return sanitize_name(f"top_{base}_bit{bit_index}")
     return sanitize_name(f"top_{port}")
+
+
+def clock_port_reference_error(inst: InstInfo, port: str, role: str) -> Tuple[str, str]:
+    lookup = lookup_port(inst, port)
+    role_upper = role.upper()
+    if lookup.is_range:
+        return (
+            f"CLOCK_{role_upper}_RANGE_NOT_SUPPORTED",
+            f"{role} port {port} is a range; 01 requires scalar or explicit bit target/source",
+        )
+    if lookup.direction == "unknown":
+        rule_id = "CLOCK_TARGET_NOT_IN_OWNER_SHEET"
+        if role == "source":
+            rule_id = "CLOCK_GENERATED_SOURCE_NOT_IN_OWNER_SHEET"
+        return (
+            rule_id,
+            f"{role} port {port} is not listed as Input/Output/Inout in owner sheet",
+        )
+    if lookup.bit_index and not port_bit_in_declared_width(lookup.info, lookup.bit_index):
+        return (
+            f"CLOCK_{role_upper}_BIT_OUT_OF_RANGE",
+            f"{role} port {port} is outside declared width for {lookup.declared_port}",
+        )
+    if not lookup.bit_index and lookup.canonical_port == lookup.declared_port and port_declared_vector(lookup.info):
+        return (
+            f"CLOCK_{role_upper}_VECTOR_REQUIRES_BIT",
+            f"{role} port {port} is a vector; 01 requires explicit bit target/source such as {port}[0]",
+        )
+    return "", ""
 
 
 def rewrite_object_token_for_inst(
@@ -833,12 +1135,32 @@ def rewrite_object_token_for_inst(
     report: Report,
     sdc_name: str,
     parsed: Optional[ParsedClock] = None,
+    name_map: Optional[Dict[str, str]] = None,
 ) -> str:
     cmd, objects = parse_get_object(token)
     if cmd == "get_ports":
         return get_pins_obj([f"{inst.inst_name}/{obj}" for obj in objects])
     if cmd == "get_clocks":
-        return token
+        mapped: List[str] = []
+        unmapped: List[str] = []
+        name_map = name_map or {}
+        for obj in objects:
+            if obj in name_map:
+                new_obj = name_map[obj]
+            else:
+                new_obj = obj
+                unmapped.append(obj)
+            mapped.append(new_obj)
+        if unmapped:
+            message = (
+                f"source references get_clocks name(s) without SoC rename mapping: "
+                f"{', '.join(unmapped)}; keeping unmapped name(s)"
+            )
+            if parsed:
+                report.warn(harden_clock_issue(inst, parsed, "CLOCK_SOURCE_GET_CLOCKS_UNMAPPED", message))
+            else:
+                report.warn(f"{sdc_name}: CLOCK_SOURCE_GET_CLOCKS_UNMAPPED: {message}")
+        return get_clocks_obj(mapped)
     if cmd == "get_pins":
         message = f"source references get_pins in harden SDC; keeping as-is: {token}"
         if parsed:
@@ -876,6 +1198,7 @@ def rewrite_clock_command(
                 report,
                 inst.sdc_path.name if inst.sdc_path else inst.inst_name,
                 parsed,
+                name_map,
             )
             idx += 2
             continue
@@ -920,12 +1243,13 @@ def test_like_clock_tokens(parsed: ParsedClock) -> List[str]:
         [parsed.original_name] + parsed.target_ports + parsed.source_ports
     ).lower()
     tokens = set(part for part in re.split(r"[^a-z0-9]+", text) if part)
-    return sorted(tokens & {"scan", "mbist", "bist", "jtag", "test"})
+    return sorted(tokens & {"scan", "mbist", "bist", "jtag", "test", "gpio"})
 
 
 def process_instance(
     inst: InstInfo,
     report: Report,
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
 ) -> List[ClockRecord]:
     if not inst.sdc_path:
         return []
@@ -938,9 +1262,14 @@ def process_instance(
     parsed_cmds = parse_clock_commands(text, report, inst.sdc_path.name)
     name_map: Dict[str, str] = {}
     for cmd in parsed_cmds:
+        if len(cmd.target_ports) != 1:
+            continue
         port = cmd.target_ports[0]
+        rule_id, _ = clock_port_reference_error(inst, port, "target")
+        if rule_id:
+            continue
         direction = port_direction(inst, port)
-        from_whom = from_whom_for(inst, port, direction)
+        from_whom = from_whom_with_connections(inst, port, direction, connection_by_dst)
         src_kind, src_obj = parse_connection(from_whom)
         if direction in {"output", "inout"}:
             name_map[cmd.original_name] = clock_name_for(inst.inst_name, port)
@@ -951,9 +1280,40 @@ def process_instance(
 
     records: List[ClockRecord] = []
     for cmd in parsed_cmds:
+        if len(cmd.target_ports) > 1:
+            note = (
+                "clock command targets multiple ports; 01 v1 requires one target port per clock command "
+                "to keep SoC clock naming and pending coverage unambiguous"
+            )
+            for target_port in cmd.target_ports:
+                direction = port_direction(inst, target_port)
+                records.append(
+                    ClockRecord(
+                        inst_name=inst.inst_name,
+                        module_name=inst.module_name,
+                        port_name=target_port,
+                        direction=direction,
+                        clock_name=clock_name_for(inst.inst_name, target_port),
+                        clock_kind=command_kind(cmd),
+                        period=cmd.period,
+                        waveform=cmd.waveform,
+                        direct_source="",
+                        root_source="",
+                            from_whom=from_whom_with_connections(inst, target_port, direction, connection_by_dst),
+                        original_sdc=inst.sdc_path.name,
+                        original_clock_name=cmd.original_name,
+                        final_action="skipped",
+                        note=note,
+                        source_line=cmd.source_line,
+                        original_command=cmd.raw,
+                    )
+                )
+            report.error(harden_clock_issue(inst, cmd, "CLOCK_MULTI_TARGET_NOT_SUPPORTED", note))
+            continue
         port = cmd.target_ports[0]
         direction = port_direction(inst, port)
-        if direction == "unknown":
+        target_rule_id, target_message = clock_port_reference_error(inst, port, "target")
+        if target_rule_id:
             records.append(
                 ClockRecord(
                     inst_name=inst.inst_name,
@@ -970,19 +1330,16 @@ def process_instance(
                     original_sdc=inst.sdc_path.name,
                     original_clock_name=cmd.original_name,
                     final_action="skipped",
-                    note="clock target is not listed as Input/Output/Inout in owner sheet",
+                    note=target_message,
                     source_line=cmd.source_line,
                     original_command=cmd.raw,
                 )
             )
-            report.warn(
-                harden_clock_issue(
-                    inst,
-                    cmd,
-                    "CLOCK_TARGET_NOT_IN_OWNER_SHEET",
-                    "target port is not listed as Input/Output/Inout in owner sheet",
-                )
-            )
+            issue = harden_clock_issue(inst, cmd, target_rule_id, target_message)
+            if target_rule_id == "CLOCK_TARGET_NOT_IN_OWNER_SHEET":
+                report.warn(issue)
+            else:
+                report.error(issue)
             continue
 
         test_tokens = test_like_clock_tokens(cmd)
@@ -996,9 +1353,58 @@ def process_instance(
                     f"{', '.join(test_tokens)}; clock is not skipped, review scenario ownership",
                 )
             )
+        if "-add" in cmd.tokens:
+            report.warn(
+                harden_clock_issue(
+                    inst,
+                    cmd,
+                    "CLOCK_ADD_OPTION_OUT_OF_SCOPE",
+                    "-add multi-clock target semantics are out of scope for 01 v1; command is emitted as-is and needs review",
+                )
+            )
+        if command_kind(cmd) == "create_clock" and not cmd.period:
+            report.warn(
+                harden_clock_issue(
+                    inst,
+                    cmd,
+                    "CLOCK_CREATE_CLOCK_MISSING_PERIOD",
+                    "create_clock has no -period; emitted command may be invalid",
+                )
+            )
 
-        from_whom = from_whom_for(inst, port, direction)
-        source_obj = source_object_from_cmd(cmd, inst)
+        from_whom = from_whom_with_connections(inst, port, direction, connection_by_dst)
+        if is_generated_clock(cmd):
+            source_errors: List[Tuple[str, str]] = []
+            for source_port in cmd.source_ports:
+                rule_id, message = clock_port_reference_error(inst, source_port, "source")
+                if rule_id:
+                    source_errors.append((rule_id, message))
+            if source_errors:
+                note = "; ".join(message for _, message in source_errors)
+                records.append(
+                    ClockRecord(
+                        inst_name=inst.inst_name,
+                        module_name=inst.module_name,
+                        port_name=port,
+                        direction=direction,
+                        clock_name=name_map.get(cmd.original_name, clock_name_for(inst.inst_name, port)),
+                        clock_kind=command_kind(cmd),
+                        period=cmd.period,
+                        waveform=cmd.waveform,
+                        direct_source="",
+                        root_source="",
+                        from_whom=from_whom,
+                        original_sdc=inst.sdc_path.name,
+                        original_clock_name=cmd.original_name,
+                        final_action="skipped",
+                        note=note,
+                        source_line=cmd.source_line,
+                        original_command=cmd.raw,
+                    )
+                )
+                report.error(harden_clock_issue(inst, cmd, source_errors[0][0], note))
+                continue
+        source_obj = source_object_from_cmd(cmd, inst, name_map)
         if is_generated_clock(cmd) and not source_obj:
             note = "generated clock has no parseable -source; fix harden SDC or use create_clock for an independent root clock"
             records.append(
@@ -1206,7 +1612,8 @@ def virtual_clock_records(specs: Sequence[VirtualClockSpec]) -> List[ClockRecord
     return records
 
 
-def source_object_from_cmd(cmd: ParsedClock, inst: InstInfo) -> str:
+def source_object_from_cmd(cmd: ParsedClock, inst: InstInfo, name_map: Optional[Dict[str, str]] = None) -> str:
+    name_map = name_map or {}
     if cmd.source_ports:
         return f"{inst.inst_name}/{cmd.source_ports[0]}"
     if cmd.source_token:
@@ -1214,7 +1621,8 @@ def source_object_from_cmd(cmd: ParsedClock, inst: InstInfo) -> str:
         if get_cmd == "get_pins" and objects:
             return objects[0]
         if get_cmd == "get_clocks" and objects:
-            return "clock:" + objects[0]
+            mapped = [name_map.get(obj, obj) for obj in objects]
+            return "clock:" + " ".join(mapped)
     return ""
 
 
@@ -1270,7 +1678,11 @@ def build_producer_map(records: List[ClockRecord]) -> Dict[str, ClockRecord]:
     return result
 
 
-def resolve_source_connection(obj: str, instances: Dict[str, InstInfo]) -> str:
+def resolve_source_connection(
+    obj: str,
+    instances: Dict[str, InstInfo],
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+) -> str:
     if not obj or obj.startswith("top/") or obj.startswith("clock:"):
         return obj
     if "/" not in obj:
@@ -1279,8 +1691,10 @@ def resolve_source_connection(obj: str, instances: Dict[str, InstInfo]) -> str:
     inst = instances.get(inst_name)
     if not inst:
         return obj
-    if port in inst.inputs:
-        kind, value = parse_connection(inst.inputs[port].from_whom)
+    direction = port_direction(inst, port)
+    if direction == "input":
+        from_whom = from_whom_with_connections(inst, port, direction, connection_by_dst)
+        kind, value = parse_connection(from_whom)
         if kind == "top":
             return f"top/{value}"
         if kind not in {"", "unknown", "const"}:
@@ -1288,7 +1702,11 @@ def resolve_source_connection(obj: str, instances: Dict[str, InstInfo]) -> str:
     return obj
 
 
-def compute_root_sources(records: List[ClockRecord], instances: Dict[str, InstInfo]) -> None:
+def compute_root_sources(
+    records: List[ClockRecord],
+    instances: Dict[str, InstInfo],
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+) -> None:
     producers = build_producer_map(records)
 
     def root_for_object(obj: str, seen: Optional[set] = None) -> str:
@@ -1299,7 +1717,7 @@ def compute_root_sources(records: List[ClockRecord], instances: Dict[str, InstIn
         if obj in seen:
             return obj
         seen.add(obj)
-        connected = resolve_source_connection(obj, instances)
+        connected = resolve_source_connection(obj, instances, connection_by_dst)
         if connected != obj:
             return root_for_object(connected, seen)
         producer = producers.get(obj)
@@ -1319,6 +1737,22 @@ def compute_root_sources(records: List[ClockRecord], instances: Dict[str, InstIn
 
 
 def run_checks(records: List[ClockRecord], instances: Dict[str, InstInfo], report: Report) -> None:
+    emitted_by_name: Dict[str, List[ClockRecord]] = {}
+    for rec in records:
+        if rec.final_action in EMITTED_CLOCK_ACTIONS:
+            emitted_by_name.setdefault(rec.clock_name, []).append(rec)
+    for clock_name, group in sorted(emitted_by_name.items()):
+        if len(group) <= 1:
+            continue
+        details = ", ".join(
+            f"{rec.inst_name or '<virtual>'}/{rec.port_name or rec.clock_name}"
+            f"({clock_location(rec.original_sdc, rec.source_line)})"
+            for rec in group
+        )
+        report.error(
+            f"clock_name {clock_name}: CLOCK_NAME_CONFLICT: multiple emitted clocks use the same name: {details}"
+        )
+
     producers = build_producer_map(records)
     for rec in records:
         if rec.final_action != "check_only":
@@ -1354,14 +1788,61 @@ def run_checks(records: List[ClockRecord], instances: Dict[str, InstInfo], repor
             )
 
 
-def write_sdc(path: Path, records: List[ClockRecord], report: Report) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def clock_dependency_names(rec: ClockRecord, by_object: Dict[str, ClockRecord]) -> List[str]:
+    deps: List[str] = []
+    for source in (rec.direct_source, rec.root_source):
+        if not source:
+            continue
+        if source.startswith("clock:"):
+            deps.extend(name for name in source[len("clock:"):].split() if name)
+            continue
+        producer = by_object.get(source)
+        if producer:
+            deps.append(producer.clock_name)
+    return deps
+
+
+def dependency_ordered_emitted(records: List[ClockRecord], report: Report) -> List[ClockRecord]:
     emitted = [
         rec
         for rec in records
         if rec.final_action in {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
         and rec.emitted_command
     ]
+    by_clock: Dict[str, ClockRecord] = {}
+    for rec in emitted:
+        if rec.clock_name not in by_clock:
+            by_clock[rec.clock_name] = rec
+    by_object = build_producer_map(emitted)
+    index_by_id = {id(rec): idx for idx, rec in enumerate(emitted)}
+    deps_by_index: Dict[int, Set[int]] = {}
+    for idx, rec in enumerate(emitted):
+        deps_by_index[idx] = set()
+        for dep_name in clock_dependency_names(rec, by_object):
+            dep = by_clock.get(dep_name)
+            if not dep:
+                continue
+            dep_idx = index_by_id[id(dep)]
+            if dep_idx != idx:
+                deps_by_index[idx].add(dep_idx)
+
+    remaining: Set[int] = set(range(len(emitted)))
+    ordered: List[ClockRecord] = []
+    while remaining:
+        ready = sorted(idx for idx in remaining if not (deps_by_index[idx] & remaining))
+        if not ready:
+            report.warn("CLOCK_DEPENDENCY_ORDER_CYCLE: unable to fully topologically order emitted clocks; keeping remaining original order")
+            ordered.extend(emitted[idx] for idx in sorted(remaining))
+            break
+        for idx in ready:
+            ordered.append(emitted[idx])
+            remaining.remove(idx)
+    return ordered
+
+
+def write_sdc(path: Path, records: List[ClockRecord], report: Report) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    emitted = dependency_ordered_emitted(records, report)
     lines = [
         "################################################################################",
         "# Auto-generated SoC func clock constraints",
@@ -1431,6 +1912,190 @@ def write_report(path: Path, report: Report, records: List[ClockRecord]) -> None
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def removable_clock_records(records: Sequence[ClockRecord]) -> List[ClockRecord]:
+    actions = {
+        "emit_top_clock",
+        "duplicate_top_clock",
+        "check_only",
+        "emit_output_clock",
+    }
+    removable: List[ClockRecord] = []
+    seen: Set[PortKey] = set()
+    for rec in records:
+        if rec.final_action not in actions:
+            continue
+        if not rec.inst_name or not rec.port_name or rec.direction not in {"input", "output", "inout"}:
+            continue
+        key = PortKey(rec.inst_name, rec.direction, rec.port_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        removable.append(rec)
+    return removable
+
+
+def pending_line_key(line: str) -> Optional[Tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 2:
+        return None
+    direction, port = parts[0], parts[1]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return direction, port
+
+
+def removed_line_key(line: str) -> Optional[PortKey]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) < 3:
+        return None
+    inst_name, direction, port = parts[:3]
+    if direction not in {"input", "output", "inout"}:
+        return None
+    return PortKey(inst_name, direction, port)
+
+
+def read_removed_keys(log_dir: Path) -> Set[PortKey]:
+    keys: Set[PortKey] = set()
+    if not log_dir.is_dir():
+        return keys
+    for path in sorted(log_dir.glob("*.removed")):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key = removed_line_key(line)
+            if key is not None:
+                keys.add(key)
+    return keys
+
+
+def clock_removed_reason(rec: ClockRecord) -> str:
+    if rec.final_action == "check_only":
+        return "upstream_clock_sink"
+    if rec.final_action == "duplicate_top_clock":
+        return "duplicate_top_clock_user"
+    if rec.final_action == "emit_top_clock":
+        return "top_clock"
+    if rec.is_forwarded:
+        return "forwarded_clock"
+    if rec.clock_kind in {"create_generated_clock", "generated_combinational"}:
+        return "generated_clock"
+    return "output_clock"
+
+
+def removed_log_line(rec: ClockRecord) -> str:
+    fields = [
+        rec.inst_name,
+        rec.direction,
+        rec.port_name,
+        "covered_by=01_soc_clocks",
+        f"reason={clock_removed_reason(rec)}",
+        f"clock={rec.clock_name}",
+        f"action={rec.final_action}",
+    ]
+    if rec.from_whom:
+        fields.append(f"from_whom={rec.from_whom}")
+    if rec.original_sdc:
+        fields.append(f"source={clock_location(rec.original_sdc, rec.source_line)}")
+    return " ".join(fields)
+
+
+def update_pending_for_01(cwd: Path, pending_root: Path, records: Sequence[ClockRecord], report: Report) -> None:
+    pending_dir = pending_root / "pending"
+    if not pending_dir.exists():
+        return
+    if not pending_dir.is_dir():
+        report.error(f"{pending_dir}: pending path exists but is not a directory")
+        return
+
+    removable = removable_clock_records(records)
+    if not removable:
+        return
+
+    log_dir = pending_root / "removed_log"
+    previous_removed = read_removed_keys(log_dir)
+
+    by_inst: Dict[str, List[ClockRecord]] = {}
+    for rec in removable:
+        by_inst.setdefault(rec.inst_name, []).append(rec)
+
+    removed_records: List[ClockRecord] = []
+    for inst_name, inst_records in sorted(by_inst.items()):
+        pending_file = pending_dir / f"{inst_name}.ports"
+        if not pending_file.is_file():
+            for rec in inst_records:
+                if PortKey(rec.inst_name, rec.direction, rec.port_name) in previous_removed:
+                    continue
+                report.error(
+                    f"{pending_file}: missing pending file for 01 clock port "
+                    f"{rec.inst_name}/{rec.port_name}"
+                )
+            continue
+
+        lines = pending_file.read_text(encoding="utf-8").splitlines()
+        index: Dict[Tuple[str, str], int] = {}
+        duplicate_keys: Set[Tuple[str, str]] = set()
+        for idx, line in enumerate(lines):
+            key = pending_line_key(line)
+            if key is None:
+                continue
+            if key in index:
+                duplicate_keys.add(key)
+            else:
+                index[key] = idx
+        for direction, port in sorted(duplicate_keys):
+            report.error(f"{pending_file}: duplicate pending port line {direction} {port}")
+
+        remove_line_indices: Set[int] = set()
+        for rec in inst_records:
+            key = (rec.direction, rec.port_name)
+            if key not in index:
+                if PortKey(rec.inst_name, rec.direction, rec.port_name) in previous_removed:
+                    continue
+                report.error(
+                    f"{pending_file}: 01 wants to remove {rec.direction} {rec.port_name}, "
+                    "but it is not present in pending and no previous_removed record exists"
+                )
+                continue
+            remove_line_indices.add(index[key])
+            removed_records.append(rec)
+
+        if remove_line_indices:
+            kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
+            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+
+    if removed_records:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "01_soc_clocks.removed"
+        existing_lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.is_file() else []
+        existing_keys: Set[PortKey] = set()
+        for line in existing_lines:
+            key = removed_line_key(line)
+            if key is not None:
+                existing_keys.add(key)
+        new_lines = []
+        for rec in sorted(removed_records, key=lambda r: (r.inst_name, r.direction, r.port_name)):
+            key = PortKey(rec.inst_name, rec.direction, rec.port_name)
+            if key not in existing_keys:
+                new_lines.append(removed_log_line(rec))
+                existing_keys.add(key)
+        if new_lines:
+            log_lines = [line for line in existing_lines if line.strip()] + new_lines
+            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+        try:
+            display_path = log_path.relative_to(cwd)
+        except ValueError:
+            display_path = log_path
+        report.info(f"removed {len(removed_records)} harden clock port(s) from pending; log={display_path}")
+
+
 def default_port_files(cwd: Path, info_name: str) -> List[Path]:
     paths = []
     for item in sorted(cwd.glob("*.xlsx")):
@@ -1477,9 +2142,30 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--connection-inventory",
+        default="00_harden_port_inventory/connection_inventory.csv",
+        help=(
+            "optional 00 bit-to-bit connection inventory. When present, 01 uses it "
+            "to resolve clock input source bits before falling back to owner From Whom"
+        ),
+    )
+    parser.add_argument(
         "--no-write-sdc",
         action="store_true",
         help="only write inventory/report, not common/01_soc_clocks.sdc",
+    )
+    parser.add_argument(
+        "--pending-root",
+        default="00_harden_port_inventory",
+        help=(
+            "optional 00 harden port inventory root. If <root>/pending exists, "
+            "01 removes covered clock ports and writes removed_log/01_soc_clocks.removed"
+        ),
+    )
+    parser.add_argument(
+        "--no-update-pending",
+        action="store_true",
+        help="do not consume 00_harden_port_inventory/pending even if it exists",
     )
     return parser.parse_args(argv)
 
@@ -1515,22 +2201,25 @@ def main(argv: Sequence[str]) -> int:
     sheets = read_port_workbooks(port_files, report)
     attach_port_data(instances, sheets, report)
     resolve_sdc_paths(instances, cwd, report)
+    connection_by_dst = read_connection_inventory(cwd / args.connection_inventory, report)
 
     records: List[ClockRecord] = []
     if args.virtual_clocks:
         records.extend(virtual_clock_records(read_virtual_clock_csv(cwd / args.virtual_clocks, report)))
     for inst_name in sorted(instances):
-        records.extend(process_instance(instances[inst_name], report))
+        records.extend(process_instance(instances[inst_name], report, connection_by_dst))
 
     dedupe_virtual_clocks(records, report)
     dedupe_top_clocks(records, report)
     inst_lookup = build_instance_lookup(instances)
-    compute_root_sources(records, inst_lookup)
+    compute_root_sources(records, inst_lookup, connection_by_dst)
     run_checks(records, inst_lookup, report)
 
     if not args.no_write_sdc:
         write_sdc(cwd / args.output, records, report)
     write_inventory(cwd / args.inventory, records)
+    if not args.no_update_pending and args.pending_root:
+        update_pending_for_01(cwd, cwd / args.pending_root, records, report)
     write_report(cwd / args.report, report, records)
 
     print(f"Instances : {len(instances)}")
