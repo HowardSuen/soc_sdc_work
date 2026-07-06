@@ -78,7 +78,7 @@ set ::STAGE2_POST_CHECK false
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.4"
+    variable VERSION "v0.4.1"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
     variable AUTHOR "Howard"
@@ -963,6 +963,8 @@ proc stage2_delay::classify_segments {} {
         if {$class eq "merge_candidate"} {
             lappend new_top $updated
         } elseif {$class eq "passthrough"} {
+            set s(passthrough_reason) [top_passthrough_reason [array get s]]
+            set updated [array get s]
             lappend passthrough_segments $updated
         } else {
             add_review $updated "" $class "top segment not mergeable"
@@ -984,6 +986,8 @@ proc stage2_delay::classify_segments {} {
             }
             lappend new_harden $updated
         } elseif {$class eq "passthrough"} {
+            set s(passthrough_reason) [harden_passthrough_reason [array get s]]
+            set updated [array get s]
             lappend passthrough_segments $updated
         } else {
             add_review "" $updated $class "harden segment not mergeable"
@@ -991,6 +995,66 @@ proc stage2_delay::classify_segments {} {
         array unset s
     }
     set harden_segments $new_harden
+}
+
+proc stage2_delay::top_passthrough_reason {seg} {
+    array set s $seg
+    set reason "TOP_PASSTHROUGH_UNKNOWN"
+    if {[llength $s(to_records)] == 1} {
+        array set to [lindex $s(to_records) 0]
+        if {$to(owner_harden_inst) eq ""} {
+            set reason "TOP_TO_NOT_UNDER_HARDEN_LIST to=[record_debug [array get to]] harden_insts=[harden_inst_list_for_debug]"
+        } elseif {![is_harden_boundary_input_record [array get to]]} {
+            set reason "TOP_TO_NOT_INPUT_BOUNDARY to=[record_debug [array get to]]"
+        }
+        array unset to
+    } else {
+        set reason "TOP_TO_OBJECT_COUNT_[llength $s(to_records)]"
+    }
+    array unset s
+    return $reason
+}
+
+proc stage2_delay::harden_passthrough_reason {seg} {
+    array set s $seg
+    set reason "HARDEN_PASSTHROUGH_UNKNOWN"
+    if {[llength $s(to_records)] == 1} {
+        array set to [lindex $s(to_records) 0]
+        if {$to(owner_harden_inst) ne $s(harden_inst)} {
+            set reason "HARDEN_TO_NOT_UNDER_OWN_INSTANCE to=[record_debug [array get to]] expected_harden=$s(harden_inst)"
+        } elseif {$s(kind) eq "complete" && [llength $s(from_records)] == 1} {
+            array set from [lindex $s(from_records) 0]
+            if {![is_harden_boundary_input_record [array get from]] || $from(owner_harden_inst) ne $s(harden_inst)} {
+                set reason "HARDEN_FROM_NOT_INPUT_BOUNDARY from=[record_debug [array get from]] expected_harden=$s(harden_inst)"
+            }
+            array unset from
+        } elseif {$s(kind) eq "complete"} {
+            set reason "HARDEN_FROM_OBJECT_COUNT_[llength $s(from_records)]"
+        }
+        array unset to
+    } else {
+        set reason "HARDEN_TO_OBJECT_COUNT_[llength $s(to_records)]"
+    }
+    array unset s
+    return $reason
+}
+
+proc stage2_delay::harden_inst_list_for_debug {} {
+    variable hardens
+    set names {}
+    foreach harden $hardens {
+        array set h $harden
+        lappend names $h(inst_path)
+        array unset h
+    }
+    return [join $names ","]
+}
+
+proc stage2_delay::record_debug {rec} {
+    array set r $rec
+    set text "class=$r(object_class),name=$r(full_name),direction=$r(direction),owner=$r(owner_harden_inst)"
+    array unset r
+    return $text
 }
 
 proc stage2_delay::classify_top_segment {seg} {
@@ -1628,11 +1692,43 @@ proc stage2_delay::write_report {path} {
         puts $fout $line
     }
     puts $fout ""
+    puts $fout "\[PASSTHROUGH\]"
+    foreach seg $passthrough_segments {
+        puts $fout [passthrough_report_line $seg]
+    }
+    puts $fout ""
     puts $fout "\[REVIEW\]"
     foreach item $review_items {
         puts $fout [join_kv $item]
     }
     close $fout
+}
+
+proc stage2_delay::passthrough_report_line {seg} {
+    array set s $seg
+    set reason ""
+    if {[info exists s(passthrough_reason)]} {
+        set reason $s(passthrough_reason)
+    }
+    set line [list \
+        source $s(source) \
+        id $s(id) \
+        file $s(source_file) \
+        line $s(line_no) \
+        reason $reason \
+        from [records_debug_list $s(from_records)] \
+        to [records_debug_list $s(to_records)] \
+    ]
+    array unset s
+    return [join_kv $line]
+}
+
+proc stage2_delay::records_debug_list {records} {
+    set items {}
+    foreach rec $records {
+        lappend items [record_debug $rec]
+    }
+    return [join $items ";"]
 }
 
 proc stage2_delay::write_final_sdc {path} {
