@@ -1,0 +1,2 @@
+harden_name,inst_path,clean_sdc,delay_candidate_file,netlist,module
+h0,u_h0,./harden0_clean.sdc,,./harden0_flat.v,harden0

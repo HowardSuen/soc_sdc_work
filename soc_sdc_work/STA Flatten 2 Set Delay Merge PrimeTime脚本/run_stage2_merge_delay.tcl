@@ -1,4 +1,4 @@
-# integration_delay_merger.pt.tcl
+# run_stage2_merge_delay.tcl
 #
 # Stage 2: Integration E2E Delay Merge Proc
 #
@@ -8,9 +8,78 @@
 # them to the PT timing database, and emits static end-to-end delay
 # constraints in the current integration scope.
 
+###############################################################################
+# Single-file runner user settings
+###############################################################################
+#
+# Normal PrimeTime usage:
+#   1. Edit only this section.
+#   2. source /path/to/run_stage2_merge_delay.tcl
+#
+# Advanced/library usage:
+#   set ::STAGE2_AUTO_RUN false
+#   source /path/to/run_stage2_merge_delay.tcl
+#   stage2_delay::build ...
+
+if {![info exists ::STAGE2_AUTO_RUN]} {
+    set ::STAGE2_AUTO_RUN true
+}
+
+# Current integration run directory. Edit this path for normal use.
+# This directory should contain top_dc.sdc and harden_list.csv unless TOP_SDC
+# / HARDEN_LIST are overridden below.
+set ::RUN_DIR [pwd]
+
+# Top integration SDC. Typical target delay segment:
+#   set_max_delay <D_ext> -from <S> -to [get_pins <harden_inst>/<input_pin>]
+# or:
+#   set_max_delay <D_ext> -to [get_pins <harden_inst>/<input_pin>]
+set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
+
+# Harden list CSV. Required columns:
+#   harden_name,inst_path,clean_sdc,delay_candidate_file,netlist,module
+set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
+
+# Output directory.
+set ::OUT_DIR $::RUN_DIR
+
+# Optional final flattened SDC name. Leave empty to derive from current_design:
+#   <top_module_name>_flatten.sdc
+set ::OUT_FINAL_SDC ""
+
+# Merge policy.
+#   replace  : recommended; consumed delay commands are removed from final SDC.
+#   additive : debug mode; keep original delay commands and add E2E commands.
+set ::MERGE_MODE replace
+
+# Partial merge policy for harden open_from segments with multiple inferred
+# boundary inputs.
+set ::PARTIAL_MERGE_POLICY residual_through
+
+# Policy for harden complete segments whose boundary input has no top segment.
+set ::UNMATCHED_HARDEN_POLICY review
+
+# Allow top open_from + harden segment to generate -through <boundary> -to <E>.
+set ::ALLOW_THROUGH true
+
+# Safety limits.
+set ::MAX_ENDPOINTS 1000
+set ::MAX_ENUM_OBJECTS 64
+
+# Optional output file overrides. Leave empty to use OUT_DIR defaults.
+set ::OUT_E2E_SDC ""
+set ::OUT_REPORT ""
+set ::OUT_REMOVED_SDC ""
+set ::OUT_REVIEW_RPT ""
+
+# Optional post-check after build. Keep disabled until generated SDC is reviewed.
+set ::STAGE2_POST_CHECK false
+
+set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
+
 namespace eval stage2_delay {
-    variable VERSION "v0.3"
-    variable TOOL_NAME "integration_delay_merger.pt.tcl"
+    variable VERSION "v0.4"
+    variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
     variable AUTHOR "Howard"
 
@@ -22,6 +91,7 @@ namespace eval stage2_delay {
     variable generated_cmds
     variable residual_cmds
     variable consumed_constraints
+    variable consumed_segments
     variable review_items
     variable report_items
     variable command_seq
@@ -58,6 +128,7 @@ proc stage2_delay::reset_state {} {
     variable generated_cmds
     variable residual_cmds
     variable consumed_constraints
+    variable consumed_segments
     variable review_items
     variable report_items
     variable command_seq
@@ -71,6 +142,7 @@ proc stage2_delay::reset_state {} {
     set residual_cmds {}
     array unset consumed_constraints
     array set consumed_constraints {}
+    set consumed_segments {}
     set review_items {}
     set report_items {}
     set command_seq 0
@@ -301,7 +373,9 @@ proc stage2_delay::extract_delay_segments_from_sdc {path source harden_inst} {
             continue
         }
         set seg [segment_from_words $words $source $path $cmd(line) $cmd(id) $cmd(text) $harden_inst]
-        add_segment $seg
+        foreach expanded [expand_segment $seg] {
+            add_segment $expanded
+        }
         array unset cmd
     }
 }
@@ -333,7 +407,7 @@ proc stage2_delay::scan_tcl_commands {text} {
                 continue
             }
             incr command_seq
-            lappend out [list id [format "CMD%06d" $command_seq] line $start_line text $text_cmd]
+            lappend out [list id [format "CMD%06d" $command_seq] line $start_line end_line $line_no text $text_cmd]
         }
         set buf ""
         set start_line 0
@@ -345,7 +419,7 @@ proc stage2_delay::scan_tcl_commands {text} {
                 continue
             }
             incr command_seq
-            lappend out [list id [format "CMD%06d" $command_seq] line $start_line text $text_cmd]
+            lappend out [list id [format "CMD%06d" $command_seq] line $start_line end_line $line_no text $text_cmd]
         }
     }
     return $out
@@ -609,12 +683,65 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         source_file $file \
         line_no $line \
         original_text $original \
+        original_id $cmd_id \
+        split_index 1 \
+        split_total 1 \
         harden_inst $harden_inst \
         class "" \
         boundary_pins {} \
         status $status \
         failure_reason $reason \
     ]
+}
+
+proc stage2_delay::expand_segment {seg} {
+    array set s $seg
+    if {$s(status) ne "ok"} {
+        array unset s
+        return [list $seg]
+    }
+    if {[llength $s(to_records)] == 0} {
+        array unset s
+        return [list $seg]
+    }
+
+    set from_choices $s(from_records)
+    if {[llength $from_choices] == 0} {
+        set from_choices [list {}]
+    }
+    set to_choices $s(to_records)
+    set total [expr {[llength $from_choices] * [llength $to_choices]}]
+    if {$total <= 1} {
+        set s(split_total) 1
+        set s(split_index) 1
+        set result [array get s]
+        array unset s
+        return [list $result]
+    }
+
+    set out {}
+    set idx 0
+    foreach from_rec $from_choices {
+        foreach to_rec $to_choices {
+            incr idx
+            array set e [array get s]
+            set e(id) "$s(original_id).[format %03d $idx]"
+            set e(split_index) $idx
+            set e(split_total) $total
+            if {[llength $from_rec] == 0} {
+                set e(from_records) {}
+                set e(kind) open_from
+            } else {
+                set e(from_records) [list $from_rec]
+                set e(kind) complete
+            }
+            set e(to_records) [list $to_rec]
+            lappend out [array get e]
+            array unset e
+        }
+    }
+    array unset s
+    return $out
 }
 
 proc stage2_delay::strip_braces {text} {
@@ -929,6 +1056,11 @@ proc stage2_delay::classify_harden_segment {seg} {
         array unset s
         return "passthrough"
     }
+    if {[is_harden_boundary_output_record [array get to]]} {
+        array unset to
+        array unset s
+        return "OUTPUT_DIRECTION_NOT_SUPPORTED"
+    }
     if {$s(kind) eq "complete"} {
         if {[llength $s(from_records)] != 1} {
             array unset to
@@ -1104,6 +1236,7 @@ proc stage2_delay::match_top_to_harden_segments {} {
     variable options
 
     array set matched_top {}
+    array set generated_pair {}
     foreach hseg $harden_segments {
         array set h $hseg
         set boundaries [harden_boundary_records [array get h]]
@@ -1120,7 +1253,8 @@ proc stage2_delay::match_top_to_harden_segments {} {
             }
             foreach tseg $candidates {
                 array set t $tseg
-                if {[info exists matched_top($t(id))]} {
+                set pair_key "$t(id)|$h(id)"
+                if {[info exists generated_pair($pair_key)]} {
                     array unset t
                     continue
                 }
@@ -1128,6 +1262,7 @@ proc stage2_delay::match_top_to_harden_segments {} {
                 if {$generated ne ""} {
                     consume_segment [array get t]
                     consume_segment [array get h]
+                    set generated_pair($pair_key) 1
                     set matched_top($t(id)) 1
                     lappend matched_boundaries [record_full_name $boundary]
                     add_report_item "MERGED $t(id) + $h(id) boundary=[record_full_name $boundary] total=[expr {$t(delay) + $h(delay)}]"
@@ -1346,8 +1481,13 @@ proc stage2_delay::truthy {value} {
 
 proc stage2_delay::consume_segment {seg} {
     variable consumed_constraints
+    variable consumed_segments
     array set s $seg
-    set consumed_constraints($s(source_file)|$s(id)) $s(original_text)
+    set key "$s(source_file)|$s(id)"
+    if {![info exists consumed_constraints($key)]} {
+        set consumed_constraints($key) $s(original_text)
+        lappend consumed_segments [array get s]
+    }
     array unset s
 }
 
@@ -1422,15 +1562,22 @@ proc stage2_delay::current_scope_name {} {
 }
 
 proc stage2_delay::write_removed_sdc {path} {
-    variable consumed_constraints
+    variable consumed_segments
     set fout [open $path w]
     write_author_banner $fout "# "
     puts $fout "#"
-    puts $fout "# merged_delay_removed.sdc generated by integration_delay_merger.pt.tcl"
-    foreach key [lsort [array names consumed_constraints]] {
-        puts $fout "# CONSUMED $key"
-        puts $fout $consumed_constraints($key)
+    puts $fout "# merged_delay_removed.sdc generated by run_stage2_merge_delay.tcl"
+    foreach seg $consumed_segments {
+        array set s $seg
+        puts $fout "# CONSUMED $s(source_file)|$s(id) original_id=$s(original_id) split=$s(split_index)/$s(split_total)"
+        if {$s(split_total) == 1} {
+            puts $fout $s(original_text)
+        } else {
+            puts $fout "# ORIGINAL: [compact_spaces $s(original_text)]"
+            puts $fout [format_segment_delay_cmd [array get s]]
+        }
         puts $fout ""
+        array unset s
     }
     close $fout
 }
@@ -1440,7 +1587,7 @@ proc stage2_delay::write_review_report {path} {
     set fout [open $path w]
     write_author_banner $fout
     puts $fout ""
-    puts $fout "# unmerged_delay_review.rpt generated by integration_delay_merger.pt.tcl"
+    puts $fout "# unmerged_delay_review.rpt generated by run_stage2_merge_delay.tcl"
     foreach item $review_items {
         puts $fout [join_kv $item]
     }
@@ -1498,7 +1645,7 @@ proc stage2_delay::write_final_sdc {path} {
     set fout [open $path w]
     write_author_banner $fout "# "
     puts $fout "#"
-    puts $fout "# [file tail $path] generated by integration_delay_merger.pt.tcl"
+    puts $fout "# [file tail $path] generated by run_stage2_merge_delay.tcl"
     puts $fout "#"
     puts $fout "# This file is a flattened Stage 2 final SDC for the current integration scope."
     puts $fout "# It contains:"
@@ -1562,33 +1709,21 @@ proc stage2_delay::write_final_section_header {file_handle title source} {
 }
 
 proc stage2_delay::remaining_sdc_text {path} {
-    variable consumed_constraints
+    variable consumed_segments
 
     set fin [open $path r]
     set text [read $fin]
     close $fin
 
-    array set remove_ids {}
-    foreach key [array names consumed_constraints "$path|*"] {
-        set original $consumed_constraints($key)
-        set parts [split $key "|"]
-        set original_id [lindex $parts end]
-        if {![info exists remove_ids($original)]} {
-            set remove_ids($original) {}
-        }
-        lappend remove_ids($original) $original_id
-    }
-
     set commands [scan_tcl_commands $text]
     set remaining $text
     foreach item [lsort -decreasing -integer -command stage2_delay::command_start_compare [commands_with_offsets $text $commands]] {
         array set cmd $item
-        if {[info exists remove_ids($cmd(text))] && [llength $remove_ids($cmd(text))] > 0} {
-            set original_id [lindex $remove_ids($cmd(text)) end]
-            set remove_ids($cmd(text)) [lrange $remove_ids($cmd(text)) 0 end-1]
+        set consumed_for_cmd [consumed_segments_for_command $path $cmd(text)]
+        if {[llength $consumed_for_cmd] > 0} {
             set before [string range $remaining 0 [expr {$cmd(start) - 1}]]
             set after [string range $remaining $cmd(end) end]
-            set replacement "# STAGE2_CONSUMED $original_id: original delay moved to merged_delay_removed.sdc\n"
+            set replacement [remaining_replacement_for_command $path $cmd(text) $consumed_for_cmd]
             set remaining "${before}${replacement}${after}"
         }
         array unset cmd
@@ -1596,25 +1731,134 @@ proc stage2_delay::remaining_sdc_text {path} {
     return [string trimright $remaining]
 }
 
+proc stage2_delay::consumed_segments_for_command {path original_text} {
+    variable consumed_segments
+    set out {}
+    set norm_path [file normalize $path]
+    foreach seg $consumed_segments {
+        array set s $seg
+        if {[file normalize $s(source_file)] eq $norm_path && $s(original_text) eq $original_text} {
+            lappend out [array get s]
+        }
+        array unset s
+    }
+    return $out
+}
+
+proc stage2_delay::remaining_replacement_for_command {path original_text consumed_for_cmd} {
+    array set first [lindex $consumed_for_cmd 0]
+    set words [tokenize_words $original_text]
+    set base [segment_from_words $words $first(source) $path $first(line_no) $first(original_id) $original_text $first(harden_inst)]
+    set expanded [expand_segment $base]
+
+    set consumed_sigs {}
+    foreach seg $consumed_for_cmd {
+        lappend consumed_sigs [segment_signature $seg]
+    }
+
+    set leftovers {}
+    foreach seg $expanded {
+        set sig [segment_signature $seg]
+        set idx [lsearch -exact $consumed_sigs $sig]
+        if {$idx >= 0} {
+            set consumed_sigs [lreplace $consumed_sigs $idx $idx]
+        } else {
+            lappend leftovers $seg
+        }
+    }
+
+    if {[llength $leftovers] == 0} {
+        set replacement "# STAGE2_CONSUMED $first(original_id): original delay moved to merged_delay_removed.sdc\n"
+        array unset first
+        return $replacement
+    }
+
+    set lines {}
+    lappend lines "# STAGE2_REWRITTEN $first(original_id): original multi-object delay kept only for unmerged pairs"
+    lappend lines "# STAGE2_ORIGINAL: [compact_spaces $original_text]"
+    foreach seg $leftovers {
+        lappend lines [format_segment_delay_cmd $seg]
+    }
+    set replacement [join $lines "\n"]
+    array unset first
+    return "$replacement\n"
+}
+
+proc stage2_delay::segment_signature {seg} {
+    array set s $seg
+    set signature [list \
+        type $s(type) \
+        delay [format_delay $s(delay)] \
+        from [records_signature $s(from_records)] \
+        through [records_signature $s(through_records)] \
+        to [records_signature $s(to_records)] \
+    ]
+    array unset s
+    return $signature
+}
+
+proc stage2_delay::records_signature {records} {
+    set out {}
+    foreach rec $records {
+        array set r $rec
+        lappend out "$r(object_class):$r(full_name)"
+        array unset r
+    }
+    return [join $out "|"]
+}
+
+proc stage2_delay::format_segment_delay_cmd {seg} {
+    array set s $seg
+    set cmd_name [expr {$s(type) eq "max" ? "set_max_delay" : "set_min_delay"}]
+    set cmd "$cmd_name [format_delay $s(delay)]"
+    if {[llength $s(from_records)] > 0} {
+        append cmd " -from [format_record_list_for_option $s(from_records)]"
+    }
+    foreach rec $s(through_records) {
+        append cmd " -through [format_record_collection $rec]"
+    }
+    if {[llength $s(to_records)] > 0} {
+        append cmd " -to [format_record_list_for_option $s(to_records)]"
+    }
+    foreach flag $s(flags) {
+        append cmd " $flag"
+    }
+    array unset s
+    return $cmd
+}
+
+proc stage2_delay::format_record_list_for_option {records} {
+    if {[llength $records] == 1} {
+        return [format_record_collection [lindex $records 0]]
+    }
+    set parts {}
+    foreach rec $records {
+        lappend parts [format_record_collection $rec]
+    }
+    return "\[list [join $parts " "]\]"
+}
+
 proc stage2_delay::commands_with_offsets {text commands} {
     set out {}
     set search_start 0
+    set line_offsets [line_start_offsets $text]
     foreach item $commands {
         array set cmd $item
         set target $cmd(text)
         set start [string first $target $text $search_start]
+        set end -1
         if {$start < 0} {
-            set compact_target [compact_spaces $target]
-            set compact_text [compact_spaces $text]
-            set compact_start [string first $compact_target $compact_text]
-            if {$compact_start >= 0} {
-                set start [string first [lindex [split $target] 0] $text $search_start]
+            if {[info exists cmd(line)] && [info exists cmd(end_line)]} {
+                set start [offset_for_line $line_offsets $cmd(line)]
+                set end [offset_after_line $text $line_offsets $cmd(end_line)]
             }
         }
         if {$start >= 0} {
-            set end [expr {$start + [string length $target]}]
-            if {$end < [string length $text] && [string index $text $end] eq "\n"} {
-                incr end
+            if {$end < 0} {
+                set end [expr {$start + [string length $target]}]
+                if {$end < [string length $text] && [string index $text $end] eq "\n"} {
+                    incr end
+                }
             }
             lappend out [list id $cmd(id) text $target start $start end $end]
             set search_start $end
@@ -1622,6 +1866,35 @@ proc stage2_delay::commands_with_offsets {text commands} {
         array unset cmd
     }
     return $out
+}
+
+proc stage2_delay::line_start_offsets {text} {
+    set offsets {0}
+    set len [string length $text]
+    for {set idx 0} {$idx < $len} {incr idx} {
+        if {[string index $text $idx] eq "\n"} {
+            lappend offsets [expr {$idx + 1}]
+        }
+    }
+    return $offsets
+}
+
+proc stage2_delay::offset_for_line {offsets line_no} {
+    set idx [expr {$line_no - 1}]
+    if {$idx < 0} {
+        return 0
+    }
+    if {$idx < [llength $offsets]} {
+        return [lindex $offsets $idx]
+    }
+    return [lindex $offsets end]
+}
+
+proc stage2_delay::offset_after_line {text offsets line_no} {
+    if {$line_no < [llength $offsets]} {
+        return [lindex $offsets $line_no]
+    }
+    return [string length $text]
 }
 
 proc stage2_delay::command_start_compare {a b} {
@@ -1674,7 +1947,9 @@ proc stage2_delay::read_harden_delay_candidates {path harden_inst} {
             set seg [array get s]
             array unset s
         }
-        add_segment $seg
+        foreach expanded [expand_segment $seg] {
+            add_segment $expanded
+        }
         array unset r
     }
 }
@@ -1699,4 +1974,105 @@ proc stage2_delay::post_check {args} {
     if {[info commands report_unconstrained_paths] ne ""} {
         report_unconstrained_paths
     }
+}
+
+proc stage2_delay::global_setting {name default} {
+    upvar #0 $name value
+    if {[info exists value] && $value ne ""} {
+        return $value
+    }
+    return $default
+}
+
+proc stage2_delay::set_global_setting {name value} {
+    upvar #0 $name target
+    set target $value
+}
+
+proc stage2_delay::run_from_user_settings {} {
+    set run_dir [file normalize [global_setting RUN_DIR [pwd]]]
+    set top_sdc [file normalize [global_setting TOP_SDC [file join $run_dir top_dc.sdc]]]
+    set harden_list [file normalize [global_setting HARDEN_LIST [file join $run_dir harden_list.csv]]]
+    set out_dir [file normalize [global_setting OUT_DIR $run_dir]]
+
+    set top_module [global_setting TOP_MODULE_NAME ""]
+    if {$top_module eq ""} {
+        if {![catch {current_design} current_top] && $current_top ne ""} {
+            set top_module $current_top
+        } else {
+            set top_module current_integration_top
+        }
+    }
+    set top_module [safe_filename_token $top_module]
+
+    set out_e2e_sdc [file normalize [global_setting OUT_E2E_SDC [file join $out_dir generated_e2e_delay.sdc]]]
+    set out_report [file normalize [global_setting OUT_REPORT [file join $out_dir integration_delay_merge.rpt]]]
+    set out_removed_sdc [file normalize [global_setting OUT_REMOVED_SDC [file join $out_dir merged_delay_removed.sdc]]]
+    set out_review_rpt [file normalize [global_setting OUT_REVIEW_RPT [file join $out_dir unmerged_delay_review.rpt]]]
+    set out_final_sdc [file normalize [global_setting OUT_FINAL_SDC [file join $out_dir ${top_module}_flatten.sdc]]]
+
+    set merge_mode [global_setting MERGE_MODE replace]
+    set partial_merge_policy [global_setting PARTIAL_MERGE_POLICY residual_through]
+    set unmatched_harden_policy [global_setting UNMATCHED_HARDEN_POLICY review]
+    set allow_through [global_setting ALLOW_THROUGH true]
+    set max_endpoints [global_setting MAX_ENDPOINTS 1000]
+    set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
+
+    foreach required_file [list $top_sdc $harden_list] {
+        if {![file exists $required_file]} {
+            error "Required file not found: $required_file"
+        }
+    }
+    if {![file isdirectory $out_dir]} {
+        file mkdir $out_dir
+    }
+
+    set_global_setting RUN_DIR $run_dir
+    set_global_setting TOP_SDC $top_sdc
+    set_global_setting HARDEN_LIST $harden_list
+    set_global_setting OUT_DIR $out_dir
+    set_global_setting OUT_E2E_SDC $out_e2e_sdc
+    set_global_setting OUT_REPORT $out_report
+    set_global_setting OUT_REMOVED_SDC $out_removed_sdc
+    set_global_setting OUT_REVIEW_RPT $out_review_rpt
+    set_global_setting OUT_FINAL_SDC $out_final_sdc
+    set_global_setting TOP_MODULE_NAME $top_module
+
+    puts "INFO: Stage 2 script      : [global_setting STAGE2_SCRIPT_FILE run_stage2_merge_delay.tcl]"
+    puts "INFO: Run directory       : $run_dir"
+    puts "INFO: Top SDC             : $top_sdc"
+    puts "INFO: Harden list         : $harden_list"
+    puts "INFO: Output E2E SDC      : $out_e2e_sdc"
+    puts "INFO: Final flatten SDC   : $out_final_sdc"
+    puts "INFO: Merge mode          : $merge_mode"
+
+    stage2_delay::build \
+        -top_sdc $top_sdc \
+        -harden_list $harden_list \
+        -out_e2e_sdc $out_e2e_sdc \
+        -out_report $out_report \
+        -out_removed_sdc $out_removed_sdc \
+        -out_review_rpt $out_review_rpt \
+        -out_final_sdc $out_final_sdc \
+        -merge_mode $merge_mode \
+        -partial_merge_policy $partial_merge_policy \
+        -unmatched_harden_policy $unmatched_harden_policy \
+        -allow_through $allow_through \
+        -max_endpoints $max_endpoints \
+        -max_enum_objects $max_enum_objects
+
+    puts "INFO: Stage 2 complete."
+    puts "INFO: Generated E2E SDC   : $out_e2e_sdc"
+    puts "INFO: Merge report        : $out_report"
+    puts "INFO: Removed constraints : $out_removed_sdc"
+    puts "INFO: Review report       : $out_review_rpt"
+    puts "INFO: Final flatten SDC   : $out_final_sdc"
+
+    if {[truthy [global_setting STAGE2_POST_CHECK false]]} {
+        post_check -e2e_sdc $out_e2e_sdc
+    }
+}
+
+if {[info exists ::STAGE2_AUTO_RUN] && [stage2_delay::truthy $::STAGE2_AUTO_RUN]} {
+    stage2_delay::run_from_user_settings
 }

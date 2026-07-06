@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression smoke tests for integration_delay_merger.pt.tcl.
+"""Regression smoke tests for run_stage2_merge_delay.tcl.
 
 The tests run with plain tclsh and use the script's non-PT fallback paths.
 They do not replace PrimeTime validation, but they keep parsing, matching,
@@ -15,7 +15,7 @@ import sys
 
 
 HERE = os.path.abspath(os.path.dirname(__file__))
-TOOL = os.path.abspath(os.path.join(HERE, "..", "integration_delay_merger.pt.tcl"))
+TOOL = os.path.abspath(os.path.join(HERE, "..", "run_stage2_merge_delay.tcl"))
 WORK = os.path.join(HERE, "work")
 
 
@@ -44,6 +44,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
     out_report = os.path.join(case_dir, "integration_delay_merge.rpt")
     out_removed = os.path.join(case_dir, "merged_delay_removed.sdc")
     out_review = os.path.join(case_dir, "unmerged_delay_review.rpt")
+    out_final = os.path.join(case_dir, "current_integration_top_flatten.sdc")
     driver = os.path.join(case_dir, "run.tcl")
     write_file(top_path, top_sdc)
     write_file(harden_path, harden_sdc)
@@ -66,7 +67,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
         args.extend(extra_build_args)
     write_file(
         driver,
-        'source "%s"\nstage2_delay::build %s\n' % (
+        'set ::STAGE2_AUTO_RUN false\nsource "%s"\nstage2_delay::build %s\n' % (
             TOOL.replace("\\", "/"),
             " ".join('"%s"' % arg for arg in args),
         ),
@@ -87,6 +88,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
         "report": out_report,
         "removed": out_removed,
         "review": out_review,
+        "final": out_final,
         "driver": driver,
     }
 
@@ -167,6 +169,36 @@ def test_edge_specific_review():
     assert_contains(result["review"], "EDGE_SPECIFIC_OPTION")
 
 
+def test_multi_object_lists_expand_and_rewrite_remaining():
+    result = run_case(
+        "multi_object_lists",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [list [get_pins u_h0/cfg_i] [get_pins u_h0/unused_i]]\n",
+        "set_max_delay 5.0 -from [list [get_pins u_h0/cfg_i] [get_pins u_h0/other_i]] -to [get_pins u_h0/u_reg/D]\n",
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_contains(result["report"], "Merged constraints              : 1")
+    assert_contains(result["report"], "Review required constraints     : 2")
+    assert_contains(result["removed"], "split=1/2")
+    assert_contains(result["removed"], "set_max_delay 2 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/cfg_i}]")
+    assert_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+    assert_contains(result["final"], "set_max_delay 2 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/unused_i}]")
+    assert_contains(result["final"], "STAGE2_REWRITTEN CMD000002")
+    assert_contains(result["final"], "set_max_delay 5 -from [get_pins {u_h0/other_i}] -to [get_pins {u_h0/u_reg/D}]")
+
+
+def test_one_top_boundary_reused_for_multiple_harden_endpoints():
+    result = run_case(
+        "reuse_top_boundary_for_multi_to",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [list [get_pins u_h0/u_cfg_reg/D] [get_pins u_h0/u_mode_reg/D]]\n",
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/u_cfg_reg/D}]")
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/u_mode_reg/D}]")
+    assert_contains(result["report"], "Merged constraints              : 2")
+
+
 def main():
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
@@ -177,6 +209,8 @@ def main():
         test_harden_open_from_with_explicit_through,
         test_multi_hop_review,
         test_edge_specific_review,
+        test_multi_object_lists_expand_and_rewrite_remaining,
+        test_one_top_boundary_reused_for_multiple_harden_endpoints,
     ]
     for test in tests:
         test()

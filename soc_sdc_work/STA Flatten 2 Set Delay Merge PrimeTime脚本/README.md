@@ -4,7 +4,7 @@ Stage 2 是一个运行在 PrimeTime 中的 Tcl proc，用于把 integration 层
 top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 `set_max_delay` / `set_min_delay` 约束。
 
-本脚本按本目录中的 v0.3 规则文档实现。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.4。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -47,16 +47,28 @@ RC、SPEF、base clock SDC 等 setup 应沿用项目现有 PT flow。Stage 2
 脚本本身不负责读 `.lib` / `.db`，它假设当前 PrimeTime database 已经 link
 完成，并且可以查询 pin/cell/net/attribute。
 
-最简单的执行方式是使用本目录下的 wrapper：
+Stage 2 现在是单文件脚本，不再需要单独的 `run_stage2.tcl`。
+通常只需要修改 `run_stage2_merge_delay.tcl` 顶部的
+`Single-file runner user settings` 区，然后在 PT 中 source 这一份文件：
 
 ```tcl
-source {/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/run_stage2.tcl}
+source {/path/to/run_stage2_merge_delay.tcl}
 ```
 
-也可以直接 source 主脚本并调用 `stage2_delay::build`：
+顶部配置区保留了原 `run_stage2.tcl` 风格的变量设置，常用项如下：
 
 ```tcl
-source integration_delay_merger.pt.tcl
+set ::RUN_DIR {/your/pt/run/dir}
+set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
+set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
+set ::OUT_DIR $::RUN_DIR
+```
+
+如果只是想把主脚本当 proc library 使用，source 前关闭 auto-run：
+
+```tcl
+set ::STAGE2_AUTO_RUN false
+source {/path/to/run_stage2_merge_delay.tcl}
 
 stage2_delay::build \
   -top_sdc ./top_dc.sdc \
@@ -74,15 +86,16 @@ stage2_delay::build \
 stage2_delay::post_check -e2e_sdc ./generated_e2e_delay.sdc
 ```
 
-## run_stage2.tcl 参数
+## 单文件参数
 
-通常只需要修改 [run_stage2.tcl](run_stage2.tcl) 顶部的用户配置区：
+通常只需要修改 `run_stage2_merge_delay.tcl` 顶部的用户配置区：
 
 ```tcl
-set RUN_DIR /your/pt/run/dir
-set TOP_SDC [file join $RUN_DIR top_dc.sdc]
-set HARDEN_LIST [file join $RUN_DIR harden_list.csv]
-set OUT_DIR $RUN_DIR
+set ::STAGE2_AUTO_RUN true
+set ::RUN_DIR {/your/pt/run/dir}
+set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
+set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
+set ::OUT_DIR $::RUN_DIR
 ```
 
 最终单文件 SDC 默认按当前 PT `current_design` 命名：
@@ -199,9 +212,9 @@ merged_delay_removed.sdc
 <top_module_name>_flatten.sdc
 ```
 
-## v0.3 支持范围
+## v0.4 支持范围
 
-v0.3 只自动合并 input 方向单跳：
+v0.4 只自动合并 input 方向单跳：
 
 ```text
 S(top legal startpoint) -> B(harden boundary input) -> E(harden internal endpoint)
@@ -213,6 +226,20 @@ S(top legal startpoint) -> B(harden boundary input) -> E(harden internal endpoin
 - Top complete + harden open_from
 - Top open_from + harden complete
 - Top open_from + harden open_from，前提是能推导 boundary input
+
+`-from` / `-to` 中允许出现多 object list，例如：
+
+```tcl
+set_max_delay 2.0 \
+  -from [list [get_pins u_src0/Q] [get_pins u_src1/Q]] \
+  -to [list [get_pins u_h0/cfg_i] [get_pins u_h0/async_i]]
+```
+
+脚本会先按 SDC 语义展开为单个 `from/to` pair，再逐 pair merge。若一个
+原始多 object delay 只有部分 pair 被 Stage 2 consume，最终
+`<top_module_name>_flatten.sdc` 会把未 consume 的 pair 重写成单条静态
+`set_max_delay` / `set_min_delay`，避免已 merge 的 pair 又从原始 list 中
+重复生效。
 
 输出示例：
 
@@ -235,6 +262,8 @@ D_total_min = D_top_min + D_harden_min
 以下情况会进入 review 或 passthrough：
 
 - output 方向路径。
+- harden `-to` 是 harden output boundary pin，例如 harden 内部
+  `input boundary -> output boundary` 穿越路径。
 - harden-to-harden 多跳链，例如 top `-from` 是上游 harden boundary output pin。
 - delay 命令没有 `-to`。
 - max/min 类型不一致。
@@ -299,6 +328,7 @@ python3 regression_test/run_regression.py
 - harden open_from 显式 `-through`
 - 多跳 harden output start 进入 review
 - edge-specific option 进入 review
+- 多 object `-from` / `-to` 展开 merge，并在 final SDC 中重写未 consume pair
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
