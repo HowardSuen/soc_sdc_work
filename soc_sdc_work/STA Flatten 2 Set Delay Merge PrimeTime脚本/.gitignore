@@ -1,0 +1,9 @@
+.DS_Store
+**/.DS_Store
+regression_test/work/
+demo_case/basic/terminal.log
+demo_case/basic/generated_e2e_delay.sdc
+demo_case/basic/integration_delay_merge.rpt
+demo_case/basic/merged_delay_removed.sdc
+demo_case/basic/unmerged_delay_review.rpt
+demo_case/basic/*_flatten.sdc

@@ -1,0 +1,20 @@
+# Demo runner for Stage 2 without PrimeTime.
+# This uses tclsh fallback behavior, so it demonstrates parsing/merge/report
+# behavior but not real PT all_fanin/get_attribute database checks.
+
+set DEMO_DIR [file dirname [file normalize [info script]]]
+set STAGE2_DIR [file normalize [file join $DEMO_DIR ../..]]
+
+source [file join $STAGE2_DIR integration_delay_merger.pt.tcl]
+
+stage2_delay::build \
+    -top_sdc [file join $DEMO_DIR top_dc.sdc] \
+    -harden_list [file join $DEMO_DIR harden_list.csv] \
+    -out_e2e_sdc [file join $DEMO_DIR generated_e2e_delay.sdc] \
+    -out_report [file join $DEMO_DIR integration_delay_merge.rpt] \
+    -out_removed_sdc [file join $DEMO_DIR merged_delay_removed.sdc] \
+    -out_review_rpt [file join $DEMO_DIR unmerged_delay_review.rpt] \
+    -merge_mode replace \
+    -partial_merge_policy residual_through \
+    -unmatched_harden_policy review \
+    -allow_through true
