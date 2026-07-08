@@ -1,0 +1,37 @@
+============================================================
+  Script  : run_stage2_merge_delay.tcl
+  Stage   : STA Flatten 2 Set Delay Merge PrimeTime
+  Author  : Howard
+  Version : v0.7.3
+============================================================
+
+[SUMMARY]
+Top SDC                         : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/path_summary_recursive/top_dc.sdc
+Harden list                     : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/path_summary_recursive/harden_list.csv
+Generated E2E SDC               : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/path_summary_recursive/generated_e2e_delay.sdc
+Final flatten SDC               : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/path_summary_recursive/path_summary_recursive_flatten.sdc
+Path summary dir                : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/path_summary_recursive/delay_path_summary
+Write path summary              : true
+Total top merge candidates      : 0
+Total top chain candidates      : 1
+Total harden merge candidates   : 1
+Total harden output sources     : 1
+Merged constraints              : 1
+Passthrough constraints         : 0
+Residual conservative constraints: 0
+Review required constraints     : 0
+Merge mode                      : replace
+Top open_from mode              : through
+Top port boundary map mode      : connectivity
+Recursive chain mode            : auto
+Max chain depth                 : 6
+Verbose PT query                : false
+Partial merge policy            : residual_through
+Current PT design               : path_summary_recursive
+
+[DETAIL]
+RECURSIVE_MERGED path=CMD000002+CMD000001 + CMD000003 boundary=u_h0/cfg_i total=8.0
+
+[PASSTHROUGH]
+
+[REVIEW]

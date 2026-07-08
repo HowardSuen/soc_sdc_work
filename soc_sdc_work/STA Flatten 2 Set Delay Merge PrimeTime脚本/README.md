@@ -4,7 +4,7 @@ Stage 2 是一个运行在 PrimeTime 中的 Tcl proc，用于把 integration 层
 top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 `set_max_delay` / `set_min_delay` 约束。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.4。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.7.3。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -62,6 +62,12 @@ set ::RUN_DIR {/your/pt/run/dir}
 set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
 set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
 set ::OUT_DIR $::RUN_DIR
+set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
+set ::RECURSIVE_CHAIN_MODE auto
+set ::MAX_CHAIN_DEPTH 6
+set ::STAGE2_VERBOSE_PT_QUERY false
+set ::WRITE_PATH_SUMMARY true
+set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
 ```
 
 如果只是想把主脚本当 proc library 使用，source 前关闭 auto-run：
@@ -77,6 +83,8 @@ stage2_delay::build \
   -out_report ./integration_delay_merge.rpt \
   -out_removed_sdc ./merged_delay_removed.sdc \
   -out_review_rpt ./unmerged_delay_review.rpt \
+  -out_summary_dir ./delay_path_summary \
+  -write_path_summary true \
   -merge_mode replace
 ```
 
@@ -96,6 +104,12 @@ set ::RUN_DIR {/your/pt/run/dir}
 set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
 set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
 set ::OUT_DIR $::RUN_DIR
+set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
+set ::RECURSIVE_CHAIN_MODE auto
+set ::MAX_CHAIN_DEPTH 6
+set ::STAGE2_VERBOSE_PT_QUERY false
+set ::WRITE_PATH_SUMMARY true
+set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
 ```
 
 最终单文件 SDC 默认按当前 PT `current_design` 命名：
@@ -117,6 +131,12 @@ set MERGE_MODE replace
 set PARTIAL_MERGE_POLICY residual_through
 set UNMATCHED_HARDEN_POLICY review
 set ALLOW_THROUGH true
+set TOP_PORT_BOUNDARY_MAP_MODE connectivity
+set RECURSIVE_CHAIN_MODE auto
+set MAX_CHAIN_DEPTH 6
+set STAGE2_VERBOSE_PT_QUERY false
+set WRITE_PATH_SUMMARY true
+set OUT_SUMMARY_DIR [file join $OUT_DIR delay_path_summary]
 set MAX_ENDPOINTS 1000
 set MAX_ENUM_OBJECTS 64
 ```
@@ -132,6 +152,20 @@ set MAX_ENUM_OBJECTS 64
   review，不自动生成 residual。
 - `ALLOW_THROUGH=true`：允许 top `open_from` 场景生成
   `-through [get_pins <boundary>] -to <endpoint>`。
+- `TOP_PORT_BOUNDARY_MAP_MODE=connectivity`：当 top SDC 是 DC 原始吐出的
+  block SDC，`-to` 仍然是 `[get_ports ...]` 时，脚本会在已 link 的 PT
+  database 中通过 direct net connectivity 找到连接到该 top port 的 harden
+  boundary input pin，再参与 merge。若设成 `off`，这些 top port delay 会
+  保持 passthrough。
+- `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
+  delay 继续递归串接，不需要用户手工调用单跳输出。
+- `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
+- `STAGE2_VERBOSE_PT_QUERY=false`：默认不打印每个 PT query。调试 PT 对象、
+  方向或 connectivity 时可设为 `true`，terminal 会打印 `PT_QUERY:` 前缀的
+  查询动作。
+- `WRITE_PATH_SUMMARY=true`：默认生成 review-friendly CSV bundle。
+- `OUT_SUMMARY_DIR`：CSV bundle 输出目录，默认是
+  `$OUT_DIR/delay_path_summary`。
 
 ## 输入文件
 
@@ -153,6 +187,26 @@ PrimeTime timing exception database。
 set_max_delay 2.0 -from [get_pins {u_src/Q}] -to [get_pins {u_h0/cfg_i}]
 set_max_delay 2.0 -to [get_pins {u_h0/cfg_i}]
 ```
+
+如果 `top_sdc` 直接来自 DC `write_sdc`，常见形态会是：
+
+```tcl
+set_max_delay 2.0 -from [get_pins {u_src/Q}] -to [get_ports {cfg_top}]
+```
+
+这种情况下，只要 PT link 后能证明 `cfg_top` 的 direct connected net 上有
+当前 `harden_list.csv` 里的 harden input boundary pin，例如
+`u_h0/cfg_i`，默认 `TOP_PORT_BOUNDARY_MAP_MODE=connectivity` 会先映射为
+`u_h0/cfg_i` 再参与 Stage 2 merge。映射记录会写在
+`integration_delay_merge.rpt` 的 `[DETAIL]` 区，格式类似：
+
+```text
+TOP_PORT_BOUNDARY_MAP top_id=CMD000001.P001 mode=connectivity port=cfg_top boundary=u_h0/cfg_i total=1
+```
+
+如果 top port 只连到 harden output pin，或者没有连到任何 harden input
+boundary，它不会被当前 Stage 2 自动合并，report 的 `[PASSTHROUGH]` 会说明
+具体原因。
 
 ### `harden_list.csv`
 
@@ -198,6 +252,8 @@ BUDGET_SEMANTICS_UNRESOLVED
 - `merged_delay_removed.sdc`：`replace` 模式下被 consume 的原始 top/harden
   delay 命令。
 - `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。
+- `delay_path_summary/`：delay 推导汇总 CSV bundle，包含 `00_index.csv`、
+  `top.csv` 和每个 harden instance 一张 CSV。
 - `<top_module_name>_flatten.sdc`：最终单文件 SDC，包含 top 剩余约束、Stage 2
   生成的 E2E delay、各 harden 剩余约束，以及 review 摘要。若直接调用
   `stage2_delay::build`，也可以用 `-out_final_sdc` 显式指定其它文件名。
@@ -207,17 +263,57 @@ BUDGET_SEMANTICS_UNRESOLVED
 ```text
 integration_delay_merge.rpt
 unmerged_delay_review.rpt
+delay_path_summary/00_index.csv
 generated_e2e_delay.sdc
 merged_delay_removed.sdc
 <top_module_name>_flatten.sdc
 ```
 
-## v0.4 支持范围
+### Delay 推导汇总 CSV
 
-v0.4 只自动合并 input 方向单跳：
+`delay_path_summary/00_index.csv` 是索引，记录每张 sheet CSV 的文件名和
+MERGED / RESIDUAL / REVIEW 行数。
+
+每张 sheet CSV 对应一个 SDC 来源：
+
+- `top.csv`：top SDC 中的原生 delay 段。
+- `<harden_inst>.csv`：该 harden clean SDC 中的原生 delay 段。
+
+核心列含义：
+
+- `native_delay/native_from/native_through/native_to`：本 sheet 对应 module SDC
+  中的原生 delay 片段。
+- `final_delay/Start Point/start_sdc_delay/start_from/start_to/stage_N_sdc_delay/stage_N_from/stage_N_to/through_N/End Point/end_sdc_delay/end_from/end_to`：
+  Stage 2 推导出的 integration top scope 完整路径。`Start Point` 和
+  `End Point` 也有各自所属首段/末段的原生 SDC delay、from、to，方便首尾
+  review。`stage_N_from` / `stage_N_to` 是第 N 段原生 SDC delay 的单段
+  `-from/-to` 对象；`through_N` 是快速串线用的边界点。这里都只写裸 object
+  名称，例如 `u_h0/cfg_i`；如果对象是 top port，则直接写 port 名称。
+- `stage_N_sdc_delay`：完整路径中第 N 段原生 SDC delay 数值；短路径填 `-`。
+- `generated_cmd`：最终写入 `generated_e2e_delay.sdc` 或 final flatten SDC
+  的静态约束命令。REVIEW 行填 `-`。
+- `review_reason`：MERGED 行为 `-`，RESIDUAL / REVIEW 行记录原因。
+- `seg_1_* ... seg_N_*`：完整推导链中每一段原生 delay 的来源、cmd id、
+  delay、from/through/to，便于从 CSV 反查原始 SDC。
+
+例如递归链：
+
+```text
+harden_a.internal_start -> harden_a.output -> harden_b.input -> harden_b.endpoint
+```
+
+会在相关 harden sheet 中看到同一条 `generated_cmd`，并通过
+`through_1/through_2` 展示中间 boundary pin。
+
+## v0.7 支持范围
+
+v0.7 自动合并 input 方向单跳、harden input-to-output feedthrough，以及
+harden output -> harden input 的递归 chain：
 
 ```text
 S(top legal startpoint) -> B(harden boundary input) -> E(harden internal endpoint)
+S(top legal startpoint) -> B_in(harden boundary input) -> B_out(harden boundary output)
+A_internal_start -> A_output -> B_input -> B_internal_endpoint
 ```
 
 支持四类组合：
@@ -226,6 +322,17 @@ S(top legal startpoint) -> B(harden boundary input) -> E(harden internal endpoin
 - Top complete + harden open_from
 - Top open_from + harden complete
 - Top open_from + harden open_from，前提是能推导 boundary input
+- harden complete feedthrough：`B_in -> B_out`，前提是 top 侧能匹配到
+  `B_in`。
+- recursive chain：若 top delay 是 `harden_a.output -> harden_b.input`，
+  并且能找到 `harden_a.internal_start -> harden_a.output` 与
+  `harden_b.input -> harden_b.endpoint`，则自动生成
+  `harden_a.internal_start -> harden_b.endpoint`。
+
+若 harden clean SDC 中仍保留 `[get_ports <port>]`，Stage 2 在解析 harden
+文件时会把它映射到当前 instance 的 `[get_pins <inst>/<port>]`，再使用 PT
+`get_attribute direction` 判断 input/output。这个映射只对 harden SDC
+生效；top SDC 的 `[get_ports ...]` 仍按 direct connectivity 处理。
 
 `-from` / `-to` 中允许出现多 object list，例如：
 
@@ -246,6 +353,8 @@ set_max_delay 2.0 \
 ```tcl
 set_max_delay 7 -from [get_pins {u_src/Q}] -to [get_pins {u_h0/u_reg/D}]
 set_max_delay 7 -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
+set_max_delay 7 -from [get_pins {u_src/Q}] -to [get_pins {u_h0/data_o}]
+set_max_delay 8 -from [get_pins {u_up/u_reg/Q}] -to [get_pins {u_h0/u_reg/D}]
 ```
 
 delay 数值规则：
@@ -262,9 +371,11 @@ D_total_min = D_top_min + D_harden_min
 以下情况会进入 review 或 passthrough：
 
 - output 方向路径。
-- harden `-to` 是 harden output boundary pin，例如 harden 内部
-  `input boundary -> output boundary` 穿越路径。
-- harden-to-harden 多跳链，例如 top `-from` 是上游 harden boundary output pin。
+- harden `-to` 是 harden output boundary pin，但 `-from` 不是同一个 harden
+  的 input boundary，或 top 侧找不到匹配到该 input boundary 的 delay 段。
+- harden-to-harden 多跳链在 `RECURSIVE_CHAIN_MODE=auto` 时会尝试自动递归；
+  只有缺少上游 source segment、下游 endpoint segment、方向未知或超过
+  `MAX_CHAIN_DEPTH` 时才进入 review。
 - delay 命令没有 `-to`。
 - max/min 类型不一致。
 - `-from`、`-to`、`-through` 中出现 clock 或未知对象。
@@ -273,6 +384,10 @@ D_total_min = D_top_min + D_harden_min
 - 生成后的 `-to` 不是合法 endpoint。
 - candidate 标记 `input_delay_overlap=yes`。
 - harden instance 不存在、未 link，或内部 endpoint 在当前 PT database 中不可见。
+- top `get_ports` endpoint 无法通过 direct connectivity 映射到 harden input
+  boundary pin，或只映射到 harden output boundary pin。
+- PT `get_attribute <object> direction` 返回空，导致脚本无法 golden 判断
+  input/output 方向。
 
 passthrough segment 只在 report 中计数，不会塞进人工 review 报告。例如 harden
 内部对象到内部对象的纯内部 delay，或者 top 内部 delay，默认都不是 Stage 2
@@ -297,6 +412,34 @@ merge candidate。
   collection 求交。
 - 若非 flat fanin 不可用，再 fallback 到从每个 boundary input 做
   `all_fanout -flat -from <B>`，检查是否能到达 leaf endpoint `E`。
+- harden boundary pin 必须是 `inst_path/pin_name` 这种 immediate pin；
+  `inst_path/u_cell/D` 这类内部 leaf pin 不会被当作 boundary。
+- input/output 方向只以 PrimeTime `get_attribute <pin_or_port> direction`
+  返回值为准，不根据 `i_`、`_i`、`o_`、`_o` 等命名规则推断。
+
+若需要观察脚本实际向 PT 查询了什么，可打开：
+
+```tcl
+set ::STAGE2_VERBOSE_PT_QUERY true
+```
+
+terminal 会打印类似：
+
+```text
+PT_QUERY: get_ports -quiet {cfg_top}
+PT_QUERY: get_nets -quiet -of_objects <ports:{cfg_top}>
+PT_QUERY: get_pins -quiet -of_objects <net:{cfg_net}>
+PT_QUERY: all_fanin -to {u_h0/u_reg/D}
+```
+
+对 top `get_ports` endpoint 的处理只使用 direct connectivity：
+
+- `get_ports <P>` -> `get_nets -of_objects <P>` -> `get_pins -of_objects <net>`。
+- 只接受属于 `harden_list.csv` 中 instance 的 harden input boundary pin。
+- 不靠名字猜 `inst_path/port_name`，所以多个 harden 有同名 port 时也不会误配。
+- 若同一个 top port 映射到多个 harden input boundary，脚本会展开成多条
+  top merge candidate；只有这些映射全部成功 merge 时，`replace` 模式才会
+  删除原始 top port delay，否则原始 top delay 保留并在 report 中提示。
 
 ## 默认参数
 
@@ -307,6 +450,11 @@ merge candidate。
 -allow_collapse_single_boundary false
 -partial_merge_policy residual_through
 -unmatched_harden_policy review
+-top_port_boundary_map_mode connectivity
+-recursive_chain_mode auto
+-max_chain_depth 6
+-verbose_pt_query false
+-write_path_summary true
 -max_endpoints 1000
 -max_enum_objects 64
 ```
@@ -329,6 +477,13 @@ python3 regression_test/run_regression.py
 - 多跳 harden output start 进入 review
 - edge-specific option 进入 review
 - 多 object `-from` / `-to` 展开 merge，并在 final SDC 中重写未 consume pair
+- DC 原始 top SDC 的 `get_ports` endpoint 通过 PT connectivity 映射到
+  harden input boundary 后 merge
+- harden `[get_ports input] -> [get_ports output]` feedthrough 映射成
+  instance boundary pin 后参与 delay 累加
+- harden output -> harden input 多跳递归 chain
+- delay path summary CSV bundle，包含 top / harden sheet、through 链、
+  segment delay 和 generated command
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。

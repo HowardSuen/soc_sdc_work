@@ -1,0 +1,3 @@
+harden_name,inst_path,clean_sdc,delay_candidate_file,netlist,module
+up,u_up,./up_clean.sdc,,./up_flat.v,upstream
+h0,u_h0,./harden0_clean.sdc,,./h0_flat.v,harden0

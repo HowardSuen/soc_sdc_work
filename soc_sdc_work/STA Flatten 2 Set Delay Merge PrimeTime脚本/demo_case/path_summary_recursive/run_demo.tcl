@@ -1,16 +1,11 @@
-# Deep demo runner for Stage 2 without PrimeTime.
-# It demonstrates multi-object pair expansion, many-to-many merge, partial
-# leftover rewriting, and output-boundary review behavior.
+# Recursive path-summary demo runner for Stage 2 without PrimeTime.
 
 set DEMO_DIR [file dirname [file normalize [info script]]]
 set STAGE2_DIR [file normalize [file join $DEMO_DIR ../..]]
 
-# Minimal PrimeTime-like query mock for running this demo with plain tclsh.
-# In real PrimeTime these procs already exist, so the demo does not override
-# the live STA database.
 if {[info commands current_design] eq ""} {
     proc current_design {} {
-        return deep_multi_mapping
+        return path_summary_recursive
     }
 }
 
@@ -40,19 +35,10 @@ if {[info commands get_pins] eq ""} {
 
 if {[info commands get_attribute] eq ""} {
     array set ::DEMO_PT_DIRECTIONS {
-        u_src0/Q out
-        u_src1/Q out
-        u_src2/Q out
+        u_up/u_reg/Q out
+        u_up/data_o out
         u_h0/cfg_i in
-        u_h0/mode_i in
-        u_h0/unused_i in
-        u_h0/no_top_i in
-        u_h0/pass_i in
-        u_h0/pass_o out
-        u_h0/u_cfg_reg/D in
-        u_h0/u_cfg_shadow_reg/D in
-        u_h0/u_mode_reg/D in
-        u_h0/u_hold_reg/D in
+        u_h0/u_reg/D in
     }
 
     proc get_attribute {obj attr} {
@@ -77,8 +63,8 @@ stage2_delay::build \
     -out_report [file join $DEMO_DIR integration_delay_merge.rpt] \
     -out_removed_sdc [file join $DEMO_DIR merged_delay_removed.sdc] \
     -out_review_rpt [file join $DEMO_DIR unmerged_delay_review.rpt] \
-    -out_final_sdc [file join $DEMO_DIR deep_multi_mapping_flatten.sdc] \
+    -out_final_sdc [file join $DEMO_DIR path_summary_recursive_flatten.sdc] \
     -merge_mode replace \
-    -partial_merge_policy residual_through \
-    -unmatched_harden_policy review \
+    -recursive_chain_mode auto \
+    -max_chain_depth 6 \
     -allow_through true

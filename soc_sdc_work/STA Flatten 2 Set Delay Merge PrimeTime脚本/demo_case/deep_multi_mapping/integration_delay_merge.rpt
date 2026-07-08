@@ -2,7 +2,7 @@
   Script  : run_stage2_merge_delay.tcl
   Stage   : STA Flatten 2 Set Delay Merge PrimeTime
   Author  : Howard
-  Version : v0.4
+  Version : v0.7.3
 ============================================================
 
 [SUMMARY]
@@ -10,31 +10,40 @@ Top SDC                         : /Users/howard/Documents/33_vcspyglass sdc处�
 Harden list                     : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden_list.csv
 Generated E2E SDC               : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/generated_e2e_delay.sdc
 Final flatten SDC               : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/deep_multi_mapping_flatten.sdc
+Path summary dir                : /Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/delay_path_summary
+Write path summary              : true
 Total top merge candidates      : 9
-Total harden merge candidates   : 7
-Merged constraints              : 8
+Total top chain candidates      : 0
+Total harden merge candidates   : 8
+Total harden output sources     : 1
+Merged constraints              : 9
 Passthrough constraints         : 0
 Residual conservative constraints: 0
-Review required constraints     : 6
+Review required constraints     : 4
 Merge mode                      : replace
 Top open_from mode              : through
+Top port boundary map mode      : connectivity
+Recursive chain mode            : auto
+Max chain depth                 : 6
+Verbose PT query                : false
 Partial merge policy            : residual_through
-Current PT design               : <current_integration_top>
+Current PT design               : deep_multi_mapping
 
 [DETAIL]
-MERGED CMD000001.001 + CMD000004.001 boundary=u_h0/cfg_i total=7.0
-MERGED CMD000001.004 + CMD000004.001 boundary=u_h0/cfg_i total=7.0
-MERGED CMD000001.001 + CMD000004.002 boundary=u_h0/cfg_i total=7.0
-MERGED CMD000001.004 + CMD000004.002 boundary=u_h0/cfg_i total=7.0
-MERGED CMD000001.002 + CMD000005 boundary=u_h0/mode_i total=8.0
-MERGED CMD000001.005 + CMD000005 boundary=u_h0/mode_i total=8.0
-MERGED CMD000002.001 + CMD000006.001 boundary=u_h0/cfg_i total=1.0
-MERGED CMD000002.002 + CMD000006.002 boundary=u_h0/mode_i total=1.0
+RECURSIVE_MERGED path=CMD000001.001 + CMD000004.001 boundary=u_h0/cfg_i total=7.0
+RECURSIVE_MERGED path=CMD000001.001 + CMD000004.002 boundary=u_h0/cfg_i total=7.0
+RECURSIVE_MERGED path=CMD000001.002 + CMD000005 boundary=u_h0/mode_i total=8.0
+RECURSIVE_MERGED path=CMD000001.004 + CMD000004.001 boundary=u_h0/cfg_i total=7.0
+RECURSIVE_MERGED path=CMD000001.004 + CMD000004.002 boundary=u_h0/cfg_i total=7.0
+RECURSIVE_MERGED path=CMD000001.005 + CMD000005 boundary=u_h0/mode_i total=8.0
+RECURSIVE_MERGED path=CMD000002.001 + CMD000006.001 boundary=u_h0/cfg_i total=1.0
+RECURSIVE_MERGED path=CMD000002.002 + CMD000006.002 boundary=u_h0/mode_i total=1.0
+RECURSIVE_MERGED path=CMD000003 + CMD000007 boundary=u_h0/pass_i total=5.0
+
+[PASSTHROUGH]
 
 [REVIEW]
-reason=OUTPUT_DIRECTION_NOT_SUPPORTED required_action=harden segment not mergeable harden_id=CMD000007 harden_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden0_clean.sdc harden_line=28
-reason=NO_TOP_SEGMENT_MATCHED required_action=no top delay segment matched harden boundary harden_id=CMD000004.003 harden_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden0_clean.sdc harden_line=8
-reason=NO_TOP_SEGMENT_MATCHED required_action=no top delay segment matched harden boundary harden_id=CMD000004.004 harden_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden0_clean.sdc harden_line=8
 reason=NO_HARDEN_SEGMENT_MATCHED required_action=top delay segment did not match any harden segment top_id=CMD000001.003 top_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/top_dc.sdc top_line=10
 reason=NO_HARDEN_SEGMENT_MATCHED required_action=top delay segment did not match any harden segment top_id=CMD000001.006 top_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/top_dc.sdc top_line=10
-reason=NO_HARDEN_SEGMENT_MATCHED required_action=top delay segment did not match any harden segment top_id=CMD000003 top_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/top_dc.sdc top_line=23
+reason=NO_TOP_SEGMENT_MATCHED required_action=no top or recursive delay path matched harden boundary harden_id=CMD000004.003 harden_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden0_clean.sdc harden_line=8
+reason=NO_TOP_SEGMENT_MATCHED required_action=no top or recursive delay path matched harden boundary harden_id=CMD000004.004 harden_file=/Users/howard/Documents/33_vcspyglass sdc处理/soc_sdc_work/STA Flatten 2 Set Delay Merge PrimeTime脚本/demo_case/deep_multi_mapping/harden0_clean.sdc harden_line=8
