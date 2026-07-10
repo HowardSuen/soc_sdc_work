@@ -4,7 +4,13 @@ Stage 2 是一个运行在 PrimeTime 中的 Tcl proc，用于把 integration 层
 top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 `set_max_delay` / `set_min_delay` 约束。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.7.3。Stage 1 以当前目录为准：
+## 协作备份规则
+
+后续每次涉及规则、代码或文档的改动，都需要在验证后提交并 push 到
+git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
+临时文件或未确认改动。
+
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.8.7。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -63,11 +69,13 @@ set ::TOP_SDC [file join $::RUN_DIR top_dc.sdc]
 set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
 set ::OUT_DIR $::RUN_DIR
 set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
+set ::TOP_OPEN_FROM_MODE enumerate_static_startpoints
 set ::RECURSIVE_CHAIN_MODE auto
 set ::MAX_CHAIN_DEPTH 6
-set ::STAGE2_VERBOSE_PT_QUERY false
+set ::STAGE2_VERBOSE_PT_QUERY true
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
+set ::STAGE2_TEXT_ENCODING utf-8
 ```
 
 如果只是想把主脚本当 proc library 使用，source 前关闭 auto-run：
@@ -107,21 +115,22 @@ set ::OUT_DIR $::RUN_DIR
 set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
 set ::RECURSIVE_CHAIN_MODE auto
 set ::MAX_CHAIN_DEPTH 6
-set ::STAGE2_VERBOSE_PT_QUERY false
+set ::STAGE2_VERBOSE_PT_QUERY true
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
+set ::STAGE2_TEXT_ENCODING utf-8
 ```
 
-最终单文件 SDC 默认按当前 PT `current_design` 命名：
+最终单文件 SDC 默认按 `TOP_SDC` 的文件名命名：
 
 ```text
-<top_module_name>_flatten.sdc
+<TOP_SDC_basename>_flatten.sdc
 ```
 
-例如当前设计是 `link_top`，则输出：
+例如 `set ::TOP_SDC ./aie_top.sdc`，则输出：
 
 ```text
-link_top_flatten.sdc
+aie_top_flatten.sdc
 ```
 
 推荐先保持默认策略：
@@ -130,13 +139,15 @@ link_top_flatten.sdc
 set MERGE_MODE replace
 set PARTIAL_MERGE_POLICY residual_through
 set UNMATCHED_HARDEN_POLICY review
-set ALLOW_THROUGH true
+set ALLOW_THROUGH false
 set TOP_PORT_BOUNDARY_MAP_MODE connectivity
+set TOP_OPEN_FROM_MODE enumerate_static_startpoints
 set RECURSIVE_CHAIN_MODE auto
 set MAX_CHAIN_DEPTH 6
-set STAGE2_VERBOSE_PT_QUERY false
+set STAGE2_VERBOSE_PT_QUERY true
 set WRITE_PATH_SUMMARY true
 set OUT_SUMMARY_DIR [file join $OUT_DIR delay_path_summary]
+set STAGE2_TEXT_ENCODING utf-8
 set MAX_ENDPOINTS 1000
 set MAX_ENUM_OBJECTS 64
 ```
@@ -146,26 +157,38 @@ set MAX_ENUM_OBJECTS 64
 - `MERGE_MODE=replace`：成功 merge 的原始 top/harden delay 不再作为最终约束
   source，原文写入 `merged_delay_removed.sdc` 备查。
 - `PARTIAL_MERGE_POLICY=residual_through`：harden `open_from` 有多个 boundary
-  input 但只部分匹配 top delay 时，对未匹配 boundary 生成保守 residual
-  `-through` 约束。
+  input 但只部分匹配 top delay 时，对未匹配 boundary 尝试生成保守 residual
+  约束。residual 也必须能由 PT 推导出合法 `-from`；否则进入 review。
 - `UNMATCHED_HARDEN_POLICY=review`：harden complete 段找不到 top 段时进入
   review，不自动生成 residual。
-- `ALLOW_THROUGH=true`：允许 top `open_from` 场景生成
-  `-through [get_pins <boundary>] -to <endpoint>`。
+- `ALLOW_THROUGH=false`：普通生成不允许 top `open_from` 静默退化成缺少
+  `-from` 的 through-only 约束。脚本会优先通过 PT `all_fanin` 推导真实
+  startpoint；推导不到则进入 review。
 - `TOP_PORT_BOUNDARY_MAP_MODE=connectivity`：当 top SDC 是 DC 原始吐出的
   block SDC，`-to` 仍然是 `[get_ports ...]` 时，脚本会在已 link 的 PT
   database 中通过 direct net connectivity 找到连接到该 top port 的 harden
   boundary input pin，再参与 merge。若设成 `off`，这些 top port delay 会
   保持 passthrough。
+- `TOP_OPEN_FROM_MODE=enumerate_static_startpoints`：当 top delay 没有 `-from`
+  时，脚本默认用 PT `all_fanin -flat -startpoints_only -to <boundary>` 推导
+  静态 startpoint。最终生成的 E2E / residual delay 约束一定包含 `-from`；
+  同时允许包含一个或多个 `-through` 来标识中间 boundary/path 点。若 PT
+  返回的是寄存器 `CP` 这类 input pin，脚本会把它作为 PT timing startpoint
+  接受；这个放行只适用于 PT `all_fanin -startpoints_only` 推导结果，不会
+  放宽原始 SDC 手写 `-from` 的合法性检查。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
-- `STAGE2_VERBOSE_PT_QUERY=false`：默认不打印每个 PT query。调试 PT 对象、
-  方向或 connectivity 时可设为 `true`，terminal 会打印 `PT_QUERY:` 前缀的
-  查询动作。
+- `STAGE2_VERBOSE_PT_QUERY=true`：默认打印每个关键 PT query，terminal 会显示
+  `PT_QUERY:` 前缀的查询动作，方便确认对象、方向、fanin/fanout 和 connectivity
+  是否被 PT database 正确返回。若日志太长，可临时设为 `false`。
 - `WRITE_PATH_SUMMARY=true`：默认生成 review-friendly CSV bundle。
 - `OUT_SUMMARY_DIR`：CSV bundle 输出目录，默认是
   `$OUT_DIR/delay_path_summary`。
+- `STAGE2_TEXT_ENCODING=utf-8`：Stage 2 读写 SDC/report/CSV 的文本编码。
+  如果 legacy SDC 注释是在 Windows GBK/GB2312 下保存，且最终
+  `<TOP_SDC_basename>_flatten.sdc` 打开后中文注释乱码，可以在 source 前临时
+  改成 `gb2312` 或 `cp936` 后重新跑；正常 Linux/PT flow 推荐保持 `utf-8`。
 
 ## 输入文件
 
@@ -254,7 +277,7 @@ BUDGET_SEMANTICS_UNRESOLVED
 - `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。
 - `delay_path_summary/`：delay 推导汇总 CSV bundle，包含 `00_index.csv`、
   `top.csv` 和每个 harden instance 一张 CSV。
-- `<top_module_name>_flatten.sdc`：最终单文件 SDC，包含 top 剩余约束、Stage 2
+- `<TOP_SDC_basename>_flatten.sdc`：最终单文件 SDC，包含 top 剩余约束、Stage 2
   生成的 E2E delay、各 harden 剩余约束，以及 review 摘要。若直接调用
   `stage2_delay::build`，也可以用 `-out_final_sdc` 显式指定其它文件名。
 
@@ -266,13 +289,27 @@ unmerged_delay_review.rpt
 delay_path_summary/00_index.csv
 generated_e2e_delay.sdc
 merged_delay_removed.sdc
-<top_module_name>_flatten.sdc
+<TOP_SDC_basename>_flatten.sdc
 ```
 
 ### Delay 推导汇总 CSV
 
-`delay_path_summary/00_index.csv` 是索引，记录每张 sheet CSV 的文件名和
-MERGED / RESIDUAL / REVIEW 行数。
+`delay_path_summary/00_index.csv` 是索引，记录每张 sheet CSV 的文件名、
+MERGED / RESIDUAL / REVIEW 行数，以及每个 sheet 中原生 `set_max_delay`
+的使用统计：
+
+```text
+max_delay_used/max_delay_total/max_delay_usage/missing_sdc_stages
+```
+
+例如 `max_delay_usage=3/4` 表示该 sheet 对应的原始 SDC 中共有 4 条
+`set_max_delay`，其中 3 条至少参与了一条最终生成的 E2E delay。若原始
+命令因为 from/to list 被展开成多个 pair，统计时仍按同一个 `original_id`
+归并，只算 1 条原始约束。
+若某个 sheet 原始 SDC 中没有 `set_max_delay`，但 Stage 2 推导路径经过了该
+模块并合成了 missing SDC stage，则 `max_delay_usage=0/0`，同时
+`missing_sdc_stages` 会记录合成缺失段数量。Excel 中这种情况会显示为
+`Max Delay Used: N/A`，避免把 `0/0` 误读成异常比例。
 
 每张 sheet CSV 对应一个 SDC 来源：
 
@@ -283,6 +320,8 @@ MERGED / RESIDUAL / REVIEW 行数。
 
 - `native_delay/native_from/native_through/native_to`：本 sheet 对应 module SDC
   中的原生 delay 片段。
+- `e2e_id`：最终生成约束编号，例如 `E2E000001`。同一条 E2E 约束在
+  top / harden 各 sheet 中使用相同编号，并会写入最终 SDC 的注释。
 - `final_delay/Start Point/start_sdc_delay/start_from/start_to/stage_N_sdc_delay/stage_N_from/stage_N_to/through_N/End Point/end_sdc_delay/end_from/end_to`：
   Stage 2 推导出的 integration top scope 完整路径。`Start Point` 和
   `End Point` 也有各自所属首段/末段的原生 SDC delay、from、to，方便首尾
@@ -290,11 +329,21 @@ MERGED / RESIDUAL / REVIEW 行数。
   `-from/-to` 对象；`through_N` 是快速串线用的边界点。这里都只写裸 object
   名称，例如 `u_h0/cfg_i`；如果对象是 top port，则直接写 port 名称。
 - `stage_N_sdc_delay`：完整路径中第 N 段原生 SDC delay 数值；短路径填 `-`。
+  若该段在对应 harden clean SDC 中缺失，Stage 2 会在计算总 delay 时按 0
+  处理，但 summary CSV 仍填 `-`，后续 Excel 会显示为 `NOT FOUND` 红底。
+  缺失段只影响 delay 数值和 review 标记，不会把 harden input boundary
+  放宽成最终 endpoint。
 - `generated_cmd`：最终写入 `generated_e2e_delay.sdc` 或 final flatten SDC
   的静态约束命令。REVIEW 行填 `-`。
 - `review_reason`：MERGED 行为 `-`，RESIDUAL / REVIEW 行记录原因。
 - `seg_1_* ... seg_N_*`：完整推导链中每一段原生 delay 的来源、cmd id、
   delay、from/through/to，便于从 CSV 反查原始 SDC。
+
+对于 top SDC 中没有 `-from`、且最终仍进入 REVIEW 的 delay，Stage 2 也会
+尝试使用 PT `all_fanin -flat -startpoints_only` 推导 startpoint，并把推导
+结果填入 CSV/Excel 的 `Start Point From`。若仍显示 `NOT FOUND`，通常表示
+当前 PT database 对该 boundary pin 没有返回合法 startpoint，terminal 的
+`PT_QUERY:` 日志会显示对应 `startpoint_count=0`。
 
 例如递归链：
 
@@ -305,9 +354,78 @@ harden_a.internal_start -> harden_a.output -> harden_b.input -> harden_b.endpoin
 会在相关 harden sheet 中看到同一条 `generated_cmd`，并通过
 `through_1/through_2` 展示中间 boundary pin。
 
-## v0.7 支持范围
+### Excel 汇总报告
 
-v0.7 自动合并 input 方向单跳、harden input-to-output feedthrough，以及
+如果希望把 `delay_path_summary/*.csv` 进一步整理成 Excel，可以运行：
+
+```bash
+python3 run_stage2_report.py ./delay_path_summary
+```
+
+默认输出文件名按 `TOP_SDC` 的文件名命名：
+
+```text
+<TOP_SDC_basename>.xlsx
+```
+
+输出名会按以下优先级推断：
+
+- 命令行 `--top_module`
+- `integration_delay_merge.rpt` 中的 `Top SDC` 文件名
+- `integration_delay_merge.rpt` 中的 `Final flatten SDC` 文件名
+- `integration_delay_merge.rpt` 中的 `Current PT design`
+- `generated_e2e_delay.sdc` 中的 `Scope`
+- `delay_path_summary` 的父目录名
+
+也可以显式指定输出路径：
+
+```bash
+python3 run_stage2_report.py ./delay_path_summary \
+  --top_module aie_top \
+  -o ./aie_top.xlsx
+```
+
+Excel 每个 CSV sheet 对应一个 worksheet。每个 worksheet 只保留路径 review
+需要的内容：
+
+```text
+E2E ID | Start Point | through_1 | through_2 | ... | End Point
+```
+
+每个标题下面固定三列：
+
+```text
+From | To | Delay
+```
+
+本 worksheet 对应的原生 delay stage 会用黄色背景标出；缺少 delay/from/to
+约束信息的位置会填 `NOT FOUND` 并使用红色背景。
+每张 worksheet 的 A1 会显示该 sheet 的 `Max Delay Used: x/y`，用于快速
+确认当前 top 或 harden 的原生 `set_max_delay` 被 Stage 2 使用的覆盖情况。
+如果该 sheet 原始 SDC 没有 `set_max_delay`，A1 会显示：
+
+```text
+Max Delay Used: N/A
+Native max_delay: 0
+Missing SDC Stage: <N>
+```
+
+这里的 `Missing SDC Stage` 表示 Stage 2 为了继续完整 E2E path 推导而合成
+的 assumed-zero 缺失段数量。
+若同一条 `E2E ID` 在同一个 worksheet 中涉及多个原生 stage，Excel 会合并成
+一行显示，并同时高亮这些 stage；未生成最终 SDC 的 REVIEW 行会在第一列显示
+`REVIEW:...`，避免和真实生成约束编号混淆。
+
+生成的 SDC 也会在每条约束前写同一个编号，方便从 Excel 反查最终约束：
+
+```tcl
+# MERGED id=E2E000001 top=CMD000001 harden=CMD000002 boundary=u_h0/cfg_i
+set_max_delay 7 -from [get_pins {u_src/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
+```
+
+## v0.8 支持范围
+
+v0.8 自动合并 input 方向单跳、harden input-to-output feedthrough，以及
 harden output -> harden input 的递归 chain：
 
 ```text
@@ -328,6 +446,81 @@ A_internal_start -> A_output -> B_input -> B_internal_endpoint
   并且能找到 `harden_a.internal_start -> harden_a.output` 与
   `harden_b.input -> harden_b.endpoint`，则自动生成
   `harden_a.internal_start -> harden_b.endpoint`。
+- missing top bridge SDC：若递归 path 到达 `harden_a.output` 后，top SDC
+  中没有对应的 `harden_a.output -> harden_b.input` delay 段，脚本会用 PT
+  `all_fanout` 查找下游 harden input boundary。PT 能证明该连接时，这段
+  top bridge 按 assumed-zero 继续扩展，并在 top sheet 中显示 `NOT FOUND`。
+- missing harden SDC stage：若递归 path 上某个 harden 的对应 clean SDC
+  delay 段不存在，Stage 2 不再停止扩展。脚本会合成一个 assumed-zero
+  stage 继续生成完整 E2E 约束，`integration_delay_merge.rpt` 中记录
+  `MISSING_SDC_ASSUMED_ZERO`，CSV/Excel 中该 stage 的 delay 显示为
+  `NOT FOUND` 供人工 review。若缺失的是末端 harden stage，脚本仍要求 PT
+  从该 harden input boundary 推导到合法 endpoint；找不到合法 endpoint 时，
+  不会生成停在 harden input boundary 的 `set_max_delay` / `set_min_delay`，
+  而是进入 `MISSING_HARDEN_SDC_ENDPOINT_NOT_FOUND` review。这类 review 不应
+  作为正常业务结果接受，通常表示 PT database、link/netlist、方向属性或 fanout
+  查询条件还没有满足 Stage 2 自动推导要求。
+- missing harden output source：若 top SDC 中存在
+  `harden_a/output -> harden_b/input`，但 `harden_a` clean SDC 中没有
+  `internal_start -> harden_a/output` 约束，Stage 2 会对
+  `harden_a/output` 调用 PT `all_fanin -flat -startpoints_only`，把 PT
+  返回的真实 startpoint 与 `harden_a/output` 组成 assumed-zero missing
+  stage。例如：
+
+```text
+PT: harden_a/u_cell/Q -> harden_a/output_a
+top SDC: harden_a/output_a -> harden_b/input_b
+harden_b SDC: harden_b/input_b -> harden_b/u_cell2/D
+
+生成路径:
+harden_a/u_cell/Q -> harden_a/output_a -> harden_b/input_b -> harden_b/u_cell2/D
+```
+
+  其中 `harden_a/u_cell/Q -> harden_a/output_a` 若没有原生 SDC delay，
+  计算值按 0，Excel 对应 harden sheet 标 `NOT FOUND`。如果 PT 也无法为
+  `harden_a/output_a` 推导出 startpoint，则不再用
+  `harden_a/output_a -> harden_a/output_a` 伪段凑路径，而是进入 review。
+- missing upstream top for harden feedthrough：若 harden clean SDC 中存在
+  `harden_a/input_a -> harden_a/output_a` feedthrough 约束，但 top SDC
+  没有写 `top/startpoint -> harden_a/input_a` 这一段，Stage 2 会对
+  `harden_a/input_a` 调用 PT `all_fanin -flat -startpoints_only`，把 PT
+  返回的真实 startpoint 与 `harden_a/input_a` 组成 assumed-zero missing
+  top stage，再继续串接 harden feedthrough 和下游 top/harden stage。例如：
+
+```text
+PT: top_reg/Q -> harden_a/input_a
+harden_a SDC: harden_a/input_a -> harden_a/output_a
+top SDC: harden_a/output_a -> harden_b/input_b
+harden_b SDC: harden_b/input_b -> harden_b/u_cell2/D
+
+生成路径:
+top_reg/Q -> harden_a/input_a -> harden_a/output_a -> harden_b/input_b -> harden_b/u_cell2/D
+```
+
+  其中 `top_reg/Q -> harden_a/input_a` 若没有原生 top SDC delay，计算值按 0，
+  Excel 的 top sheet 标 `NOT FOUND`。若已有 top/chain top segment 到
+  `harden_a/input_a`，脚本不会再启用这条 PT missing-top fallback，避免重复
+  生成或绕过中间 boundary。
+- terminal top endpoint after harden output：若 harden output 下游不是另一个
+  harden input，而是 top output port 或其它 PT 可识别的合法 endpoint，
+  Stage 2 会把 `harden_output -> top_endpoint` 当作最后一段 top missing SDC
+  或显式 top chain stage，然后直接 emit 最终 E2E 约束。例如：
+
+```text
+PT: top_reg/Q -> harden_a/input_a
+harden_a SDC: harden_a/input_a -> harden_a/output_a
+PT/top: harden_a/output_a -> top_output
+
+生成路径:
+top_reg/Q -> harden_a/input_a -> harden_a/output_a -> top_output
+```
+
+  若 `harden_a/output_a -> top_output` 没有原生 top SDC delay，计算值按 0，
+  Excel top sheet 标 `NOT FOUND`。
+  自动推导 terminal endpoint 时，Stage 2 只接受 PT
+  `all_fanout -flat -endpoints_only` 返回的对象；普通
+  `all_fanout -flat` 中出现的组合逻辑 input pin 只作为中间 fanout 节点，
+  不会被当成最终 endpoint。
 
 若 harden clean SDC 中仍保留 `[get_ports <port>]`，Stage 2 在解析 harden
 文件时会把它映射到当前 instance 的 `[get_pins <inst>/<port>]`，再使用 PT
@@ -344,17 +537,17 @@ set_max_delay 2.0 \
 
 脚本会先按 SDC 语义展开为单个 `from/to` pair，再逐 pair merge。若一个
 原始多 object delay 只有部分 pair 被 Stage 2 consume，最终
-`<top_module_name>_flatten.sdc` 会把未 consume 的 pair 重写成单条静态
+`<TOP_SDC_basename>_flatten.sdc` 会把未 consume 的 pair 重写成单条静态
 `set_max_delay` / `set_min_delay`，避免已 merge 的 pair 又从原始 list 中
 重复生效。
 
 输出示例：
 
 ```tcl
-set_max_delay 7 -from [get_pins {u_src/Q}] -to [get_pins {u_h0/u_reg/D}]
-set_max_delay 7 -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
-set_max_delay 7 -from [get_pins {u_src/Q}] -to [get_pins {u_h0/data_o}]
-set_max_delay 8 -from [get_pins {u_up/u_reg/Q}] -to [get_pins {u_h0/u_reg/D}]
+set_max_delay 7 -from [get_pins {u_src/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
+set_max_delay 7 -from [get_pins {u_src/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg2/D}]
+set_max_delay 7 -from [get_pins {u_src/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/data_o}]
+set_max_delay 8 -from [get_pins {u_up/u_reg/Q}] -through [get_pins {u_up/data_o}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
 ```
 
 delay 数值规则：
@@ -365,6 +558,9 @@ D_total_min = D_top_min + D_harden_min
 ```
 
 不允许混合 `top max + harden min` 或 `top min + harden max`。
+若某个 harden stage 缺少 clean SDC delay 约束，该 stage 的计算值按 0
+累加，但不会在报告中伪装成真实 0；报告里仍用 `NOT FOUND` 标识。缺失末端
+stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束。
 
 ## 不自动合并的情况
 
@@ -374,8 +570,10 @@ D_total_min = D_top_min + D_harden_min
 - harden `-to` 是 harden output boundary pin，但 `-from` 不是同一个 harden
   的 input boundary，或 top 侧找不到匹配到该 input boundary 的 delay 段。
 - harden-to-harden 多跳链在 `RECURSIVE_CHAIN_MODE=auto` 时会尝试自动递归；
-  只有缺少上游 source segment、下游 endpoint segment、方向未知或超过
-  `MAX_CHAIN_DEPTH` 时才进入 review。
+  缺少某个 top bridge 或 harden clean SDC stage 时按 assumed-zero 继续扩展
+  并进入 report review 标识；若缺失 bridge/stage 无法由 PT 推导，末端缺失
+  stage 无法由 PT 推到合法 endpoint，或方向未知、对象非法、超过
+  `MAX_CHAIN_DEPTH`，则停止并进入 review。
 - delay 命令没有 `-to`。
 - max/min 类型不一致。
 - `-from`、`-to`、`-through` 中出现 clock 或未知对象。
@@ -445,15 +643,15 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 
 ```text
 -merge_mode replace
--top_open_from_mode through
--allow_through true
+-top_open_from_mode enumerate_static_startpoints
+-allow_through false
 -allow_collapse_single_boundary false
 -partial_merge_policy residual_through
 -unmatched_harden_policy review
 -top_port_boundary_map_mode connectivity
 -recursive_chain_mode auto
 -max_chain_depth 6
--verbose_pt_query false
+-verbose_pt_query true
 -write_path_summary true
 -max_endpoints 1000
 -max_enum_objects 64
@@ -472,9 +670,9 @@ python3 regression_test/run_regression.py
 当前覆盖：
 
 - complete + complete merge
-- top open_from 生成 `-through`
+- top open_from 通过 PT `all_fanin` 推导 startpoint，并生成显式 `-from`
 - harden open_from 显式 `-through`
-- 多跳 harden output start 进入 review
+- 多跳 harden output start 缺少上游 harden SDC source 时 assumed-zero 继续扩展
 - edge-specific option 进入 review
 - 多 object `-from` / `-to` 展开 merge，并在 final SDC 中重写未 consume pair
 - DC 原始 top SDC 的 `get_ports` endpoint 通过 PT connectivity 映射到
@@ -484,6 +682,8 @@ python3 regression_test/run_regression.py
 - harden output -> harden input 多跳递归 chain
 - delay path summary CSV bundle，包含 top / harden sheet、through 链、
   segment delay 和 generated command
+- 缺失 top bridge / harden SDC stage assumed-zero，并在 Excel 报告中显示
+  `NOT FOUND`
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。

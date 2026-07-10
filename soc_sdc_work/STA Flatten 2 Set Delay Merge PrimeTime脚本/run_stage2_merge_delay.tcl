@@ -43,8 +43,8 @@ set ::HARDEN_LIST [file join $::RUN_DIR harden_list.csv]
 # Output directory.
 set ::OUT_DIR $::RUN_DIR
 
-# Optional final flattened SDC name. Leave empty to derive from current_design:
-#   <top_module_name>_flatten.sdc
+# Optional final flattened SDC name. Leave empty to derive from TOP_SDC basename:
+#   <TOP_SDC_basename>_flatten.sdc
 set ::OUT_FINAL_SDC ""
 
 # Merge policy.
@@ -59,8 +59,15 @@ set ::PARTIAL_MERGE_POLICY residual_through
 # Policy for harden complete segments whose boundary input has no top segment.
 set ::UNMATCHED_HARDEN_POLICY review
 
-# Allow top open_from + harden segment to generate -through <boundary> -to <E>.
-set ::ALLOW_THROUGH true
+# For top open_from delay, infer static startpoints from PT all_fanin before
+# generating E2E constraints. Set to "through" only for old conservative debug
+# behavior.
+set ::TOP_OPEN_FROM_MODE enumerate_static_startpoints
+
+# Legacy compatibility knob. Normal Stage 2 output always requires explicit
+# -from inferred from the linked PT database; -through may still be emitted as
+# path breadcrumbs after -from.
+set ::ALLOW_THROUGH false
 
 # Map top-side get_ports endpoints to connected harden boundary pins in the
 # linked PrimeTime database.
@@ -90,15 +97,20 @@ set ::STAGE2_POST_CHECK false
 
 # Print PrimeTime query actions to terminal. Useful when debugging whether PT
 # database objects and connectivity are visible to Stage 2.
-set ::STAGE2_VERBOSE_PT_QUERY false
+set ::STAGE2_VERBOSE_PT_QUERY true
 
 # Write review-friendly CSV sheets under OUT_SUMMARY_DIR.
 set ::WRITE_PATH_SUMMARY true
 
+# Text file encoding used by Stage 2 generated reports/SDC/CSV and source SDC
+# reads. Keep utf-8 for normal Linux/PT flow. If legacy SDC comments were saved
+# in GBK/GB2312 and look garbled, override this before source.
+set ::STAGE2_TEXT_ENCODING utf-8
+
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.7.3"
+    variable VERSION "v0.8.7"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
     variable AUTHOR "Howard"
@@ -109,6 +121,7 @@ namespace eval stage2_delay {
     variable chain_top_segments
     variable harden_segments
     variable harden_output_segments
+    variable all_delay_segments
     variable passthrough_segments
     variable generated_cmds
     variable residual_cmds
@@ -118,6 +131,7 @@ namespace eval stage2_delay {
     variable review_items
     variable report_items
     variable command_seq
+    variable e2e_seq
     variable boundary_input_cache
     variable top_port_boundary_cache
 
@@ -131,8 +145,8 @@ namespace eval stage2_delay {
         -out_review_rpt "unmerged_delay_review.rpt"
         -out_summary_dir ""
         -merge_mode "replace"
-        -top_open_from_mode "through"
-        -allow_through "true"
+        -top_open_from_mode "enumerate_static_startpoints"
+        -allow_through "false"
         -allow_collapse_single_boundary "false"
         -partial_merge_policy "residual_through"
         -unmatched_harden_policy "review"
@@ -145,8 +159,9 @@ namespace eval stage2_delay {
         -expect_units ""
         -strict "false"
         -debug "false"
-        -verbose_pt_query "false"
+        -verbose_pt_query "true"
         -write_path_summary "true"
+        -text_encoding "utf-8"
     }
 }
 
@@ -156,6 +171,7 @@ proc stage2_delay::reset_state {} {
     variable chain_top_segments
     variable harden_segments
     variable harden_output_segments
+    variable all_delay_segments
     variable passthrough_segments
     variable generated_cmds
     variable residual_cmds
@@ -165,6 +181,7 @@ proc stage2_delay::reset_state {} {
     variable review_items
     variable report_items
     variable command_seq
+    variable e2e_seq
     variable boundary_input_cache
     variable top_port_boundary_cache
 
@@ -173,6 +190,7 @@ proc stage2_delay::reset_state {} {
     set chain_top_segments {}
     set harden_segments {}
     set harden_output_segments {}
+    set all_delay_segments {}
     set passthrough_segments {}
     set generated_cmds {}
     set residual_cmds {}
@@ -183,6 +201,7 @@ proc stage2_delay::reset_state {} {
     set review_items {}
     set report_items {}
     set command_seq 0
+    set e2e_seq 0
     array unset boundary_input_cache
     array set boundary_input_cache {}
     array unset top_port_boundary_cache
@@ -305,7 +324,7 @@ proc stage2_delay::apply_derived_options {} {
     variable options
     if {$options(-out_final_sdc) eq ""} {
         set out_dir [file dirname [file normalize $options(-out_e2e_sdc)]]
-        set top_name [safe_filename_token [current_scope_name]]
+        set top_name [top_name_from_sdc_path $options(-top_sdc)]
         set options(-out_final_sdc) [file join $out_dir "${top_name}_flatten.sdc"]
     }
     if {$options(-out_summary_dir) eq ""} {
@@ -325,6 +344,25 @@ proc stage2_delay::safe_filename_token {text} {
         set token "current_integration_top"
     }
     return $token
+}
+
+proc stage2_delay::top_name_from_sdc_path {path} {
+    set base [file tail [file rootname $path]]
+    return [safe_filename_token $base]
+}
+
+proc stage2_delay::open_text {path mode} {
+    variable options
+    set fh [open $path $mode]
+    set encoding "utf-8"
+    if {[info exists options(-text_encoding)] && $options(-text_encoding) ne ""} {
+        set encoding $options(-text_encoding)
+    }
+    if {$encoding ne ""} {
+        fconfigure $fh -encoding $encoding
+    }
+    fconfigure $fh -translation lf
+    return $fh
 }
 
 proc stage2_delay::read_harden_list {path} {
@@ -349,7 +387,7 @@ proc stage2_delay::read_harden_list {path} {
 }
 
 proc stage2_delay::read_csv_dicts {path} {
-    set fin [open $path r]
+    set fin [open_text $path r]
     set text [read $fin]
     close $fin
     set lines [split $text "\n"]
@@ -413,7 +451,7 @@ proc stage2_delay::dict_get_default {array_name key default} {
 }
 
 proc stage2_delay::extract_delay_segments_from_sdc {path source harden_inst} {
-    set fin [open $path r]
+    set fin [open_text $path r]
     set text [read $fin]
     close $fin
     set commands [scan_tcl_commands $text]
@@ -844,6 +882,8 @@ proc stage2_delay::has_clock_or_unknown {records} {
 proc stage2_delay::add_segment {seg} {
     variable top_segments
     variable harden_segments
+    variable all_delay_segments
+    lappend all_delay_segments $seg
     array set s $seg
     if {$s(source) eq "top"} {
         lappend top_segments $seg
@@ -1339,6 +1379,11 @@ proc stage2_delay::classify_top_segment {seg} {
     array set to [lindex $s(to_records) 0]
     set owner $to(owner_harden_inst)
     if {$owner eq ""} {
+        if {[top_from_is_harden_boundary_output [array get s]] && [validate_endpoint_record [array get to]]} {
+            array unset to
+            array unset s
+            return "chain_top_candidate"
+        }
         array unset to
         array unset s
         return "passthrough"
@@ -1642,6 +1687,10 @@ proc stage2_delay::segment_summary_step {seg} {
         set source_inst $s(harden_inst)
         set sheet $s(harden_inst)
     }
+    set delay [format_delay_maybe $s(delay)]
+    if {[info exists s(missing_sdc)] && [truthy $s(missing_sdc)]} {
+        set delay "-"
+    }
     set step [list \
         sheet $sheet \
         source $s(source) \
@@ -1651,7 +1700,7 @@ proc stage2_delay::segment_summary_step {seg} {
         cmd_id $s(id) \
         original_id $s(original_id) \
         type $s(type) \
-        delay [format_delay_maybe $s(delay)] \
+        delay $delay \
         from [records_summary_text $s(from_records)] \
         through [records_summary_text $s(through_records)] \
         to [records_summary_text $s(to_records)] \
@@ -1702,35 +1751,57 @@ proc stage2_delay::record_summary_name {rec} {
     return $name
 }
 
-proc stage2_delay::record_generated_path_summary {path_id path_steps final_delay final_from_records through_records final_to_record generated_cmd} {
-    append_path_summary_items "MERGED" $path_id $path_steps $final_delay $final_from_records $through_records $final_to_record $generated_cmd "-"
+proc stage2_delay::next_e2e_id {} {
+    variable e2e_seq
+    incr e2e_seq
+    return [format "E2E%06d" $e2e_seq]
 }
 
-proc stage2_delay::record_residual_path_summary {hseg boundary reason generated_cmd} {
+proc stage2_delay::record_generated_path_summary {e2e_id path_id path_steps final_delay final_from_records through_records final_to_record generated_cmd} {
+    append_path_summary_items "MERGED" $e2e_id $path_id $path_steps $final_delay $final_from_records $through_records $final_to_record $generated_cmd "-"
+}
+
+proc stage2_delay::record_residual_path_summary {e2e_id hseg boundary reason generated_cmd {final_from_records {}}} {
     array set h $hseg
     set to_rec [lindex $h(to_records) 0]
     set path_steps [list [segment_summary_step [array get h]]]
     set path_id "RESIDUAL:[summary_steps_path_id $path_steps]"
-    append_path_summary_items "RESIDUAL" $path_id $path_steps $h(delay) {} [list $boundary] $to_rec $generated_cmd $reason
+    append_path_summary_items "RESIDUAL" $e2e_id $path_id $path_steps $h(delay) $final_from_records [list $boundary] $to_rec $generated_cmd $reason
     array unset h
 }
 
 proc stage2_delay::record_review_path_summary {top_seg harden_seg reason action} {
     set path_steps {}
     if {$top_seg ne ""} {
-        lappend path_steps [segment_summary_step $top_seg]
+        lappend path_steps [review_segment_summary_step $top_seg]
     }
     if {$harden_seg ne ""} {
-        lappend path_steps [segment_summary_step $harden_seg]
+        lappend path_steps [review_segment_summary_step $harden_seg]
     }
     if {[llength $path_steps] == 0} {
         return
     }
     set path_id "REVIEW:[summary_steps_path_id $path_steps]"
-    append_path_summary_items "REVIEW" $path_id $path_steps "-" {} {} "" "-" "$reason | $action"
+    append_path_summary_items "REVIEW" "-" $path_id $path_steps "-" {} {} "" "-" "$reason | $action"
 }
 
-proc stage2_delay::append_path_summary_items {merge_status path_id path_steps final_delay final_from_records through_records final_to_record generated_cmd review_reason} {
+proc stage2_delay::review_segment_summary_step {seg} {
+    array set s $seg
+    if {$s(source) eq "top" && [llength $s(from_records)] == 0 && [llength $s(to_records)] == 1} {
+        set inferred [pt_startpoints_to_boundary [lindex $s(to_records) 0]]
+        if {[llength $inferred] > 0} {
+            set s(from_records) $inferred
+            add_report_item "REVIEW_TOP_OPEN_FROM_STARTPOINT_INFERRED top_id=$s(id) to=[records_summary_name_text $s(to_records)] count=[llength $inferred]"
+        } else {
+            add_report_item "REVIEW_TOP_OPEN_FROM_STARTPOINT_NOT_FOUND top_id=$s(id) to=[records_summary_name_text $s(to_records)]"
+        }
+    }
+    set step [segment_summary_step [array get s]]
+    array unset s
+    return $step
+}
+
+proc stage2_delay::append_path_summary_items {merge_status e2e_id path_id path_steps final_delay final_from_records through_records final_to_record generated_cmd review_reason} {
     variable path_summary_items
     set through_records [unique_records_by_name $through_records]
     set final_from [records_summary_name_text $final_from_records]
@@ -1765,6 +1836,9 @@ proc stage2_delay::append_path_summary_items {merge_status path_id path_steps fi
         set end_to [records_summary_name_text $last_step(to_records)]
         array unset last_step
     }
+    if {$start_from eq "-" && $final_from ne "-"} {
+        set start_from $final_from
+    }
     foreach step $path_steps {
         array set st $step
         lappend stage_delays $st(delay)
@@ -1775,6 +1849,7 @@ proc stage2_delay::append_path_summary_items {merge_status path_id path_steps fi
     foreach step $path_steps {
         array set st $step
         lappend path_summary_items [list \
+            e2e_id $e2e_id \
             sheet $st(sheet) \
             merge_status $merge_status \
             path_id $path_id \
@@ -1859,7 +1934,9 @@ proc stage2_delay::match_delay_graph_segments {} {
     foreach tseg $top_segments {
         array set t $tseg
         if {[llength $t(to_records)] == 1} {
-            lappend queue [path_from_top_segment [array get t]]
+            foreach path [paths_from_top_segment [array get t]] {
+                lappend queue $path
+            }
         }
         array unset t
     }
@@ -1868,8 +1945,25 @@ proc stage2_delay::match_delay_graph_segments {} {
         array set h $hseg
         if {[harden_output_source_has_legal_start [array get h]]} {
             lappend queue [path_from_harden_output_source [array get h]]
+        } else {
+            foreach path [paths_from_missing_top_to_harden_feedthrough [array get h]] {
+                lappend queue $path
+            }
         }
         array unset h
+    }
+
+    foreach tseg $chain_top_segments {
+        array set t $tseg
+        if {[llength $t(from_records)] == 1} {
+            set from_rec [lindex $t(from_records) 0]
+            if {[is_harden_boundary_output_record $from_rec] && ![harden_output_source_exists_for_boundary $from_rec $t(type)]} {
+                foreach path [paths_from_missing_harden_output_boundary $from_rec $t(type)] {
+                    lappend queue $path
+                }
+            }
+        }
+        array unset t
     }
 
     set idx 0
@@ -1890,19 +1984,90 @@ proc stage2_delay::match_delay_graph_segments {} {
         set visited($psig) 1
 
         set end_rec $p(end_record)
+        if {[validate_endpoint_record $end_rec]} {
+            set emitted_sig "TERMINAL:[path_signature [array get p]]"
+            if {![info exists emitted($emitted_sig)]} {
+                set emitted($emitted_sig) 1
+                set generated [emit_graph_terminal_cmd [array get p]]
+                if {$generated ne ""} {
+                    mark_path_used [array get p] used_top used_harden
+                    add_report_item "RECURSIVE_MERGED_TERMINAL path=[path_id_string [array get p]] endpoint=[record_full_name $end_rec] total=$p(delay)"
+                }
+            }
+            array unset p
+            continue
+        }
         if {[is_harden_boundary_output_record $end_rec]} {
+            set matched_chain_top 0
             foreach tseg [matching_chain_top_segments $end_rec $p(type)] {
                 array set t $tseg
                 set next [extend_path_with_top_segment [array get p] [array get t]]
                 if {$next ne ""} {
                     lappend queue $next
+                    set matched_chain_top 1
                 }
                 array unset t
+            }
+            if {!$matched_chain_top} {
+                foreach target [missing_top_targets_from_harden_output_boundary $end_rec $p(type)] {
+                    set missing_tseg [synthetic_missing_top_segment $end_rec $target $p(type)]
+                    set next [extend_path_with_top_segment [array get p] $missing_tseg]
+                    if {$next ne ""} {
+                        lappend queue $next
+                        add_report_item "MISSING_SDC_ASSUMED_ZERO source=top from=[record_full_name $end_rec] to=[record_full_name $target] reason=PT_FANOUT_BRIDGE"
+                    }
+                }
             }
         }
 
         if {[is_harden_boundary_input_record $end_rec]} {
-            foreach hseg [matching_harden_segments_for_boundary $end_rec $p(type)] {
+            set matched_hsegs [matching_harden_segments_for_boundary $end_rec $p(type)]
+            if {[llength $matched_hsegs] == 0} {
+                set bridged 0
+                foreach tseg [missing_harden_bridge_top_segments $end_rec $p(type)] {
+                    array set t $tseg
+                    set out_rec [lindex $t(from_records) 0]
+                    set missing_hseg [synthetic_missing_harden_segment $end_rec $out_rec $p(type)]
+                    set next [extend_path_with_harden_segment [array get p] $missing_hseg]
+                    if {$next ne ""} {
+                        lappend queue $next
+                        set bridged 1
+                        add_report_item "MISSING_SDC_ASSUMED_ZERO harden=[record_owner_name $end_rec] from=[record_full_name $end_rec] to=[record_full_name $out_rec] reason=BRIDGE_TO_NEXT_TOP_SEGMENT"
+                    }
+                    array unset t
+                }
+                if {!$bridged} {
+                    set terminal_targets [missing_harden_targets_from_boundary $end_rec $p(type)]
+                    foreach target $terminal_targets {
+                        set missing_hseg [synthetic_missing_harden_segment $end_rec $target $p(type)]
+                        if {[is_harden_boundary_output_record $target]} {
+                            set next [extend_path_with_harden_segment [array get p] $missing_hseg]
+                            if {$next ne ""} {
+                                lappend queue $next
+                                set bridged 1
+                            }
+                            continue
+                        }
+                        set emitted_sig [recursive_emit_signature [array get p] $missing_hseg]
+                        if {[info exists emitted($emitted_sig)]} {
+                            continue
+                        }
+                        set emitted($emitted_sig) 1
+                        set generated [emit_graph_delay_cmd [array get p] $missing_hseg $end_rec]
+                        if {$generated ne ""} {
+                            mark_path_used [array get p] used_top used_harden
+                            add_report_item "RECURSIVE_MERGED_MISSING_SDC path=[path_id_string [array get p]] + [summary_steps_path_id [list [segment_summary_step $missing_hseg]]] boundary=[record_full_name $end_rec] assumed_delay=0 total=$p(delay)"
+                        }
+                    }
+                } else {
+                    set terminal_targets {}
+                }
+                if {!$bridged && [llength $terminal_targets] == 0} {
+                    set missing_hseg [synthetic_missing_harden_segment $end_rec $end_rec $p(type)]
+                    add_review "" $missing_hseg "MISSING_HARDEN_SDC_ENDPOINT_NOT_FOUND" "missing harden SDC stage has no PT-inferred legal endpoint or output boundary"
+                }
+            }
+            foreach hseg $matched_hsegs {
                 array set h $hseg
                 set emitted_sig [recursive_emit_signature [array get p] [array get h]]
                 if {[info exists emitted($emitted_sig)]} {
@@ -1978,6 +2143,56 @@ proc stage2_delay::path_from_top_segment {tseg} {
     return $path
 }
 
+proc stage2_delay::paths_from_top_segment {tseg} {
+    variable options
+    array set t $tseg
+    if {[llength $t(from_records)] > 0 || $options(-top_open_from_mode) eq "through"} {
+        set path [path_from_top_segment [array get t]]
+        array unset t
+        return [list $path]
+    }
+
+    set boundary [lindex $t(to_records) 0]
+    set startpoints [pt_startpoints_to_boundary $boundary]
+    if {[llength $startpoints] == 0} {
+        add_review [array get t] "" "NO_TOP_STARTPOINT_INFERRED" "top open_from delay has no PT-inferred legal startpoint"
+        array unset t
+        return {}
+    }
+    if {[llength $startpoints] > $options(-max_endpoints)} {
+        add_review [array get t] "" "TOO_MANY_TOP_STARTPOINTS" "top open_from inferred startpoints exceeded -max_endpoints"
+        array unset t
+        return {}
+    }
+
+    set out {}
+    foreach startpoint $startpoints {
+        lappend out [path_from_top_segment_with_startpoint [array get t] $startpoint]
+    }
+    array unset t
+    return $out
+}
+
+proc stage2_delay::path_from_top_segment_with_startpoint {tseg startpoint} {
+    array set t $tseg
+    set end_rec [lindex $t(to_records) 0]
+    set path [list \
+        type $t(type) \
+        delay $t(delay) \
+        from_records [list $startpoint] \
+        through_records {} \
+        end_record $end_rec \
+        top_ids [list $t(id)] \
+        harden_ids {} \
+        top_segments [list [array get t]] \
+        harden_segments {} \
+        path_steps [list [segment_summary_step [array get t]]] \
+        depth 1 \
+    ]
+    array unset t
+    return $path
+}
+
 proc stage2_delay::path_from_harden_output_source {hseg} {
     array set h $hseg
     set from_rec [lindex $h(from_records) 0]
@@ -1999,6 +2214,167 @@ proc stage2_delay::path_from_harden_output_source {hseg} {
     return $path
 }
 
+proc stage2_delay::paths_from_missing_top_to_harden_feedthrough {hseg} {
+    array set h $hseg
+    set out {}
+    if {$h(kind) ne "complete" || [llength $h(from_records)] != 1 || [llength $h(to_records)] != 1} {
+        array unset h
+        return {}
+    }
+    set input_rec [lindex $h(from_records) 0]
+    set output_rec [lindex $h(to_records) 0]
+    if {![is_harden_boundary_input_record $input_rec] || ![is_harden_boundary_output_record $output_rec]} {
+        array unset h
+        return {}
+    }
+    if {[top_or_chain_segment_exists_to_boundary $input_rec $h(type)]} {
+        array unset h
+        return {}
+    }
+
+    set startpoints [pt_startpoints_to_boundary $input_rec]
+    if {[llength $startpoints] == 0} {
+        add_report_item "MISSING_TOP_TO_FEEDTHROUGH_STARTPOINT_NOT_FOUND harden=$h(harden_inst) boundary=[record_full_name $input_rec] harden_id=$h(id)"
+        array unset h
+        return {}
+    }
+
+    foreach startpoint $startpoints {
+        set missing_tseg [synthetic_missing_top_segment $startpoint $input_rec $h(type)]
+        set path [path_from_top_segment $missing_tseg]
+        set next [extend_path_with_harden_segment $path [array get h]]
+        lappend out $next
+        add_report_item "MISSING_SDC_ASSUMED_ZERO source=top from=[record_full_name $startpoint] to=[record_full_name $input_rec] reason=PT_FANIN_TO_FEEDTHROUGH_INPUT harden=$h(harden_inst) harden_id=$h(id)"
+    }
+    array unset h
+    return $out
+}
+
+proc stage2_delay::top_or_chain_segment_exists_to_boundary {boundary type} {
+    variable top_segments
+    variable chain_top_segments
+    set bname [record_full_name $boundary]
+    foreach tseg [concat $top_segments $chain_top_segments] {
+        array set t $tseg
+        set matched 0
+        if {$t(type) eq $type && [llength $t(to_records)] == 1 && [record_full_name [lindex $t(to_records) 0]] eq $bname} {
+            set matched 1
+        }
+        array unset t
+        if {$matched} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc stage2_delay::paths_from_missing_harden_output_boundary {boundary type} {
+    set startpoints [pt_startpoints_to_boundary $boundary]
+    if {[llength $startpoints] == 0} {
+        add_report_item "MISSING_HARDEN_OUTPUT_SOURCE_STARTPOINT_NOT_FOUND boundary=[record_full_name $boundary] type=$type"
+        return {}
+    }
+
+    set out {}
+    foreach startpoint $startpoints {
+        set missing_hseg [synthetic_missing_harden_segment $startpoint $boundary $type]
+        array set h $missing_hseg
+        set from_rec [lindex $h(from_records) 0]
+        set to_rec [lindex $h(to_records) 0]
+        set path [list \
+            type $type \
+            delay 0 \
+            from_records [list $from_rec] \
+            through_records {} \
+            end_record $to_rec \
+            top_ids {} \
+            harden_ids [list $h(id)] \
+            top_segments {} \
+            harden_segments [list [array get h]] \
+            path_steps [list [segment_summary_step [array get h]]] \
+            depth 1 \
+        ]
+        lappend out $path
+        add_report_item "MISSING_SDC_ASSUMED_ZERO harden=[record_owner_name $boundary] from=[record_full_name $startpoint] to=[record_full_name $boundary] reason=PT_FANIN_TO_OUTPUT_BOUNDARY"
+        array unset h
+    }
+    return $out
+}
+
+proc stage2_delay::synthetic_missing_harden_segment {from_rec to_rec type} {
+    array set f $from_rec
+    array set t $to_rec
+    set harden_inst $f(owner_harden_inst)
+    if {$harden_inst eq ""} {
+        set harden_inst $t(owner_harden_inst)
+    }
+    set id "MISSING_SDC_[safe_filename_token $harden_inst]_[safe_filename_token $f(full_name)]_TO_[safe_filename_token $t(full_name)]"
+    set seg [list \
+        id $id \
+        type $type \
+        kind complete \
+        delay 0 \
+        from_expr "" \
+        to_expr "" \
+        through_exprs {} \
+        from_records [list $from_rec] \
+        to_records [list $to_rec] \
+        through_records {} \
+        flags {} \
+        source harden \
+        source_file "NOT FOUND" \
+        line_no "-" \
+        original_text "" \
+        original_id $id \
+        split_index 1 \
+        split_total 1 \
+        harden_inst $harden_inst \
+        class missing_sdc \
+        boundary_pins {} \
+        status ok \
+        failure_reason "" \
+        missing_sdc true \
+    ]
+    array unset f
+    array unset t
+    return $seg
+}
+
+proc stage2_delay::synthetic_missing_top_segment {from_rec to_rec type} {
+    array set f $from_rec
+    array set t $to_rec
+    set id "MISSING_TOP_SDC_[safe_filename_token $f(full_name)]_TO_[safe_filename_token $t(full_name)]"
+    set seg [list \
+        id $id \
+        type $type \
+        kind complete \
+        delay 0 \
+        from_expr "" \
+        to_expr "" \
+        through_exprs {} \
+        from_records [list $from_rec] \
+        to_records [list $to_rec] \
+        through_records {} \
+        flags {} \
+        source top \
+        source_file "NOT FOUND" \
+        line_no "-" \
+        original_text "" \
+        original_id $id \
+        split_index 1 \
+        split_total 1 \
+        harden_inst "" \
+        class missing_sdc \
+        boundary_pins {} \
+        status ok \
+        failure_reason "" \
+        missing_sdc true \
+    ]
+    array unset f
+    array unset t
+    return $seg
+}
+
 proc stage2_delay::harden_output_source_has_legal_start {hseg} {
     array set h $hseg
     set result 0
@@ -2009,6 +2385,20 @@ proc stage2_delay::harden_output_source_has_legal_start {hseg} {
     }
     array unset h
     return $result
+}
+
+proc stage2_delay::harden_output_source_exists_for_boundary {boundary type} {
+    variable harden_output_segments
+    set bname [record_full_name $boundary]
+    foreach hseg $harden_output_segments {
+        array set h $hseg
+        if {$h(type) eq $type && [llength $h(to_records)] == 1 && [record_full_name [lindex $h(to_records) 0]] eq $bname && [harden_output_source_has_legal_start [array get h]]} {
+            array unset h
+            return 1
+        }
+        array unset h
+    }
+    return 0
 }
 
 proc stage2_delay::matching_chain_top_segments {from_boundary type} {
@@ -2044,6 +2434,278 @@ proc stage2_delay::matching_harden_segments_for_boundary {boundary type} {
         array unset h
     }
     return $out
+}
+
+proc stage2_delay::missing_harden_bridge_top_segments {boundary type} {
+    variable chain_top_segments
+    set out {}
+    array set b $boundary
+    set owner $b(owner_harden_inst)
+    array unset b
+    if {$owner eq ""} {
+        return {}
+    }
+    foreach tseg $chain_top_segments {
+        array set t $tseg
+        if {$t(type) ne $type || [llength $t(from_records)] != 1} {
+            array unset t
+            continue
+        }
+        set from_rec [lindex $t(from_records) 0]
+        array set f $from_rec
+        if {$f(owner_harden_inst) eq $owner && [is_harden_boundary_output_record $from_rec]} {
+            lappend out [array get t]
+        }
+        array unset f
+        array unset t
+    }
+    return $out
+}
+
+proc stage2_delay::missing_harden_targets_from_boundary {boundary type} {
+    set out {}
+    foreach rec [pt_harden_fanout_targets_from_boundary $boundary] {
+        if {[validate_endpoint_record $rec] || [is_harden_boundary_output_record $rec]} {
+            lappend out $rec
+        }
+    }
+    return [unique_records_by_name $out]
+}
+
+proc stage2_delay::missing_top_targets_from_harden_output_boundary {boundary type} {
+    set boundary_targets {}
+    foreach rec [pt_top_fanout_targets_from_harden_output_boundary $boundary] {
+        if {[is_harden_boundary_input_record $rec] || [validate_endpoint_record $rec]} {
+            lappend boundary_targets $rec
+        }
+    }
+    return [unique_records_by_name $boundary_targets]
+}
+
+proc stage2_delay::pt_harden_fanout_targets_from_boundary {boundary} {
+    array set b $boundary
+    set boundary_name $b(full_name)
+    set harden_inst $b(owner_harden_inst)
+    array unset b
+
+    if {$harden_inst eq ""} {
+        return {}
+    }
+    if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands foreach_in_collection] eq ""} {
+        pt_trace "missing-sdc fanout target skip boundary={$boundary_name} missing_command"
+        return {}
+    }
+
+    set value {}
+    pt_trace "get_pins -quiet {$boundary_name}"
+    if {[catch {
+        set start [get_pins -quiet $boundary_name]
+        pt_trace "get_pins missing-sdc boundary result boundary={$boundary_name} count=[sizeof_collection $start]"
+        if {[sizeof_collection $start] > 0} {
+            foreach rec [pt_endpoint_fanout_records $start $boundary_name "missing-sdc"] {
+                array set e $rec
+                if {$e(owner_harden_inst) eq $harden_inst && $e(full_name) ne $boundary_name} {
+                    lappend value $rec
+                }
+                array unset e
+            }
+            pt_trace "all_fanout -flat -from {$boundary_name}"
+            set fanout [all_fanout -flat -from $start]
+            pt_trace "all_fanout missing-sdc result boundary={$boundary_name} count=[sizeof_collection $fanout]"
+            foreach_in_collection obj $fanout {
+                set name [collection_object_name $obj]
+                set owner [owner_harden_inst $name]
+                if {$owner ne $harden_inst || $name eq $boundary_name} {
+                    continue
+                }
+                set direction [pt_get_attr_by_name pin $name direction]
+                set rec [object_record pin $name $direction $owner]
+                if {[is_harden_boundary_output_record $rec]} {
+                    lappend value $rec
+                }
+            }
+        }
+    } err]} {
+        pt_trace "missing-sdc fanout target failed boundary={$boundary_name} error={$err}"
+        return {}
+    }
+    set value [unique_records_by_name $value]
+    pt_trace "missing-sdc fanout target summary boundary={$boundary_name} target_count=[llength $value]"
+    return $value
+}
+
+proc stage2_delay::pt_top_fanout_targets_from_harden_output_boundary {boundary} {
+    array set b $boundary
+    set boundary_name $b(full_name)
+    set owner_harden $b(owner_harden_inst)
+    array unset b
+
+    if {$owner_harden eq ""} {
+        return {}
+    }
+    if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands foreach_in_collection] eq ""} {
+        pt_trace "missing-top fanout target skip boundary={$boundary_name} missing_command"
+        return {}
+    }
+
+    set value {}
+    pt_trace "get_pins -quiet {$boundary_name}"
+    if {[catch {
+        set start [get_pins -quiet $boundary_name]
+        pt_trace "get_pins missing-top boundary result boundary={$boundary_name} count=[sizeof_collection $start]"
+        if {[sizeof_collection $start] > 0} {
+            foreach rec [pt_endpoint_fanout_records $start $boundary_name "missing-top"] {
+                array set e $rec
+                if {$e(full_name) ne $boundary_name && $e(owner_harden_inst) ne $owner_harden} {
+                    lappend value $rec
+                }
+                array unset e
+            }
+            pt_trace "all_fanout -flat -from {$boundary_name}"
+            set fanout [all_fanout -flat -from $start]
+            pt_trace "all_fanout missing-top result boundary={$boundary_name} count=[sizeof_collection $fanout]"
+            foreach_in_collection obj $fanout {
+                set rec [pt_object_record_from_collection $obj]
+                array set r $rec
+                set name $r(full_name)
+                set owner $r(owner_harden_inst)
+                array unset r
+                if {$name eq $boundary_name || $owner eq $owner_harden} {
+                    continue
+                }
+                if {[is_harden_boundary_input_record $rec] || [is_harden_boundary_output_record $rec]} {
+                    lappend value $rec
+                }
+            }
+        }
+    } err]} {
+        pt_trace "missing-top fanout target failed boundary={$boundary_name} error={$err}"
+        return {}
+    }
+    set value [unique_records_by_name $value]
+    pt_trace "missing-top fanout target summary boundary={$boundary_name} target_count=[llength $value]"
+    return $value
+}
+
+proc stage2_delay::pt_endpoint_fanout_records {start boundary_name label} {
+    if {[info commands all_fanout] eq "" || [info commands foreach_in_collection] eq "" || [info commands sizeof_collection] eq ""} {
+        pt_trace "$label endpoint fanout skip boundary={$boundary_name} missing_command"
+        return {}
+    }
+    set value {}
+    if {[catch {
+        pt_trace "all_fanout -flat -endpoints_only -from {$boundary_name}"
+        set endpoints [all_fanout -flat -endpoints_only -from $start]
+        pt_trace "all_fanout endpoints result boundary={$boundary_name} count=[sizeof_collection $endpoints]"
+        foreach_in_collection obj $endpoints {
+            set rec [mark_pt_endpoint_record [pt_object_record_from_collection $obj]]
+            if {[validate_endpoint_record $rec]} {
+                lappend value $rec
+            }
+        }
+    } err]} {
+        pt_trace "$label endpoint fanout failed boundary={$boundary_name} error={$err}"
+        return {}
+    }
+    return [unique_records_by_name $value]
+}
+
+proc stage2_delay::pt_startpoints_to_boundary {boundary} {
+    array set b $boundary
+    set boundary_name $b(full_name)
+    set boundary_class $b(object_class)
+    array unset b
+
+    if {[info commands all_fanin] eq "" || [info commands foreach_in_collection] eq "" || [info commands sizeof_collection] eq ""} {
+        pt_trace "top startpoint inference skip boundary={$boundary_name} missing_command"
+        return {}
+    }
+
+    set getter get_pins
+    if {$boundary_class eq "port"} {
+        set getter get_ports
+    }
+    if {[info commands $getter] eq ""} {
+        pt_trace "top startpoint inference skip boundary={$boundary_name} missing_getter=$getter"
+        return {}
+    }
+
+    set value {}
+    pt_trace "$getter -quiet {$boundary_name}"
+    if {[catch {
+        set target [$getter -quiet $boundary_name]
+        pt_trace "$getter top-open-from boundary result boundary={$boundary_name} count=[sizeof_collection $target]"
+        if {[sizeof_collection $target] > 0} {
+            set fanin {}
+            if {[catch {
+                pt_trace "all_fanin -flat -startpoints_only -to {$boundary_name}"
+                set fanin [all_fanin -flat -startpoints_only -to $target]
+            } err_startpoints]} {
+                pt_trace "all_fanin startpoints_only failed boundary={$boundary_name} error={$err_startpoints}"
+                pt_trace "all_fanin -flat -to {$boundary_name}"
+                set fanin [all_fanin -flat -to $target]
+            }
+            pt_trace "all_fanin top-open-from result boundary={$boundary_name} count=[sizeof_collection $fanin]"
+            foreach_in_collection obj $fanin {
+                set rec [pt_object_record_from_collection $obj]
+                set rec [mark_pt_startpoint_record $rec]
+                if {[validate_startpoint_record $rec]} {
+                    lappend value $rec
+                }
+            }
+        }
+    } err]} {
+        pt_trace "top startpoint inference failed boundary={$boundary_name} error={$err}"
+        return {}
+    }
+    set value [unique_records_by_name $value]
+    pt_trace "top startpoint inference summary boundary={$boundary_name} startpoint_count=[llength $value]"
+    return $value
+}
+
+proc stage2_delay::mark_pt_startpoint_record {rec} {
+    array set r $rec
+    set r(pt_startpoint) true
+    set out [array get r]
+    array unset r
+    return $out
+}
+
+proc stage2_delay::mark_pt_endpoint_record {rec} {
+    array set r $rec
+    set r(pt_endpoint) true
+    set out [array get r]
+    array unset r
+    return $out
+}
+
+proc stage2_delay::pt_object_record_from_collection {obj} {
+    set name [collection_object_name $obj]
+    set direction ""
+    catch {set direction [get_attribute $obj direction]}
+    set class ""
+    catch {set class [get_attribute $obj object_class]}
+    set class [normalize_pt_object_class $class $name]
+    if {$direction eq ""} {
+        set direction [pt_get_attr_by_name $class $name direction]
+    }
+    return [object_record $class $name $direction [owner_harden_inst $name]]
+}
+
+proc stage2_delay::normalize_pt_object_class {class name} {
+    set class [string tolower $class]
+    if {$class in {pin port cell net}} {
+        return $class
+    }
+    if {[string first "/" $name] >= 0} {
+        return pin
+    }
+    if {[info commands get_ports] ne ""} {
+        if {![catch {set ports [get_ports -quiet $name]}] && [sizeof_collection $ports] > 0} {
+            return port
+        }
+    }
+    return pin
 }
 
 proc stage2_delay::extend_path_with_top_segment {path tseg} {
@@ -2105,6 +2767,7 @@ proc stage2_delay::extend_path_with_harden_segment {path hseg} {
 
 proc stage2_delay::emit_graph_delay_cmd {path hseg boundary} {
     variable generated_cmds
+    variable options
     array set p $path
     array set h $hseg
     set to_rec [lindex $h(to_records) 0]
@@ -2122,30 +2785,127 @@ proc stage2_delay::emit_graph_delay_cmd {path hseg boundary} {
     }
     set total [format_delay [expr {$p(delay) + $h(delay)}]]
     set cmd_name [expr {$p(type) eq "max" ? "set_max_delay" : "set_min_delay"}]
-    set cmd "$cmd_name $total"
-    if {[llength $p(from_records)] > 0} {
-        set from_rec [lindex $p(from_records) 0]
-        if {![validate_startpoint_record $from_rec]} {
-            add_review "" [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
+
+    set start_records $p(from_records)
+    if {[llength $start_records] == 0} {
+        set start_records [pt_startpoints_to_boundary $boundary]
+        if {[llength $start_records] == 0} {
+            add_review "" [array get h] "NO_FINAL_STARTPOINT_INFERRED" "generated path has no -from and PT all_fanin could not infer a legal startpoint"
             array unset p
             array unset h
             return ""
         }
-        append cmd " -from [format_record_collection $from_rec]"
-    } else {
-        foreach through_rec [unique_records_by_name $p(through_records)] {
-            append cmd " -through [format_record_collection $through_rec]"
+        if {[llength $start_records] > $options(-max_endpoints)} {
+            add_review "" [array get h] "TOO_MANY_FINAL_STARTPOINTS" "generated path inferred startpoints exceeded -max_endpoints"
+            array unset p
+            array unset h
+            return ""
         }
+        add_report_item "TOP_OPEN_FROM_STARTPOINT_INFERRED boundary=[record_full_name $boundary] count=[llength $start_records]"
     }
-    append cmd " -to [format_record_collection $to_rec]"
-    lappend generated_cmds [list command $cmd top_id [join $p(top_ids) "+"] harden_id [join [concat $p(harden_ids) [list $h(id)]] "+"] boundary [record_full_name $boundary] total $total]
+
     set summary_steps [concat $p(path_steps) [list [segment_summary_step [array get h]]]]
     set summary_through [summary_through_records_from_steps $summary_steps $to_rec $p(through_records)]
-    record_generated_path_summary [summary_steps_path_id $summary_steps] $summary_steps $total $p(from_records) $summary_through $to_rec $cmd
-    consume_graph_path [array get p]
+    set emitted_cmds {}
+    foreach from_rec $start_records {
+        if {![validate_startpoint_record $from_rec]} {
+            add_review "" [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
+            continue
+        }
+        set cmd "$cmd_name $total"
+        append cmd " -from [format_record_collection $from_rec]"
+        foreach through_rec [command_through_records $summary_through $from_rec $to_rec] {
+            append cmd " -through [format_record_collection $through_rec]"
+        }
+        append cmd " -to [format_record_collection $to_rec]"
+        set e2e_id [next_e2e_id]
+        lappend generated_cmds [list e2e_id $e2e_id command $cmd top_id [join $p(top_ids) "+"] harden_id [join [concat $p(harden_ids) [list $h(id)]] "+"] boundary [record_full_name $boundary] total $total]
+        record_generated_path_summary $e2e_id [summary_steps_path_id $summary_steps] $summary_steps $total [list $from_rec] $summary_through $to_rec $cmd
+        lappend emitted_cmds $cmd
+    }
+
+    if {[llength $emitted_cmds] > 0} {
+        consume_graph_path [array get p]
+        foreach seg $p(harden_segments) {
+            add_missing_sdc_report_for_segment $seg $total
+        }
+        add_missing_sdc_report_for_segment [array get h] $total
+    }
     array unset p
     array unset h
-    return $cmd
+    return [join $emitted_cmds "\n"]
+}
+
+proc stage2_delay::emit_graph_terminal_cmd {path} {
+    variable generated_cmds
+    variable options
+    array set p $path
+    set to_rec $p(end_record)
+    if {![validate_endpoint_record $to_rec]} {
+        add_review "" "" "INVALID_TERMINAL_ENDPOINT" "recursive path terminal object is not a legal endpoint"
+        array unset p
+        return ""
+    }
+    set total [format_delay $p(delay)]
+    set cmd_name [expr {$p(type) eq "max" ? "set_max_delay" : "set_min_delay"}]
+    set start_records $p(from_records)
+    if {[llength $start_records] == 0} {
+        set start_records [pt_startpoints_to_boundary $to_rec]
+        if {[llength $start_records] == 0} {
+            add_review "" "" "NO_FINAL_STARTPOINT_INFERRED" "terminal recursive path has no -from and PT all_fanin could not infer a legal startpoint"
+            array unset p
+            return ""
+        }
+        if {[llength $start_records] > $options(-max_endpoints)} {
+            add_review "" "" "TOO_MANY_FINAL_STARTPOINTS" "terminal recursive path inferred startpoints exceeded -max_endpoints"
+            array unset p
+            return ""
+        }
+    }
+
+    set summary_steps $p(path_steps)
+    set summary_through [summary_through_records_from_steps $summary_steps $to_rec $p(through_records)]
+    set emitted_cmds {}
+    foreach from_rec $start_records {
+        if {![validate_startpoint_record $from_rec]} {
+            add_review "" "" "INVALID_STARTPOINT" "terminal generated -from object is not a legal startpoint"
+            continue
+        }
+        set cmd "$cmd_name $total"
+        append cmd " -from [format_record_collection $from_rec]"
+        foreach through_rec [command_through_records $summary_through $from_rec $to_rec] {
+            append cmd " -through [format_record_collection $through_rec]"
+        }
+        append cmd " -to [format_record_collection $to_rec]"
+        set e2e_id [next_e2e_id]
+        lappend generated_cmds [list e2e_id $e2e_id command $cmd top_id [join $p(top_ids) "+"] harden_id [join $p(harden_ids) "+"] boundary [record_full_name $to_rec] total $total]
+        record_generated_path_summary $e2e_id [summary_steps_path_id $summary_steps] $summary_steps $total [list $from_rec] $summary_through $to_rec $cmd
+        lappend emitted_cmds $cmd
+    }
+
+    if {[llength $emitted_cmds] > 0} {
+        consume_graph_path [array get p]
+        foreach seg $p(top_segments) {
+            add_missing_sdc_report_for_segment $seg $total
+        }
+        foreach seg $p(harden_segments) {
+            add_missing_sdc_report_for_segment $seg $total
+        }
+    }
+    array unset p
+    return [join $emitted_cmds "\n"]
+}
+
+proc stage2_delay::add_missing_sdc_report_for_segment {seg total} {
+    array set s $seg
+    if {[info exists s(missing_sdc)] && [truthy $s(missing_sdc)]} {
+        if {$s(source) eq "top"} {
+            add_report_item "MISSING_SDC_ASSUMED_ZERO source=top from=[records_summary_name_text $s(from_records)] to=[records_summary_name_text $s(to_records)] generated_total=$total"
+        } else {
+            add_report_item "MISSING_SDC_ASSUMED_ZERO harden=$s(harden_inst) from=[records_summary_name_text $s(from_records)] to=[records_summary_name_text $s(to_records)] generated_total=$total"
+        }
+    }
+    array unset s
 }
 
 proc stage2_delay::consume_graph_path {path} {
@@ -2360,6 +3120,31 @@ proc stage2_delay::record_full_name {rec} {
     return $name
 }
 
+proc stage2_delay::record_owner_name {rec} {
+    array set r $rec
+    set owner $r(owner_harden_inst)
+    array unset r
+    return $owner
+}
+
+proc stage2_delay::command_through_records {records from_rec to_rec} {
+    set skip {}
+    if {$from_rec ne ""} {
+        lappend skip [record_full_name $from_rec]
+    }
+    if {$to_rec ne ""} {
+        lappend skip [record_full_name $to_rec]
+    }
+    set out {}
+    foreach rec [unique_records_by_name $records] {
+        set name [record_full_name $rec]
+        if {[lsearch -exact $skip $name] < 0} {
+            lappend out $rec
+        }
+    }
+    return $out
+}
+
 proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
     variable generated_cmds
     variable options
@@ -2389,30 +3174,61 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
             array unset h
             return ""
         }
-        set cmd "$cmd_name $total -from [format_record_collection $from_rec] -to [format_record_collection $to_rec]"
+        set cmd "$cmd_name $total -from [format_record_collection $from_rec]"
+        foreach through_rec [command_through_records [list $boundary] $from_rec $to_rec] {
+            append cmd " -through [format_record_collection $through_rec]"
+        }
+        append cmd " -to [format_record_collection $to_rec]"
     } else {
-        if {![truthy $options(-allow_through)]} {
-            add_review [array get t] [array get h] "THROUGH_DISABLED" "top open_from requires -through but -allow_through is false"
+        set start_records [pt_startpoints_to_boundary $boundary]
+        if {[llength $start_records] == 0} {
+            add_review [array get t] [array get h] "NO_FINAL_STARTPOINT_INFERRED" "top open_from has no -from and PT all_fanin could not infer a legal startpoint"
             array unset t
             array unset h
             return ""
-        }
-        if {![validate_endpoint_record $to_rec] && ![is_harden_boundary_output_record $to_rec]} {
+        } elseif {[llength $start_records] > $options(-max_endpoints)} {
+            add_review [array get t] [array get h] "TOO_MANY_FINAL_STARTPOINTS" "top open_from inferred startpoints exceeded -max_endpoints"
+            array unset t
+            array unset h
+            return ""
+        } elseif {![validate_endpoint_record $to_rec] && ![is_harden_boundary_output_record $to_rec]} {
             add_review [array get t] [array get h] "INVALID_ENDPOINT" "generated -to object is not a legal endpoint"
             array unset t
             array unset h
             return ""
+        } else {
+            set emitted_cmds {}
+            foreach from_rec $start_records {
+                if {![validate_startpoint_record $from_rec]} {
+                    add_review [array get t] [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
+                    continue
+                }
+                set one_cmd "$cmd_name $total -from [format_record_collection $from_rec]"
+                foreach through_rec [command_through_records [list $boundary] $from_rec $to_rec] {
+                    append one_cmd " -through [format_record_collection $through_rec]"
+                }
+                append one_cmd " -to [format_record_collection $to_rec]"
+                set e2e_id [next_e2e_id]
+                lappend generated_cmds [list e2e_id $e2e_id command $one_cmd top_id $t(id) harden_id $h(id) boundary [record_full_name $boundary] total $total]
+                set summary_steps [list [segment_summary_step [array get t]] [segment_summary_step [array get h]]]
+                set summary_through [summary_through_records_from_steps $summary_steps $to_rec [list $boundary]]
+                record_generated_path_summary $e2e_id [summary_steps_path_id $summary_steps] $summary_steps $total [list $from_rec] $summary_through $to_rec $one_cmd
+                lappend emitted_cmds $one_cmd
+            }
+            array unset t
+            array unset h
+            return [join $emitted_cmds "\n"]
         }
-        set cmd "$cmd_name $total -through [format_record_collection $boundary] -to [format_record_collection $to_rec]"
     }
-    lappend generated_cmds [list command $cmd top_id $t(id) harden_id $h(id) boundary [record_full_name $boundary] total $total]
+    set e2e_id [next_e2e_id]
+    lappend generated_cmds [list e2e_id $e2e_id command $cmd top_id $t(id) harden_id $h(id) boundary [record_full_name $boundary] total $total]
     set summary_steps [list [segment_summary_step [array get t]] [segment_summary_step [array get h]]]
     set final_from_records {}
     if {$t(kind) eq "complete"} {
         set final_from_records [list [lindex $t(from_records) 0]]
     }
     set summary_through [summary_through_records_from_steps $summary_steps $to_rec [list $boundary]]
-    record_generated_path_summary [summary_steps_path_id $summary_steps] $summary_steps $total $final_from_records $summary_through $to_rec $cmd
+    record_generated_path_summary $e2e_id [summary_steps_path_id $summary_steps] $summary_steps $total $final_from_records $summary_through $to_rec $cmd
     array unset t
     array unset h
     return $cmd
@@ -2420,13 +3236,41 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
 
 proc stage2_delay::emit_residual_through_cmd {hseg boundary reason} {
     variable residual_cmds
+    variable options
     array set h $hseg
     set to_rec [lindex $h(to_records) 0]
+    if {![validate_endpoint_record $to_rec] && ![is_harden_boundary_output_record $to_rec]} {
+        add_review "" [array get h] "INVALID_ENDPOINT" "residual -to object is not a legal endpoint"
+        array unset h
+        return
+    }
+    set start_records [pt_startpoints_to_boundary $boundary]
+    if {[llength $start_records] == 0} {
+        add_review "" [array get h] "NO_FINAL_STARTPOINT_INFERRED" "residual path has no -from and PT all_fanin could not infer a legal startpoint"
+        array unset h
+        return
+    }
+    if {[llength $start_records] > $options(-max_endpoints)} {
+        add_review "" [array get h] "TOO_MANY_FINAL_STARTPOINTS" "residual path inferred startpoints exceeded -max_endpoints"
+        array unset h
+        return
+    }
     set cmd_name [expr {$h(type) eq "max" ? "set_max_delay" : "set_min_delay"}]
-    set cmd "$cmd_name [format_delay $h(delay)] -through [format_record_collection $boundary] -to [format_record_collection $to_rec]"
-    lappend residual_cmds [list command $cmd harden_id $h(id) boundary [record_full_name $boundary] reason $reason]
-    record_residual_path_summary [array get h] $boundary $reason $cmd
-    add_report_item "RESIDUAL_CONSERVATIVE $h(id) boundary=[record_full_name $boundary] reason=$reason"
+    foreach from_rec $start_records {
+        if {![validate_startpoint_record $from_rec]} {
+            add_review "" [array get h] "INVALID_STARTPOINT" "residual -from object is not a legal startpoint"
+            continue
+        }
+        set cmd "$cmd_name [format_delay $h(delay)] -from [format_record_collection $from_rec]"
+        foreach through_rec [command_through_records [list $boundary] $from_rec $to_rec] {
+            append cmd " -through [format_record_collection $through_rec]"
+        }
+        append cmd " -to [format_record_collection $to_rec]"
+        set e2e_id [next_e2e_id]
+        lappend residual_cmds [list e2e_id $e2e_id command $cmd harden_id $h(id) boundary [record_full_name $boundary] reason $reason]
+        record_residual_path_summary $e2e_id [array get h] $boundary $reason $cmd [list $from_rec]
+        add_report_item "RESIDUAL_CONSERVATIVE $h(id) boundary=[record_full_name $boundary] reason=$reason"
+    }
     array unset h
 }
 
@@ -2442,7 +3286,9 @@ proc stage2_delay::boundary_and_endpoint_same_harden {boundary endpoint} {
 proc stage2_delay::validate_startpoint_record {rec} {
     array set r $rec
     set ok 0
-    if {$r(object_class) eq "port" && $r(direction) in {in inout}} {
+    if {[info exists r(pt_startpoint)] && [truthy $r(pt_startpoint)] && $r(object_class) in {pin port cell}} {
+        set ok 1
+    } elseif {$r(object_class) eq "port" && $r(direction) in {in inout}} {
         set ok 1
     } elseif {$r(object_class) eq "pin" && $r(direction) in {out inout}} {
         set ok 1
@@ -2454,7 +3300,9 @@ proc stage2_delay::validate_startpoint_record {rec} {
 proc stage2_delay::validate_endpoint_record {rec} {
     array set r $rec
     set ok 0
-    if {$r(object_class) eq "port" && $r(direction) in {out inout}} {
+    if {[info exists r(pt_endpoint)] && [truthy $r(pt_endpoint)] && $r(object_class) in {pin port cell} && ![is_harden_boundary_input_record $rec]} {
+        set ok 1
+    } elseif {$r(object_class) eq "port" && $r(direction) in {out inout}} {
         set ok 1
     } elseif {$r(object_class) eq "pin" && $r(direction) in {in inout} && ![is_harden_boundary_input_record $rec]} {
         set ok 1
@@ -2508,6 +3356,10 @@ proc stage2_delay::consume_segment {seg} {
     variable consumed_constraints
     variable consumed_segments
     array set s $seg
+    if {[info exists s(missing_sdc)] && [truthy $s(missing_sdc)]} {
+        array unset s
+        return
+    }
     set key "$s(source_file)|$s(id)"
     if {![info exists consumed_constraints($key)]} {
         set consumed_constraints($key) $s(original_text)
@@ -2543,7 +3395,7 @@ proc stage2_delay::write_e2e_sdc {path} {
     variable TOOL_NAME
     variable generated_cmds
     variable residual_cmds
-    set fout [open $path w]
+    set fout [open_text $path w]
     puts $fout "################################################################################"
     puts $fout "# Auto-generated integration E2E delay SDC"
     puts $fout "#"
@@ -2560,14 +3412,14 @@ proc stage2_delay::write_e2e_sdc {path} {
     puts $fout ""
     foreach item $generated_cmds {
         array set g $item
-        puts $fout "# MERGED top=$g(top_id) harden=$g(harden_id) boundary=$g(boundary)"
+        puts $fout "# MERGED id=$g(e2e_id) top=$g(top_id) harden=$g(harden_id) boundary=$g(boundary)"
         puts $fout $g(command)
         puts $fout ""
         array unset g
     }
     foreach item $residual_cmds {
         array set r $item
-        puts $fout "# RESIDUAL_CONSERVATIVE harden=$r(harden_id) boundary=$r(boundary) reason=$r(reason)"
+        puts $fout "# RESIDUAL_CONSERVATIVE id=$r(e2e_id) harden=$r(harden_id) boundary=$r(boundary) reason=$r(reason)"
         puts $fout $r(command)
         puts $fout ""
         array unset r
@@ -2589,7 +3441,7 @@ proc stage2_delay::current_scope_name {} {
 
 proc stage2_delay::write_removed_sdc {path} {
     variable consumed_segments
-    set fout [open $path w]
+    set fout [open_text $path w]
     write_author_banner $fout "# "
     puts $fout "#"
     puts $fout "# merged_delay_removed.sdc generated by run_stage2_merge_delay.tcl"
@@ -2610,7 +3462,7 @@ proc stage2_delay::write_removed_sdc {path} {
 
 proc stage2_delay::write_review_report {path} {
     variable review_items
-    set fout [open $path w]
+    set fout [open_text $path w]
     write_author_banner $fout
     puts $fout ""
     puts $fout "# unmerged_delay_review.rpt generated by run_stage2_merge_delay.tcl"
@@ -2632,7 +3484,7 @@ proc stage2_delay::write_report {path} {
     variable review_items
     variable report_items
 
-    set fout [open $path w]
+    set fout [open_text $path w]
     write_author_banner $fout
     puts $fout ""
     puts $fout "\[SUMMARY\]"
@@ -2710,7 +3562,7 @@ proc stage2_delay::write_final_sdc {path} {
     variable residual_cmds
     variable review_items
 
-    set fout [open $path w]
+    set fout [open_text $path w]
     write_author_banner $fout "# "
     puts $fout "#"
     puts $fout "# [file tail $path] generated by run_stage2_merge_delay.tcl"
@@ -2731,14 +3583,14 @@ proc stage2_delay::write_final_sdc {path} {
     write_final_section_header $fout "GENERATED_E2E_DELAY_SDC" $options(-out_e2e_sdc)
     foreach item $generated_cmds {
         array set g $item
-        puts $fout "# MERGED top=$g(top_id) harden=$g(harden_id) boundary=$g(boundary)"
+        puts $fout "# MERGED id=$g(e2e_id) top=$g(top_id) harden=$g(harden_id) boundary=$g(boundary)"
         puts $fout $g(command)
         puts $fout ""
         array unset g
     }
     foreach item $residual_cmds {
         array set r $item
-        puts $fout "# RESIDUAL_CONSERVATIVE harden=$r(harden_id) boundary=$r(boundary) reason=$r(reason)"
+        puts $fout "# RESIDUAL_CONSERVATIVE id=$r(e2e_id) harden=$r(harden_id) boundary=$r(boundary) reason=$r(reason)"
         puts $fout $r(command)
         puts $fout ""
         array unset r
@@ -2835,10 +3687,15 @@ proc stage2_delay::write_path_summary {dir} {
     }
 
     set index_path [file join $dir 00_index.csv]
-    set fout [open $index_path w]
-    csv_write_row $fout {tool version author sheet file row_count merged_rows residual_rows review_rows}
+    set fout [open_text $index_path w]
+    csv_write_row $fout {tool version author sheet file row_count merged_rows residual_rows review_rows max_delay_used max_delay_total max_delay_usage missing_sdc_stages}
     foreach sheet $sheet_order {
         set rows $rows_by_sheet($sheet)
+        set max_stats [max_delay_usage_stats_for_sheet $sheet]
+        set max_used [lindex $max_stats 0]
+        set max_total [lindex $max_stats 1]
+        set max_usage [format "%d/%d" $max_used $max_total]
+        set missing_stages [missing_sdc_stage_count $rows]
         csv_write_row $fout [list \
             $TOOL_NAME \
             $VERSION \
@@ -2849,6 +3706,10 @@ proc stage2_delay::write_path_summary {dir} {
             [summary_count_status $rows MERGED] \
             [summary_count_status $rows RESIDUAL] \
             [summary_count_status $rows REVIEW] \
+            $max_used \
+            $max_total \
+            $max_usage \
+            $missing_stages \
         ]
     }
     close $fout
@@ -2857,6 +3718,53 @@ proc stage2_delay::write_path_summary {dir} {
         write_path_summary_sheet [file join $dir $sheet_file($sheet)] $rows_by_sheet($sheet)
     }
     puts "INFO: Path summary CSV    : $dir"
+}
+
+proc stage2_delay::missing_sdc_stage_count {rows} {
+    array set seen {}
+    foreach item $rows {
+        set cmd_id [summary_item_get $item cmd_id ""]
+        if {[string match "MISSING_*" $cmd_id]} {
+            set seen($cmd_id) 1
+        }
+    }
+    return [array size seen]
+}
+
+proc stage2_delay::segment_sheet {seg} {
+    array set s $seg
+    set sheet "top"
+    if {[info exists s(source)] && $s(source) eq "harden"} {
+        set sheet $s(harden_inst)
+    }
+    array unset s
+    return $sheet
+}
+
+proc stage2_delay::max_delay_usage_stats_for_sheet {sheet} {
+    variable all_delay_segments
+    variable consumed_segments
+
+    array set total_seen {}
+    array set used_seen {}
+    foreach seg $all_delay_segments {
+        array set s $seg
+        if {$s(type) eq "max" && [segment_sheet [array get s]] eq $sheet} {
+            set total_seen([list $s(source_file) $s(original_id)]) 1
+        }
+        array unset s
+    }
+    foreach seg $consumed_segments {
+        array set s $seg
+        if {$s(type) eq "max" && [segment_sheet [array get s]] eq $sheet} {
+            set key [list $s(source_file) $s(original_id)]
+            if {[info exists total_seen($key)]} {
+                set used_seen($key) 1
+            }
+        }
+        array unset s
+    }
+    return [list [array size used_seen] [array size total_seen]]
 }
 
 proc stage2_delay::summary_count_status {rows status} {
@@ -2895,7 +3803,7 @@ proc stage2_delay::write_path_summary_sheet {path rows} {
     }
 
     set max_path_cols [expr {$max_steps > $max_through ? $max_steps : $max_through}]
-    set header [list sheet merge_status path_id source source_inst source_file line_no cmd_id original_id delay_type native_delay native_from native_through native_to final_delay "Start Point" start_sdc_delay start_from start_to]
+    set header [list e2e_id sheet merge_status path_id source source_inst source_file line_no cmd_id original_id delay_type native_delay native_from native_through native_to final_delay "Start Point" start_sdc_delay start_from start_to]
     for {set idx 1} {$idx <= $max_path_cols} {incr idx} {
         lappend header "stage_${idx}_sdc_delay"
         lappend header "stage_${idx}_from"
@@ -2909,12 +3817,12 @@ proc stage2_delay::write_path_summary_sheet {path rows} {
         lappend header "seg_${idx}_source" "seg_${idx}_inst" "seg_${idx}_cmd_id" "seg_${idx}_sdc_delay" "seg_${idx}_from" "seg_${idx}_through" "seg_${idx}_to"
     }
 
-    set fout [open $path w]
+    set fout [open_text $path w]
     csv_write_row $fout $header
     foreach item $rows {
         array set r $item
         set row {}
-        foreach key {sheet merge_status path_id source source_inst source_file line_no cmd_id original_id delay_type native_delay native_from native_through native_to final_delay final_from start_sdc_delay start_from start_to} {
+        foreach key {e2e_id sheet merge_status path_id source source_inst source_file line_no cmd_id original_id delay_type native_delay native_from native_through native_to final_delay final_from start_sdc_delay start_from start_to} {
             lappend row [summary_item_get $item $key]
         }
         set stage_delays [summary_item_get $item stage_delays {}]
@@ -2981,7 +3889,7 @@ proc stage2_delay::csv_quote {value} {
 proc stage2_delay::remaining_sdc_text {path} {
     variable consumed_segments
 
-    set fin [open $path r]
+    set fin [open_text $path r]
     set text [read $fin]
     close $fin
 
@@ -3279,11 +4187,7 @@ proc stage2_delay::run_from_user_settings {} {
 
     set top_module [global_setting TOP_MODULE_NAME ""]
     if {$top_module eq ""} {
-        if {![catch {current_design} current_top] && $current_top ne ""} {
-            set top_module $current_top
-        } else {
-            set top_module current_integration_top
-        }
+        set top_module [top_name_from_sdc_path $top_sdc]
     }
     set top_module [safe_filename_token $top_module]
 
@@ -3297,14 +4201,16 @@ proc stage2_delay::run_from_user_settings {} {
     set merge_mode [global_setting MERGE_MODE replace]
     set partial_merge_policy [global_setting PARTIAL_MERGE_POLICY residual_through]
     set unmatched_harden_policy [global_setting UNMATCHED_HARDEN_POLICY review]
-    set allow_through [global_setting ALLOW_THROUGH true]
+    set top_open_from_mode [global_setting TOP_OPEN_FROM_MODE enumerate_static_startpoints]
+    set allow_through [global_setting ALLOW_THROUGH false]
     set top_port_boundary_map_mode [global_setting TOP_PORT_BOUNDARY_MAP_MODE connectivity]
     set recursive_chain_mode [global_setting RECURSIVE_CHAIN_MODE auto]
     set max_chain_depth [global_setting MAX_CHAIN_DEPTH 6]
     set max_endpoints [global_setting MAX_ENDPOINTS 1000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
-    set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY false]
+    set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY true]
     set write_path_summary [global_setting WRITE_PATH_SUMMARY true]
+    set text_encoding [global_setting STAGE2_TEXT_ENCODING utf-8]
 
     foreach required_file [list $top_sdc $harden_list] {
         if {![file exists $required_file]} {
@@ -3326,11 +4232,13 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting OUT_FINAL_SDC $out_final_sdc
     set_global_setting OUT_SUMMARY_DIR $out_summary_dir
     set_global_setting TOP_MODULE_NAME $top_module
+    set_global_setting TOP_OPEN_FROM_MODE $top_open_from_mode
     set_global_setting TOP_PORT_BOUNDARY_MAP_MODE $top_port_boundary_map_mode
     set_global_setting RECURSIVE_CHAIN_MODE $recursive_chain_mode
     set_global_setting MAX_CHAIN_DEPTH $max_chain_depth
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
+    set_global_setting STAGE2_TEXT_ENCODING $text_encoding
 
     puts "INFO: Stage 2 script      : [global_setting STAGE2_SCRIPT_FILE run_stage2_merge_delay.tcl]"
     puts "INFO: Run directory       : $run_dir"
@@ -3341,9 +4249,11 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Path summary dir    : $out_summary_dir"
     puts "INFO: Write path summary  : $write_path_summary"
     puts "INFO: Merge mode          : $merge_mode"
+    puts "INFO: Top open_from mode  : $top_open_from_mode"
     puts "INFO: Top port map mode   : $top_port_boundary_map_mode"
     puts "INFO: Recursive mode      : $recursive_chain_mode"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
+    puts "INFO: Text encoding       : $text_encoding"
 
     stage2_delay::build \
         -top_sdc $top_sdc \
@@ -3357,11 +4267,13 @@ proc stage2_delay::run_from_user_settings {} {
         -merge_mode $merge_mode \
         -partial_merge_policy $partial_merge_policy \
         -unmatched_harden_policy $unmatched_harden_policy \
+        -top_open_from_mode $top_open_from_mode \
         -top_port_boundary_map_mode $top_port_boundary_map_mode \
         -recursive_chain_mode $recursive_chain_mode \
         -max_chain_depth $max_chain_depth \
         -verbose_pt_query $verbose_pt_query \
         -write_path_summary $write_path_summary \
+        -text_encoding $text_encoding \
         -allow_through $allow_through \
         -max_endpoints $max_endpoints \
         -max_enum_objects $max_enum_objects

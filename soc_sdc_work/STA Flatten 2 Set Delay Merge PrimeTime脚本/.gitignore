@@ -7,3 +7,4 @@ demo_case/basic/integration_delay_merge.rpt
 demo_case/basic/merged_delay_removed.sdc
 demo_case/basic/unmerged_delay_review.rpt
 demo_case/basic/*_flatten.sdc
+demo_case/*/*.xlsx
