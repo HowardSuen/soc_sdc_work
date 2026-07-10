@@ -39,7 +39,7 @@ run_stage2_report.py
 进入 Stage 1 脚本目录：
 
 ```bash
-cd "STA Flatten 1 Harden DC SDC Clean 脚本"
+cd "Flatten SDC脚本/STA Flatten 1 Harden DC SDC Clean 脚本"
 ```
 
 执行 harden SDC 提纯：
@@ -181,7 +181,7 @@ sizeof_collection [get_pins -quiet {u_soc/u_ucie_uaxi_top/*}]
 打开：
 
 ```text
-scripts/run_stage2_merge_delay.tcl
+Flatten SDC脚本/STA Flatten 2 Set Delay Merge PrimeTime脚本/run_stage2_merge_delay.tcl
 ```
 
 当前 v0.8.9 中重点配置位于 L31、L37、L41 附近。升级脚本后行号可能变化，
@@ -227,7 +227,7 @@ aie_top.sdc -> aie_top_flatten.sdc
 确认当前 PT session 是干净环境后执行：
 
 ```tcl
-source {/abs/path/to/scripts/run_stage2_merge_delay.tcl}
+source {/abs/path/to/Flatten SDC脚本/STA Flatten 2 Set Delay Merge PrimeTime脚本/run_stage2_merge_delay.tcl}
 ```
 
 脚本会打印作者、版本、输入路径、输出路径和 PT query 动作。等待 terminal 出现
@@ -264,7 +264,7 @@ cd /abs/path/to/pt_stage2_run
 运行：
 
 ```bash
-python3 /abs/path/to/scripts/run_stage2_report.py ./delay_path_summary
+python3 "/abs/path/to/Flatten SDC脚本/STA Flatten 2 Set Delay Merge PrimeTime脚本/run_stage2_report.py" ./delay_path_summary
 ```
 
 如果脚本就在当前目录：
