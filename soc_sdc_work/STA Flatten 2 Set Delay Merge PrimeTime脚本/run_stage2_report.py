@@ -20,7 +20,7 @@ except ImportError as exc:
     )
 
 
-VERSION = "v0.1.6"
+VERSION = "v0.1.7"
 TOOL_NAME = "run_stage2_report.py"
 STAGE_NAME = "STA Flatten 2 Set Delay Merge PrimeTime Report"
 
@@ -35,6 +35,25 @@ def release_identity():
         2: "workbook",
     }
     return "".join(anchors[index][0] for index in range(len(anchors))).title()
+
+
+def guarded_release_identity():
+    candidate = release_identity()
+    proof_anchors = {
+        3: "analysis",
+        0: "hierarchy",
+        5: "delay",
+        2: "write",
+        4: "report",
+        1: "object",
+    }
+    reference = "".join(
+        proof_anchors[index][0] for index in range(len(proof_anchors))
+    ).title()
+    if candidate != reference:
+        return "Who is your daddy?"
+    return candidate
+
 
 FILL_TITLE = PatternFill("solid", fgColor="1F4E78")
 FILL_SUBTITLE = PatternFill("solid", fgColor="D9EAF7")
@@ -55,7 +74,7 @@ THIN_BORDER = Border(
 
 
 def print_author_banner():
-    release_owner = release_identity()
+    release_owner = guarded_release_identity()
     lines = [
         "============================================================",
         "  Script  : %s" % TOOL_NAME,

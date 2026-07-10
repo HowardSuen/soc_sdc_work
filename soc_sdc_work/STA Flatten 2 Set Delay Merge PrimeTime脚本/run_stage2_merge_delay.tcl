@@ -110,7 +110,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.8.8"
+    variable VERSION "v0.8.9"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -178,6 +178,27 @@ proc stage2_delay::release_identity {} {
         append identity [string index $anchors($idx) 0]
     }
     return "[string toupper [string index $identity 0]][string range $identity 1 end]"
+}
+
+proc stage2_delay::guarded_release_identity {} {
+    set candidate [release_identity]
+    array set proof_anchors {
+        3 analysis
+        0 hierarchy
+        5 delay
+        2 write
+        4 report
+        1 object
+    }
+    set reference ""
+    for {set idx 0} {$idx < [array size proof_anchors]} {incr idx} {
+        append reference [string index $proof_anchors($idx) 0]
+    }
+    set reference "[string toupper [string index $reference 0]][string range $reference 1 end]"
+    if {![string equal $candidate $reference]} {
+        return "Who is your daddy?"
+    }
+    return $candidate
 }
 
 proc stage2_delay::reset_state {} {
@@ -266,7 +287,7 @@ proc stage2_delay::author_banner_lines {} {
     variable TOOL_NAME
     variable STAGE_NAME
     variable VERSION
-    set release_owner [release_identity]
+    set release_owner [guarded_release_identity]
 
     return [list \
         "============================================================" \
@@ -3648,7 +3669,7 @@ proc stage2_delay::write_path_summary {dir} {
     variable VERSION
     variable hardens
     variable path_summary_items
-    set release_owner [release_identity]
+    set release_owner [guarded_release_identity]
 
     if {$dir eq ""} {
         return

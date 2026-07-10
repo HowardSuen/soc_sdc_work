@@ -8,7 +8,9 @@ parsing, matching, reporting, and static SDC emission deterministic.
 
 from __future__ import print_function
 
+import contextlib
 import importlib.util
+import io
 import os
 import shutil
 import subprocess
@@ -209,6 +211,7 @@ def require_ok(result):
 
 def test_release_identity_is_reconstructed_without_plaintext_constant():
     expected = "".join(chr(code) for code in (72, 111, 119, 97, 114, 100))
+    tamper_message = "Who is your daddy?"
     assert_not_contains(TOOL, expected)
     assert_not_contains(REPORT_TOOL, expected)
 
@@ -217,11 +220,29 @@ def test_release_identity_is_reconstructed_without_plaintext_constant():
     module_spec.loader.exec_module(report_module)
     if report_module.release_identity() != expected:
         raise AssertionError("Unexpected reconstructed Python release identity")
+    if report_module.guarded_release_identity() != expected:
+        raise AssertionError("Unexpected guarded Python release identity")
+    original_release_identity = report_module.release_identity
+    report_module.release_identity = lambda: "Somebody"
+    if report_module.guarded_release_identity() != tamper_message:
+        raise AssertionError("Python identity guard did not detect tampering")
+    captured_banner = io.StringIO()
+    with contextlib.redirect_stdout(captured_banner):
+        report_module.print_author_banner()
+    if "  Author  : %s" % tamper_message not in captured_banner.getvalue():
+        raise AssertionError("Python final author banner did not expose tampering")
+    report_module.release_identity = original_release_identity
 
     driver = os.path.join(WORK, "release_identity.tcl")
     write_file(
         driver,
-        'set ::STAGE2_AUTO_RUN false\nsource "%s"\nputs [stage2_delay::release_identity]\n'
+        'set ::STAGE2_AUTO_RUN false\n'
+        'source "%s"\n'
+        'puts [stage2_delay::release_identity]\n'
+        'puts [stage2_delay::guarded_release_identity]\n'
+        'rename stage2_delay::release_identity stage2_delay::original_release_identity\n'
+        'proc stage2_delay::release_identity {} {return Somebody}\n'
+        'puts [lindex [stage2_delay::author_banner_lines] 3]\n'
         % TOOL.replace("\\", "/"),
     )
     proc = subprocess.Popen(
@@ -236,8 +257,9 @@ def test_release_identity_is_reconstructed_without_plaintext_constant():
             "identity reconstruction failed\nstdout=%s\nstderr=%s"
             % (stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
         )
-    if stdout.decode("utf-8", "replace").strip() != expected:
-        raise AssertionError("Unexpected reconstructed release identity")
+    identity_lines = stdout.decode("utf-8", "replace").strip().splitlines()
+    if identity_lines != [expected, expected, "  Author  : %s" % tamper_message]:
+        raise AssertionError("Unexpected Tcl identity guard output: %s" % identity_lines)
 
 
 def test_complete_complete_merge():
