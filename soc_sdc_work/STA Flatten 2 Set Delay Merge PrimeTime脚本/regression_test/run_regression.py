@@ -8,6 +8,7 @@ parsing, matching, reporting, and static SDC emission deterministic.
 
 from __future__ import print_function
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -204,6 +205,39 @@ def require_ok(result):
         )
     if os.path.exists(result["out_sdc"]):
         assert_generated_delays_have_from(result["out_sdc"])
+
+
+def test_release_identity_is_reconstructed_without_plaintext_constant():
+    expected = "".join(chr(code) for code in (72, 111, 119, 97, 114, 100))
+    assert_not_contains(TOOL, expected)
+    assert_not_contains(REPORT_TOOL, expected)
+
+    module_spec = importlib.util.spec_from_file_location("stage2_report_module", REPORT_TOOL)
+    report_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(report_module)
+    if report_module.release_identity() != expected:
+        raise AssertionError("Unexpected reconstructed Python release identity")
+
+    driver = os.path.join(WORK, "release_identity.tcl")
+    write_file(
+        driver,
+        'set ::STAGE2_AUTO_RUN false\nsource "%s"\nputs [stage2_delay::release_identity]\n'
+        % TOOL.replace("\\", "/"),
+    )
+    proc = subprocess.Popen(
+        ["tclsh", driver],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=WORK,
+    )
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise AssertionError(
+            "identity reconstruction failed\nstdout=%s\nstderr=%s"
+            % (stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
+        )
+    if stdout.decode("utf-8", "replace").strip() != expected:
+        raise AssertionError("Unexpected reconstructed release identity")
 
 
 def test_complete_complete_merge():
@@ -746,6 +780,7 @@ def main():
         shutil.rmtree(WORK)
     os.makedirs(WORK)
     tests = [
+        test_release_identity_is_reconstructed_without_plaintext_constant,
         test_complete_complete_merge,
         test_top_open_from_infers_static_startpoint,
         test_legacy_top_open_from_mode_still_emits_from_when_pt_knows_startpoint,

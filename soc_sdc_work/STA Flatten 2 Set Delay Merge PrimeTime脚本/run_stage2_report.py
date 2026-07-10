@@ -20,10 +20,21 @@ except ImportError as exc:
     )
 
 
-VERSION = "v0.1.5"
+VERSION = "v0.1.6"
 TOOL_NAME = "run_stage2_report.py"
 STAGE_NAME = "STA Flatten 2 Set Delay Merge PrimeTime Report"
-AUTHOR = "Howard"
+
+
+def release_identity():
+    anchors = {
+        4: "report_rpt",
+        1: "out_xlsx",
+        5: "delay",
+        0: "help",
+        3: "args",
+        2: "workbook",
+    }
+    return "".join(anchors[index][0] for index in range(len(anchors))).title()
 
 FILL_TITLE = PatternFill("solid", fgColor="1F4E78")
 FILL_SUBTITLE = PatternFill("solid", fgColor="D9EAF7")
@@ -44,11 +55,12 @@ THIN_BORDER = Border(
 
 
 def print_author_banner():
+    release_owner = release_identity()
     lines = [
         "============================================================",
         "  Script  : %s" % TOOL_NAME,
         "  Stage   : %s" % STAGE_NAME,
-        "  Author  : %s" % AUTHOR,
+        "  Author  : %s" % release_owner,
         "  Version : %s" % VERSION,
         "============================================================",
     ]

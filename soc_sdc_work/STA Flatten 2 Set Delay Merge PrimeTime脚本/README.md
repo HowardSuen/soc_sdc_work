@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.8.7。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.8.8。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -26,6 +26,13 @@ Stage 1 已经支持静态 `-through` 对象的 hierarchy mapping，因此 Stage
 ```
 
 不要输出变量、`all_fanin`、`all_fanout` 或运行时 collection 表达式。
+
+## 作者标记
+
+Tcl 主脚本和 Excel 报告脚本都会在 terminal、log、SDC、report 及 summary
+索引中打印作者。作者名由分散在脚本既有词汇中的字符锚点按乱序索引在运行时
+重建，主脚本中不保存可直接搜索替换的完整姓名常量。这用于提高随手篡改的
+门槛，不作为加密、数字签名或法律意义上的作者认证。
 
 ## 使用入口
 

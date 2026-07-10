@@ -110,10 +110,9 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.8.7"
+    variable VERSION "v0.8.8"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
-    variable AUTHOR "Howard"
 
     variable options
     variable hardens
@@ -163,6 +162,22 @@ namespace eval stage2_delay {
         -write_path_summary "true"
         -text_encoding "utf-8"
     }
+}
+
+proc stage2_delay::release_identity {} {
+    array set anchors {
+        4 recursive_chain_mode
+        1 options
+        5 debug
+        0 hardens
+        3 allow_through
+        2 write_path_summary
+    }
+    set identity ""
+    for {set idx 0} {$idx < [array size anchors]} {incr idx} {
+        append identity [string index $anchors($idx) 0]
+    }
+    return "[string toupper [string index $identity 0]][string range $identity 1 end]"
 }
 
 proc stage2_delay::reset_state {} {
@@ -250,14 +265,14 @@ proc stage2_delay::build {args} {
 proc stage2_delay::author_banner_lines {} {
     variable TOOL_NAME
     variable STAGE_NAME
-    variable AUTHOR
     variable VERSION
+    set release_owner [release_identity]
 
     return [list \
         "============================================================" \
         "  Script  : $TOOL_NAME" \
         "  Stage   : $STAGE_NAME" \
-        "  Author  : $AUTHOR" \
+        "  Author  : $release_owner" \
         "  Version : $VERSION" \
         "============================================================" \
     ]
@@ -3631,9 +3646,9 @@ proc stage2_delay::write_final_section_header {file_handle title source} {
 proc stage2_delay::write_path_summary {dir} {
     variable TOOL_NAME
     variable VERSION
-    variable AUTHOR
     variable hardens
     variable path_summary_items
+    set release_owner [release_identity]
 
     if {$dir eq ""} {
         return
@@ -3699,7 +3714,7 @@ proc stage2_delay::write_path_summary {dir} {
         csv_write_row $fout [list \
             $TOOL_NAME \
             $VERSION \
-            $AUTHOR \
+            $release_owner \
             $sheet \
             $sheet_file($sheet) \
             [llength $rows] \
