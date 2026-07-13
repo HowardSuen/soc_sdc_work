@@ -1,6 +1,28 @@
 # 04_soc_io_pads.sdc Rules
 
+本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。`--run-root` target runtime 已实现：表单/中间状态写入 `04_middle/`，最终 SDC/report 写入 `04_result/`；未指定 `--run-root` 时继续保留 legacy cwd 兼容模式。
+
 本文档记录 `04_soc_io_pads.sdc` 的规则边界、输入来源、建议表单格式和后续脚本机制。
+
+当前 target runtime 固定读取：
+
+```text
+inputs/info_all.xlsx
+inputs/port_*.xlsx 或 inputs/ports_*.xlsx
+00_middle/connection_inventory.csv
+00_middle/scenario/<scenario>/harden_sdc_manifest.csv
+01_middle/assembled/common/clock_inventory.csv
+01_middle/assembled/<scenario>/clock_inventory.csv
+00_middle/scenario/<scenario>/pending/
+```
+
+target 运行入口：
+
+```text
+04_extract_soc_io_pads.py --run-root <run_root> --scenario <scenario>
+```
+
+CLI 显式路径参数可以覆盖固定默认值，但 resolved absolute path 必须写入 report。target 模式不扫描 cwd 猜测 harden SDC，也不把 common clock inventory 当成 scenario effective clock universe。
 
 ## 1. 目标
 
@@ -21,7 +43,7 @@
 - 下级 iobuffer/module SDC。
 - `01_soc_clocks.sdc` 中已经创建好的 clock object，包括 IO delay 使用的 virtual clock、real clock、generated/forwarded clock。
 
-04 不创建 clock。所有 `create_clock` / `create_generated_clock`，包括 virtual clock，都归属 `01_soc_clocks.sdc`。
+04 不创建 clock。所有供 SoC 层级引用的 `create_clock` / `create_generated_clock`，包括 SoC IO virtual clock，都归属 `01_soc_clocks.sdc`；harden internal/private clock 不属于 04，也不因此提升到 01。
 
 ## 2. 放什么
 
@@ -107,6 +129,17 @@ set_max_capacitance
 - 是内部实现保护或临时 exception，不应进入 SoC 04。
 
 因此，从下级 SDC 提取到的约束默认只作为候选记录；是否最终生成，由表单中的 `apply` / `review_status` 决定。
+
+#### 3.2.1 下级 SDC 缺失时
+
+04 默认允许部分 iobuffer/module SDC 未交付。脚本只扫描 harden-SDC manifest 中 `available` 的文件；`missing` 对象的 pad/port 仍根据 SoC 集成表单进入 `pad_inventory`，但 extraction 状态标记为 `missing_sdc` / `incomplete_evidence`。
+
+- 不能因未扫描到下级 SDC 就自动判定该 pad 没有 delay/load/driver/false-path 约束。
+- 依赖下级 SDC 证据的 candidate 保持 pending，不消账。
+- 若人工 IO 表单已给出不依赖缺失 SDC 的完整 approved 约束和 basis，04 可以正常生成并消账。
+- coverage/report 必须区分 `missing because SDC not delivered` 和 `available SDC scanned but constraint not found`。
+
+partial mode 下其它 available harden 继续生成；`--require-complete-harden-sdc` 开启后 missing 才全局阻断。
 
 ### 3.3 人工 IO 约束表单
 
@@ -269,6 +302,8 @@ config
 
 04 采用 common + scenario 叠加模型。
 
+04 中所有 `clock_name` / virtual clock / source-synchronous clock 检查必须使用 01 assembled inventory。common 行使用 `01_middle/assembled/common/clock_inventory.csv`；scenario 行使用 `01_middle/assembled/<scenario>/clock_inventory.csv`。不得只读 common inventory 生成 scenario-specific IO 约束，也不得由 04 自行合并 common/scenario clock。legacy cwd 模式继续接受 `--input` + optional `--scenario-input`，只用于旧流程兼容。
+
 输出建议：
 
 ```text
@@ -349,18 +384,20 @@ coverage report 也应按 assembled view 输出，而不是只基于静态 pad i
 
 ### 7.3 Pending 消账
 
-04 完成生成后可以从 `00_harden_port_inventory/pending/*.ports` 删除已被 04 覆盖的 pad-related harden port，并写入：
+04 完成生成后可以从 target runtime 的 `00_middle/scenario/<scenario>/pending/*.ports` 删除已被 04 覆盖的 pad-related harden port，并写入：
 
 ```text
-00_harden_port_inventory/removed_log/04_soc_io_pads.removed
+04_middle/scenario/<scenario>/removed_log/04_soc_io_pads.removed
 ```
 
-脚本默认可提供：
+legacy cwd 兼容模式仍使用：
 
 ```text
 --pending-root 00_harden_port_inventory
 --no-update-pending
 ```
+
+target 模式默认不需要传 `--pending-root`；该参数只用于显式覆盖 00 pending root。`--no-update-pending` 在两种模式下都可用。
 
 删除规则：
 
@@ -423,6 +460,7 @@ unit_time
 unit_cap
 extra_options
 source_type
+source_sdc_status
 source_sdc_file
 source_line
 source_digest
@@ -468,6 +506,7 @@ unit_time         原始约束时间单位，例如 ns；用于检查与 SoC flo
 unit_cap          原始约束电容单位，例如 pF；用于检查与 SoC flow 单位一致
 extra_options     只放暂未结构化支持的额外 SDC 选项；不能承载已定义字段的语义
 source_type       extracted / manual / na
+source_sdc_status available / missing / not_required；manual 行可为 not_required
 source_sdc_file   从下级 SDC 提取时的原始文件
 source_line       从下级 SDC 提取时的原始行号
 source_digest     原始 SDC 文件 hash/digest；用于判断重抽后记录是否失效
@@ -508,6 +547,7 @@ note
 
 ```text
 source_sdc_file
+source_sdc_status
 source_line
 command_type
 original_command
@@ -637,7 +677,7 @@ set_dont_touch_network [get_nets {pad_uart0_sout}]
 - 集成表单中的 `subsys_port` / top pad 不是 canonical scalar 或 bit key，例如出现 bus/range/pattern，或 width 为多 bit 却未按 bit 展开。
 - `apply = yes` 且 `review_status = approved` 的当前输出行无法生成任何 SDC 命令，例如 `false_path` 既无 `rewritten_command` 也无 `set_false_path` 原始命令，或电气约束缺少 `value`。
 - `constraint_type = input_delay/output_delay` 但 `clock_name` 为空。
-- `clock_name` 不存在于 `01_soc_clocks` 输出的 `clock_inventory.csv` 或对应 scenario clock inventory。
+- `clock_name` 不存在于 `01_middle/assembled/<scenario>/clock_inventory.csv`。
 - `scenario = common` 的 04 约束引用了 scenario-only clock；common 04 只能引用 common 01 中创建的 clock。
 - scenario 04 引用 scenario-only clock 时，没有对应 scenario clock inventory 证据。
 - `timing_class = timed` 但既没有 input/output delay，也没有明确说明该接口由其它机制约束。
@@ -687,8 +727,8 @@ set_dont_touch_network [get_nets {pad_uart0_sout}]
 04 只引用已经由 01 或 scenario clock overlay 创建好的 clock。
 
 - IO virtual clock 必须在 01 创建。
-- common 04 中的 delay 只能引用 common 01 `clock_inventory.csv` 中存在的 clock。
-- scenario 04 中的 delay 可以引用 common 01 clock，也可以引用该 scenario clock overlay 产生的 scenario clock inventory。
+- common 04 中的 delay 只能引用 `01_middle/assembled/common/clock_inventory.csv` 中存在的 clock。
+- scenario 04 中的 delay 可以引用 common clock，也可以引用该 scenario overlay clock，但统一通过 `01_middle/assembled/<scenario>/clock_inventory.csv` 查询。
 - 如果某条 IO delay 引用 scenario-only clock，该约束必须下沉到对应 scenario 04，不能放在 common 04。
 - 04 不扫描其它 SDC 创建 clock，也不在本文件补 create_clock。
 

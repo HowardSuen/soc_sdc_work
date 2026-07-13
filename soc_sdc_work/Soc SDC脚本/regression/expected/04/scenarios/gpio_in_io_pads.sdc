@@ -1,4 +1,12 @@
 ################################################################################
+# Author: Howard
+# Stage: 04_soc_io_pads
+# Script: 04_extract_soc_io_pads.py
+# Run completeness: complete
+# Available harden SDC: 1
+# Missing harden SDC: 0
+# Not-required harden SDC: 0
+# Missing instances: <none>
 # Auto-generated SoC IO/pad constraints for scenario: gpio_in, stage: all, corner: all, tool: sta
 # Source: 04_soc_io_pads.xlsx io_constraints sheet
 # Only apply=yes and review_status=approved rows are emitted.

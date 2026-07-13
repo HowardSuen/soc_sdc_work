@@ -4,7 +4,8 @@ Generate 04 SoC IO/pad SDC and review reports from integration spreadsheets,
 lower-level iobuffer/module SDC files, and a reviewed IO constraint workbook.
 
 Current scope:
-  * all xlsx and SDC inputs live in the command execution directory
+  * --run-root uses fixed inputs/00_middle/01_middle/04_middle/04_result paths
+  * legacy cwd mode remains available for existing flows
   * first run creates/synchronizes 04_soc_io_pads.xlsx, then stops for review
   * only apply=yes + review_status=approved rows are emitted
   * scenario/stage/corner-specific generation is supported
@@ -13,6 +14,7 @@ Current scope:
 import argparse
 import csv
 import hashlib
+import os
 import re
 import sys
 from collections import defaultdict
@@ -106,6 +108,7 @@ STAGES = {"all", "synth", "prects", "postcts", "postroute"}
 APPLY_VALUES = {"", "yes", "no"}
 REVIEW_STATUS_VALUES = {"", "pending", "approved", "rejected"}
 SOURCE_TYPES = {"", "extracted", "manual", "na"}
+SOURCE_SDC_STATUS_VALUES = {"", "available", "missing", "not_required"}
 TOOLS = {"sta", "synth", "both"}
 ACTIVE_01_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
 PORT_BIT_RE = re.compile(r"^[^\s\[\]]+(?:\[\d+\])?$")
@@ -163,6 +166,7 @@ IO_HEADERS = [
     "unit_cap",
     "extra_options",
     "source_type",
+    "source_sdc_status",
     "source_sdc_file",
     "source_line",
     "source_digest",
@@ -184,11 +188,13 @@ PAD_HEADERS = [
     "direction_from_integration",
     "is_gpio_or_inout",
     "related_scenarios",
+    "source_sdc_status",
     "note",
 ]
 
 LOG_HEADERS = [
     "source_sdc_file",
+    "source_sdc_status",
     "source_line",
     "command_type",
     "original_command",
@@ -231,6 +237,8 @@ class InstInfo:
     file_path: str = ""
     sdc_hint: str = ""
     sdc_path: Optional[Path] = None
+    sdc_status: str = ""
+    sdc_note: str = ""
     inputs: Dict[str, PortInfo] = field(default_factory=dict)
     outputs: Dict[str, PortInfo] = field(default_factory=dict)
     inouts: Dict[str, PortInfo] = field(default_factory=dict)
@@ -251,6 +259,7 @@ class PadRecord:
     direction: str
     is_gpio_or_inout: str = "no"
     related_scenarios: str = ""
+    source_sdc_status: str = ""
     note: str = ""
 
 
@@ -279,6 +288,50 @@ class ClockInfo:
     producer_object: str = ""
     final_action: str = ""
     source_file: str = ""
+
+
+@dataclass
+class HardenSdcManifestEntry:
+    scenario: str
+    inst_name: str
+    module_name: str
+    sdc_path: str
+    availability_status: str
+    note: str
+    source_row: int
+
+
+@dataclass
+class RunCompleteness:
+    status: str
+    available_instances: List[str] = field(default_factory=list)
+    missing_instances: List[str] = field(default_factory=list)
+    not_required_instances: List[str] = field(default_factory=list)
+    manifest_path: str = ""
+
+    @property
+    def available_count(self) -> int:
+        return len(self.available_instances)
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_instances)
+
+    @property
+    def not_required_count(self) -> int:
+        return len(self.not_required_instances)
+
+
+@dataclass(frozen=True)
+class ConnectionEdge:
+    connection_id: str
+    src_instance: str
+    src_direction: str
+    src_port: str
+    dst_instance: str
+    dst_direction: str
+    dst_port: str
+    validation_status: str = ""
 
 
 @dataclass
@@ -311,6 +364,44 @@ class Report:
     def error(self, msg: str) -> None:
         self.error_count += 1
         self.lines.append(f"ERROR: {msg}")
+
+
+def _author_part_a() -> str:
+    return chr(72) + chr(111)
+
+
+def _author_part_b() -> str:
+    return chr(119) + chr(97)
+
+
+def _author_part_c() -> str:
+    return chr(114) + chr(100)
+
+
+def author_name() -> str:
+    return _author_part_a() + _author_part_b() + _author_part_c()
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(text, encoding=encoding)
+        os.replace(str(tmp_path), str(path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def atomic_save_workbook(wb: Workbook, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.stem}.tmp.{os.getpid()}{path.suffix}")
+    try:
+        wb.save(tmp_path)
+        os.replace(str(tmp_path), str(path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def clean_cell(value) -> str:
@@ -531,7 +622,137 @@ def attach_port_data(instances: Dict[str, InstInfo], sheets: Dict[str, Dict[str,
         inst.inouts = data["inouts"]
 
 
-def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> None:
+def resolve_manifest_path(run_root: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else run_root / path
+
+
+def apply_harden_sdc_manifest(
+    instances: Dict[str, InstInfo],
+    manifest_path: Path,
+    run_root: Path,
+    scenario: str,
+    require_complete: bool,
+    report: Report,
+) -> RunCompleteness:
+    error_count_before = report.error_count
+    if not manifest_path.is_file():
+        report.error(f"{manifest_path}: HARDEN_SDC_MANIFEST_MISSING: required target runtime manifest is absent")
+        return RunCompleteness(status="invalid", manifest_path=str(manifest_path.resolve()))
+
+    required_fields = {"scenario", "inst_name", "module_name", "availability_status"}
+    entries: Dict[str, HardenSdcManifestEntry] = {}
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fields = set(reader.fieldnames or [])
+        missing_fields = sorted(required_fields - fields)
+        if missing_fields:
+            report.error(
+                f"{manifest_path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing field(s): {', '.join(missing_fields)}"
+            )
+        if "sdc_path" not in fields and "resolved_sdc_path" not in fields:
+            report.error(f"{manifest_path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing sdc_path")
+        for row_idx, row in enumerate(reader, start=2):
+            row_scenario = clean_cell(row.get("scenario"))
+            inst_name = clean_cell(row.get("inst_name"))
+            if not inst_name:
+                report.error(f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_EMPTY_INSTANCE")
+                continue
+            if row_scenario != scenario:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_SCENARIO_MISMATCH: "
+                    f"row scenario={row_scenario or '<empty>'}, requested={scenario}"
+                )
+                continue
+            if inst_name in entries:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_DUPLICATE_INSTANCE: {inst_name}"
+                )
+                continue
+            entries[inst_name] = HardenSdcManifestEntry(
+                scenario=row_scenario,
+                inst_name=inst_name,
+                module_name=clean_cell(row.get("module_name")),
+                sdc_path=clean_cell(row.get("sdc_path")) or clean_cell(row.get("resolved_sdc_path")),
+                availability_status=normalize_key(row.get("availability_status")),
+                note=clean_cell(row.get("note")),
+                source_row=row_idx,
+            )
+
+    for inst_name in sorted(set(entries) - set(instances)):
+        report.error(
+            f"{manifest_path.name} row {entries[inst_name].source_row}: "
+            f"HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: {inst_name}"
+        )
+
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    for inst_name in sorted(instances):
+        inst = instances[inst_name]
+        entry = entries.get(inst_name)
+        if entry is None:
+            report.error(f"{manifest_path.name}: HARDEN_SDC_MANIFEST_INSTANCE_MISSING: {inst_name}")
+            inst.sdc_status = "missing"
+            missing.append(inst_name)
+            continue
+        if entry.module_name and entry.module_name != inst.module_name:
+            report.error(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_MODULE_MISMATCH: "
+                f"{inst_name} workbook={inst.module_name} manifest={entry.module_name}"
+            )
+        inst.sdc_status = entry.availability_status
+        inst.sdc_note = entry.note
+        if entry.availability_status == "available":
+            if not entry.sdc_path:
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_AVAILABLE_PATH_EMPTY: {inst_name}"
+                )
+                continue
+            sdc_path = resolve_manifest_path(run_root, entry.sdc_path)
+            if not sdc_path.is_file():
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_AVAILABLE_FILE_MISSING: "
+                    f"{inst_name} -> {sdc_path}"
+                )
+                continue
+            inst.sdc_path = sdc_path
+            available.append(inst_name)
+            report.info(f"manifest selected {inst_name}: status=available path={sdc_path.resolve()}")
+        elif entry.availability_status == "missing":
+            missing.append(inst_name)
+            report.warn(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MISSING: "
+                f"{inst_name}: {entry.note or '<no note>'}"
+            )
+        elif entry.availability_status == "not_required":
+            not_required.append(inst_name)
+            report.info(f"manifest marks {inst_name} as not_required: {entry.note or '<no note>'}")
+        else:
+            report.error(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_STATUS_INVALID: "
+                f"{inst_name} status={entry.availability_status or '<empty>'}"
+            )
+
+    strict_error = bool(require_complete and missing)
+    if strict_error:
+        report.error(
+            "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): " + ", ".join(missing)
+        )
+    status = "partial" if missing else "complete"
+    manifest_error_count = report.error_count - error_count_before - (1 if strict_error else 0)
+    if manifest_error_count:
+        status = "invalid"
+    return RunCompleteness(
+        status=status,
+        available_instances=available,
+        missing_instances=missing,
+        not_required_instances=not_required,
+        manifest_path=str(manifest_path.resolve()),
+    )
+
+
+def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> RunCompleteness:
     all_sdcs = sorted(path for path in cwd.glob("*.sdc") if path.is_file())
     by_name = {path.name: path for path in all_sdcs}
     by_lower = {path.name.lower(): path for path in all_sdcs}
@@ -562,14 +783,89 @@ def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report)
                 unique.append(path)
         if len(unique) == 1:
             inst.sdc_path = unique[0]
+            inst.sdc_status = "available"
         elif len(unique) > 1:
             inst.sdc_path = unique[0]
+            inst.sdc_status = "available"
             report.warn(
                 f"multiple SDC candidates for {inst.inst_name}: "
                 f"{', '.join(path.name for path in unique)}; using {inst.sdc_path.name}"
             )
         else:
+            inst.sdc_status = "missing"
             report.warn(f"no SDC found for {inst.inst_name}; tried: {', '.join(candidates)}")
+
+    available = sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "available")
+    missing = sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "missing")
+    return RunCompleteness(
+        status="partial" if missing else "complete",
+        available_instances=available,
+        missing_instances=missing,
+    )
+
+
+def read_connection_inventory(path: Path, report: Report) -> List[ConnectionEdge]:
+    edges: List[ConnectionEdge] = []
+    required = {
+        "connection_id", "src_instance", "src_direction", "src_port",
+        "dst_instance", "dst_direction", "dst_port",
+    }
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fields = set(reader.fieldnames or [])
+        missing = sorted(required - fields)
+        if missing:
+            report.error(f"{path}: CONNECTION_INVENTORY_SCHEMA_ERROR: missing field(s): {', '.join(missing)}")
+            return edges
+        seen_ids: Set[str] = set()
+        for row_idx, row in enumerate(reader, start=2):
+            connection_id = clean_cell(row.get("connection_id"))
+            if not connection_id:
+                report.error(f"{path.name} row {row_idx}: CONNECTION_ID_EMPTY")
+                continue
+            if connection_id in seen_ids:
+                report.error(f"{path.name} row {row_idx}: CONNECTION_ID_DUPLICATE: {connection_id}")
+                continue
+            seen_ids.add(connection_id)
+            edge = ConnectionEdge(
+                connection_id=connection_id,
+                src_instance=clean_cell(row.get("src_instance")),
+                src_direction=normalize_key(row.get("src_direction")),
+                src_port=clean_cell(row.get("src_port")),
+                dst_instance=clean_cell(row.get("dst_instance")),
+                dst_direction=normalize_key(row.get("dst_direction")),
+                dst_port=clean_cell(row.get("dst_port")),
+                validation_status=normalize_key(row.get("validation_status")),
+            )
+            if edge.validation_status and edge.validation_status != "matched":
+                report.error(
+                    f"{path.name} row {row_idx}: CONNECTION_NOT_MATCHED: "
+                    f"{connection_id} status={edge.validation_status}"
+                )
+            edges.append(edge)
+    report.info(f"loaded {len(edges)} connection edge(s) from {path}")
+    return edges
+
+
+def validate_pad_connections(pads: Sequence[PadRecord], edges: Sequence[ConnectionEdge], report: Report) -> None:
+    edge_keys = {
+        (
+            edge.src_instance, edge.src_direction, edge.src_port,
+            edge.dst_instance, edge.dst_direction, edge.dst_port,
+        )
+        for edge in edges
+    }
+    for pad in pads:
+        input_key = ("top", "input", pad.pad_name, pad.subsys_instance, "input", pad.subsys_port)
+        output_key = (pad.subsys_instance, "output", pad.subsys_port, "top", "output", pad.pad_name)
+        matched = input_key in edge_keys if pad.direction == "input" else output_key in edge_keys
+        if pad.direction == "inout":
+            matched = input_key in edge_keys or output_key in edge_keys
+        if not matched:
+            report.error(
+                "PAD_CONNECTION_INVENTORY_MISSING: "
+                f"{pad.pad_name} <-> {pad.subsys_instance}:{pad.direction}:{pad.subsys_port}"
+            )
 
 
 def read_text(path: Path) -> str:
@@ -860,14 +1156,25 @@ def build_pad_records(instances: Dict[str, InstInfo]) -> List[PadRecord]:
         for port in inst.inputs.values():
             top = top_port_from_connection(port.from_whom)
             if top:
-                add(PadRecord(top, top, inst.inst_name, port.name, "input"))
+                add(PadRecord(top, top, inst.inst_name, port.name, "input", source_sdc_status=inst.sdc_status))
         for port in inst.outputs.values():
             top = clean_top_name(port.to_top)
             if top:
-                add(PadRecord(top, top, inst.inst_name, port.name, "output"))
+                add(PadRecord(top, top, inst.inst_name, port.name, "output", source_sdc_status=inst.sdc_status))
         for port in inst.inouts.values():
             top = clean_top_name(port.inout_name) or top_port_from_connection(port.connectivity) or port.name
-            add(PadRecord(top, top, inst.inst_name, port.name, "inout", "yes", "gpio_in,gpio_out"))
+            add(
+                PadRecord(
+                    top,
+                    top,
+                    inst.inst_name,
+                    port.name,
+                    "inout",
+                    "yes",
+                    "gpio_in,gpio_out",
+                    inst.sdc_status,
+                )
+            )
     return records
 
 
@@ -1094,7 +1401,7 @@ def all_non_clock_collections(tokens: Sequence[str]) -> List[Tuple[str, List[str
     return result
 
 
-def extract_constraints_from_instance(inst: InstInfo, report: Report) -> List[ExtractedConstraint]:
+def extract_constraints_from_instance(inst: InstInfo, scenario: str, report: Report) -> List[ExtractedConstraint]:
     if not inst.sdc_path:
         return []
     try:
@@ -1120,11 +1427,12 @@ def extract_constraints_from_instance(inst: InstInfo, report: Report) -> List[Ex
         values = {header: "" for header in IO_HEADERS}
         values.update(
             {
-                "scenario": "common",
+                "scenario": scenario,
                 "stage": "all",
                 "corner": "all",
                 "constraint_type": ctype,
                 "source_type": "extracted",
+                "source_sdc_status": "available",
                 "source_sdc_file": inst.sdc_path.name,
                 "source_line": str(cmd.line_no),
                 "source_digest": digest,
@@ -1257,10 +1565,18 @@ def fill_command_values(values: Dict[str, str], tokens: Sequence[str], ctype: st
         values["drive_input_transition_fall"] = option_value(tokens, "-input_transition_fall")
 
 
-def read_clock_inventory(path: Path, report: Report, source_file: str = "common") -> Dict[str, ClockInfo]:
+def read_clock_inventory(
+    path: Path,
+    report: Report,
+    source_file: str = "common",
+    required: bool = False,
+) -> Dict[str, ClockInfo]:
     clocks: Dict[str, ClockInfo] = {}
     if not path.is_file():
-        report.warn(f"clock inventory not found: {path}")
+        if required:
+            report.error(f"TARGET_UPSTREAM_CLOCK_INVENTORY_MISSING: {path}")
+        else:
+            report.warn(f"clock inventory not found: {path}")
         return clocks
     with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
         reader = csv.DictReader(file_obj)
@@ -1399,7 +1715,7 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
 
     ws_pad = wb["pad_inventory"]
     existing_pads = {
-        pad_key(row_values(ws_pad, row_idx, PAD_HEADERS))
+        pad_key(row_values(ws_pad, row_idx, PAD_HEADERS)): row_idx
         for row_idx in range(2, ws_pad.max_row + 1)
         if clean_cell(ws_pad.cell(row=row_idx, column=1).value)
     }
@@ -1412,13 +1728,20 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
             "direction_from_integration": pad.direction,
             "is_gpio_or_inout": pad.is_gpio_or_inout,
             "related_scenarios": pad.related_scenarios,
+            "source_sdc_status": pad.source_sdc_status,
             "note": pad.note,
         }
         key = pad_key(values)
         if key not in existing_pads:
             append_dict(ws_pad, PAD_HEADERS, values, NEW_FILL)
-            existing_pads.add(key)
+            existing_pads[key] = ws_pad.max_row
             report.sync_changed = True
+        else:
+            row_idx = existing_pads[key]
+            status_col = header_map(ws_pad).get("source_sdc_status")
+            if status_col and clean_cell(ws_pad.cell(row_idx, status_col).value) != pad.source_sdc_status:
+                ws_pad.cell(row_idx, status_col, pad.source_sdc_status)
+                report.sync_changed = True
 
     ws_log = wb["extraction_log"]
     if ws_log.max_row > 1:
@@ -1426,6 +1749,7 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
     for item in extracted:
         values = {
             "source_sdc_file": item.values.get("source_sdc_file", ""),
+            "source_sdc_status": item.values.get("source_sdc_status", ""),
             "source_line": item.values.get("source_line", ""),
             "command_type": item.values.get("constraint_type", ""),
             "original_command": item.values.get("original_command", ""),
@@ -1436,11 +1760,29 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
             "message": item.message,
         }
         append_dict(ws_log, LOG_HEADERS, values)
+    for pad in pads:
+        if pad.source_sdc_status not in {"missing", "not_required"}:
+            continue
+        append_dict(
+            ws_log,
+            LOG_HEADERS,
+            {
+                "source_sdc_status": pad.source_sdc_status,
+                "parse_status": "incomplete_evidence" if pad.source_sdc_status == "missing" else "not_required",
+                "mapped_soc_object": get_collection("get_ports", [pad.soc_top_port]),
+                "message": (
+                    f"{pad.subsys_instance}:{pad.subsys_port} lower-level SDC is missing; "
+                    "candidate extraction remains incomplete"
+                    if pad.source_sdc_status == "missing"
+                    else f"{pad.subsys_instance}:{pad.subsys_port} lower-level SDC is not required"
+                ),
+            },
+        )
 
     add_validations(wb)
     for ws in wb.worksheets:
         style_sheet(ws)
-    wb.save(path)
+    atomic_save_workbook(wb, path)
     if report.sync_changed:
         report.info(f"synchronized workbook {path.name}; review new rows before generation")
 
@@ -1462,6 +1804,7 @@ def add_validations(wb: Workbook) -> None:
     add_list("scenario", sorted(SCENARIOS))
     add_list("stage", sorted(STAGES))
     add_list("source_type", sorted(SOURCE_TYPES))
+    add_list("source_sdc_status", sorted(SOURCE_SDC_STATUS_VALUES - {""}))
     add_list("apply", sorted(APPLY_VALUES - {""}))
     add_list("review_status", sorted(REVIEW_STATUS_VALUES - {""}))
     add_list("add_delay", ["yes", "no"])
@@ -1547,6 +1890,7 @@ def validate_rows(
         apply_value = normalize_key(values.get("apply"))
         review_status = normalize_key(values.get("review_status"))
         source_type = normalize_key(values.get("source_type"))
+        source_sdc_status = normalize_key(values.get("source_sdc_status"))
         ctype = normalize_key(values.get("constraint_type"))
         pad = clean_cell(values.get("pad_name"))
         soc_object = clean_cell(values.get("soc_object"))
@@ -1559,6 +1903,8 @@ def validate_rows(
             report.error(f"io_constraints row {row.row_idx}: invalid review_status {review_status}")
         if source_type and source_type not in SOURCE_TYPES:
             report.error(f"io_constraints row {row.row_idx}: invalid source_type {source_type}")
+        if source_sdc_status and source_sdc_status not in SOURCE_SDC_STATUS_VALUES:
+            report.error(f"io_constraints row {row.row_idx}: invalid source_sdc_status {source_sdc_status}")
 
         if apply_value == "yes":
             if not raw_scenario:
@@ -1578,7 +1924,7 @@ def validate_rows(
                     )
                 elif clock_name not in all_clocks:
                     report.error(
-                        f"io_constraints row {row.row_idx}: clock_name {clock_name} not found in common/scenario inventory"
+                        f"io_constraints row {row.row_idx}: clock_name {clock_name} not found in assembled inventory"
                     )
             if ctype in DELAY_TYPES:
                 if clean_cell(values.get("value")) and (
@@ -1759,12 +2105,27 @@ def report_path(cwd: Path, scenario: str, stage: str, corner: str) -> Path:
     return cwd / f"io_pad_check_report_{scenario}_{stage}_{safe_filename_token(corner)}.txt"
 
 
-def generate_sdc(rows: Sequence[FormRow], scenario: str, stage: str, corner: str, tool: str) -> List[str]:
+def generate_sdc(
+    rows: Sequence[FormRow],
+    scenario: str,
+    stage: str,
+    corner: str,
+    tool: str,
+    completeness: RunCompleteness,
+) -> List[str]:
     selected = [row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)]
     emitted_delay_groups: Set[Tuple[str, str, str]] = set()
 
     lines = [
         "################################################################################",
+        f"# Author: {author_name()}",
+        "# Stage: 04_soc_io_pads",
+        "# Script: 04_extract_soc_io_pads.py",
+        f"# Run completeness: {completeness.status}",
+        f"# Available harden SDC: {completeness.available_count}",
+        f"# Missing harden SDC: {completeness.missing_count}",
+        f"# Not-required harden SDC: {completeness.not_required_count}",
+        f"# Missing instances: {','.join(completeness.missing_instances) or '<none>'}",
         (
             "# Auto-generated SoC IO/pad constraints for "
             f"scenario: {scenario}, stage: {stage}, corner: {corner}, tool: {tool}"
@@ -2183,7 +2544,8 @@ def removed_log_line_04(pad: PadRecord, scenario: str, stage: str, corner: str) 
 
 def update_pending_for_04(
     cwd: Path,
-    pending_root: Path,
+    pending_dir: Path,
+    log_dir: Path,
     rows: Sequence[FormRow],
     pads: Sequence[PadRecord],
     scenario: str,
@@ -2191,7 +2553,6 @@ def update_pending_for_04(
     corner: str,
     report: Report,
 ) -> None:
-    pending_dir = pending_root / "pending"
     if not pending_dir.exists():
         return
     if not pending_dir.is_dir():
@@ -2202,7 +2563,6 @@ def update_pending_for_04(
     if not removable:
         return
 
-    log_dir = pending_root / "removed_log"
     previous_removed = read_removed_keys(log_dir)
     by_inst: Dict[str, List[PadRecord]] = defaultdict(list)
     for pad in removable:
@@ -2253,7 +2613,7 @@ def update_pending_for_04(
 
         if remove_line_indices:
             kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
-            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+            atomic_write_text(pending_file, "\n".join(kept).rstrip() + ("\n" if kept else ""))
 
     if removed_records:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -2272,7 +2632,7 @@ def update_pending_for_04(
                 existing_keys.add(key)
         if new_lines:
             log_lines = [line for line in existing_lines if line.strip()] + new_lines
-            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+            atomic_write_text(log_path, "\n".join(log_lines).rstrip() + "\n")
         try:
             display_path = log_path.relative_to(cwd)
         except ValueError:
@@ -2290,17 +2650,32 @@ def write_report(
     form_path: Path,
     output_path: Path,
     coverage_lines: Sequence[str],
+    completeness: RunCompleteness,
+    clock_inventory_paths: Sequence[Path],
+    manifest_path: Optional[Path],
+    connection_path: Optional[Path],
 ) -> None:
     lines = [
         "04_soc_io_pads extraction report",
         "================================",
         "",
+        f"Author  : {author_name()}",
+        "Stage   : 04_soc_io_pads",
+        "Script  : 04_extract_soc_io_pads.py",
         f"Scenario: {scenario}",
         f"Stage   : {stage}",
         f"Corner  : {corner}",
         f"Tool    : {tool}",
         f"Form    : {form_path}",
         f"Output  : {output_path}",
+        f"Clock inventory: {', '.join(str(path) for path in clock_inventory_paths)}",
+        f"Harden SDC manifest: {manifest_path or '<legacy inference>'}",
+        f"Connection inventory: {connection_path or '<not used>'}",
+        f"Run completeness: {completeness.status}",
+        f"Available harden SDC: {completeness.available_count}",
+        f"Missing harden SDC: {completeness.missing_count}",
+        f"Not-required harden SDC: {completeness.not_required_count}",
+        f"Missing instances: {','.join(completeness.missing_instances) or '<none>'}",
         f"Warnings: {report.warning_count}",
         f"Errors  : {report.error_count}",
         f"Sync changed: {'yes' if report.sync_changed else 'no'}",
@@ -2309,28 +2684,40 @@ def write_report(
     ]
     lines.extend(report.lines or ["INFO: no messages"])
     lines.extend(coverage_lines)
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate 04 SoC IO/pad SDC from extracted/reviewed constraints.")
+    parser.add_argument(
+        "--run-root",
+        help="target runtime root; reads inputs/00_middle/01_middle and writes 04_middle/04_result",
+    )
     parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS), help="target scenario")
     parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES), help="target stage/view")
     parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
-    parser.add_argument("-input", "--input", default="../01_soc_clocks/clock_inventory.csv", help="common 01 clock inventory CSV")
-    parser.add_argument("--scenario-input", help="optional scenario clock inventory CSV")
-    parser.add_argument("--info-all", default="info_all.xlsx", help="integration summary xlsx")
-    parser.add_argument("--form", default="04_soc_io_pads.xlsx", help="IO pad constraint workbook")
+    parser.add_argument("-input", "--input", help="common 01 assembled clock inventory CSV")
+    parser.add_argument("--scenario-input", help="scenario assembled clock inventory CSV")
+    parser.add_argument("--info-all", help="integration summary xlsx")
+    parser.add_argument("--port-files", nargs="*", help="explicit integration port workbook path(s)")
+    parser.add_argument("--form", help="IO pad constraint workbook")
+    parser.add_argument("--output", help="output SDC path")
+    parser.add_argument("--harden-sdc-manifest", help="00 harden SDC manifest CSV")
+    parser.add_argument(
+        "--require-complete-harden-sdc",
+        action="store_true",
+        help="treat any manifest/inferred missing harden SDC as an error",
+    )
+    parser.add_argument("--connection-inventory", help="00 bit-level connection inventory CSV")
     parser.add_argument("--tool", default="sta", choices=sorted(TOOLS), help="target tool surface; sta skips dont_touch_network")
     parser.add_argument("--time-unit", default="", help="optional expected time unit for unit_time checks, e.g. ns")
     parser.add_argument("--cap-unit", default="", help="optional expected capacitance unit for unit_cap checks, e.g. pF")
     parser.add_argument("--force-generate-after-sync", action="store_true", help="generate SDC even if workbook was synchronized")
     parser.add_argument(
         "--pending-root",
-        default="00_harden_port_inventory",
         help=(
-            "optional 00 harden port inventory root. If <root>/pending exists, "
-            "04 removes covered pad ports and writes removed_log/04_soc_io_pads.removed"
+            "optional 00 pending root override; target default is 00_middle/scenario/<scenario>, "
+            "legacy default is 00_harden_port_inventory"
         ),
     )
     parser.add_argument(
@@ -2346,30 +2733,144 @@ def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd()
     report = Report()
+    print(f"Author: {author_name()}")
 
-    info_all = cwd / args.info_all
+    target_layout = bool(args.run_root)
+    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
+    input_root = run_root / "inputs" if target_layout else cwd
+
+    def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
+        path = Path(value).expanduser() if value else Path(default)
+        return path if path.is_absolute() else base / path
+
+    info_all = resolve_path(input_root, args.info_all, "info_all.xlsx")
+    form_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.form,
+        "04_middle/04_soc_io_pads.xlsx" if target_layout else "04_soc_io_pads.xlsx",
+    )
+    output_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.output,
+        str(output_sdc_path(Path("04_result") if target_layout else Path("."), args.scenario, args.stage, args.corner)),
+    )
+    rpt_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.report,
+        (
+            f"04_result/reports/io_pad_check_report_{args.scenario}_{args.stage}_"
+            f"{safe_filename_token(args.corner)}.txt"
+            if target_layout
+            else report_path(Path("."), args.scenario, args.stage, args.corner).as_posix()
+        ),
+    )
+
+    if target_layout:
+        common_clock_path = resolve_path(
+            run_root,
+            args.input,
+            "01_middle/assembled/common/clock_inventory.csv",
+        ).resolve()
+        scenario_clock_path = resolve_path(
+            run_root,
+            args.scenario_input,
+            f"01_middle/assembled/{args.scenario}/clock_inventory.csv",
+        ).resolve()
+        manifest_path: Optional[Path] = resolve_path(
+            run_root,
+            args.harden_sdc_manifest,
+            f"00_middle/scenario/{args.scenario}/harden_sdc_manifest.csv",
+        )
+        connection_path: Optional[Path] = resolve_path(
+            run_root,
+            args.connection_inventory,
+            "00_middle/connection_inventory.csv",
+        )
+        if args.pending_root:
+            pending_base = resolve_path(run_root, args.pending_root, args.pending_root)
+            pending_dir = pending_base / "pending"
+        else:
+            pending_dir = run_root / f"00_middle/scenario/{args.scenario}/pending"
+        removed_log_dir = run_root / f"04_middle/scenario/{args.scenario}/removed_log"
+    else:
+        common_clock_path = resolve_path(cwd, args.input, "../01_soc_clocks/clock_inventory.csv").resolve()
+        scenario_clock_path = resolve_path(cwd, args.scenario_input, args.scenario_input or "").resolve()
+        manifest_path = (
+            resolve_path(cwd, args.harden_sdc_manifest, args.harden_sdc_manifest)
+            if args.harden_sdc_manifest
+            else None
+        )
+        connection_path = (
+            resolve_path(cwd, args.connection_inventory, args.connection_inventory)
+            if args.connection_inventory
+            else None
+        )
+        pending_base = resolve_path(cwd, args.pending_root, "00_harden_port_inventory")
+        pending_dir = pending_base / "pending"
+        removed_log_dir = pending_base / "removed_log"
+
+    report.info(f"resolved input root: {input_root.resolve()}")
+    report.info(f"resolved info workbook: {info_all.resolve()}")
+    report.info(f"resolved form workbook: {form_path.resolve()}")
+    report.info(f"resolved common clock inventory: {common_clock_path.resolve()}")
+    if args.scenario != "common" and (target_layout or args.scenario_input):
+        report.info(f"resolved scenario clock inventory: {scenario_clock_path.resolve()}")
+    if manifest_path is not None:
+        report.info(f"resolved harden SDC manifest: {manifest_path.resolve()}")
+    if connection_path is not None:
+        report.info(f"resolved connection inventory: {connection_path.resolve()}")
+    report.info(f"resolved output SDC: {output_path.resolve()}")
+    report.info(f"resolved output report: {rpt_path.resolve()}")
+
     if not info_all.is_file():
         raise RuntimeError(f"integration file not found: {info_all}")
     instances = read_info_all(info_all, report)
-    port_paths = default_port_workbooks(cwd, Path(args.info_all).name, Path(args.form).name, report)
+    if args.port_files:
+        port_paths = [resolve_path(input_root, value, value) for value in args.port_files]
+    else:
+        port_paths = default_port_workbooks(input_root, info_all.name, form_path.name, report)
+    if not port_paths:
+        report.error("no owner port workbook found; expected port_*.xlsx/ports_*.xlsx or --port-files")
+    for path in port_paths:
+        if not path.is_file():
+            report.error(f"port workbook not found: {path}")
     port_sheets = read_port_workbooks(port_paths, report)
     attach_port_data(instances, port_sheets, report)
     validate_integration_port_keys(instances, report)
-    resolve_sdc_paths(instances, cwd, report)
+    if manifest_path is not None:
+        completeness = apply_harden_sdc_manifest(
+            instances,
+            manifest_path,
+            run_root,
+            args.scenario,
+            args.require_complete_harden_sdc,
+            report,
+        )
+    else:
+        completeness = resolve_sdc_paths(instances, input_root, report)
+        if args.require_complete_harden_sdc and completeness.missing_instances:
+            report.error(
+                "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): "
+                + ", ".join(completeness.missing_instances)
+            )
     current_digests = collect_current_sdc_digests(instances)
 
     pad_records = build_pad_records(instances)
+    if connection_path is not None:
+        if not connection_path.is_file():
+            report.error(f"TARGET_UPSTREAM_CONNECTION_INVENTORY_MISSING: {connection_path}")
+        else:
+            validate_pad_connections(pad_records, read_connection_inventory(connection_path, report), report)
     extracted: List[ExtractedConstraint] = []
     for inst in instances.values():
-        extracted.extend(extract_constraints_from_instance(inst, report))
+        extracted.extend(extract_constraints_from_instance(inst, args.scenario, report))
 
-    form_path = cwd / args.form
     sync_workbook(form_path, pad_records, extracted, report)
 
-    common_inventory = read_clock_inventory((cwd / args.input).resolve(), report, "common")
+    common_inventory = read_clock_inventory(common_clock_path, report, "common", required=target_layout)
     scenario_inventory = (
-        read_clock_inventory((cwd / args.scenario_input).resolve(), report, args.scenario)
-        if args.scenario_input
+        read_clock_inventory(scenario_clock_path, report, args.scenario, required=target_layout)
+        if args.scenario != "common" and (target_layout or args.scenario_input)
         else {}
     )
 
@@ -2389,27 +2890,37 @@ def main(argv: Sequence[str]) -> int:
         report,
     )
 
-    output_path = output_sdc_path(cwd, args.scenario, args.stage, args.corner)
-    rpt_path = Path(args.report) if args.report else report_path(cwd, args.scenario, args.stage, args.corner)
+    if target_layout and not args.no_update_pending and not pending_dir.is_dir():
+        report.error(f"TARGET_UPSTREAM_PENDING_MISSING: {pending_dir}")
 
     generated = False
     if report.sync_changed and not args.force_generate_after_sync:
         report.warn("workbook changed during sync; review 04_soc_io_pads.xlsx before SDC generation")
     elif report.error_count == 0:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            "\n".join(generate_sdc(rows, args.scenario, args.stage, args.corner, args.tool)).rstrip() + "\n",
-            encoding="utf-8",
+        atomic_write_text(
+            output_path,
+            "\n".join(
+                generate_sdc(
+                    rows,
+                    args.scenario,
+                    args.stage,
+                    args.corner,
+                    args.tool,
+                    completeness,
+                )
+            ).rstrip()
+            + "\n",
         )
         report.info(f"wrote {output_path}")
         generated = True
     else:
         report.warn("SDC generation skipped because errors were reported")
 
-    if generated and not args.no_update_pending and args.pending_root:
+    if generated and not args.no_update_pending:
         update_pending_for_04(
-            cwd,
-            cwd / args.pending_root,
+            run_root,
+            pending_dir,
+            removed_log_dir,
             rows,
             pad_records,
             args.scenario,
@@ -2419,7 +2930,24 @@ def main(argv: Sequence[str]) -> int:
         )
 
     coverage_lines = build_coverage_lines(rows, pad_records, args.scenario, args.stage, args.corner)
-    write_report(rpt_path, report, args.scenario, args.stage, args.corner, args.tool, form_path, output_path, coverage_lines)
+    clock_paths = [common_clock_path]
+    if args.scenario != "common" and (target_layout or args.scenario_input):
+        clock_paths.append(scenario_clock_path)
+    write_report(
+        rpt_path,
+        report,
+        args.scenario,
+        args.stage,
+        args.corner,
+        args.tool,
+        form_path,
+        output_path,
+        coverage_lines,
+        completeness,
+        clock_paths,
+        manifest_path,
+        connection_path,
+    )
     print(f"Report: {rpt_path}")
     print(f"Warnings: {report.warning_count}  Errors: {report.error_count}  Sync changed: {report.sync_changed}")
     if report.error_count:

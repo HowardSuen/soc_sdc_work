@@ -1,17 +1,34 @@
 04_soc_io_pads extraction report
 ================================
 
+Author  : Howard
+Stage   : 04_soc_io_pads
+Script  : 04_extract_soc_io_pads.py
 Scenario: common
 Stage   : prects
 Corner  : ss_125
 Tool    : sta
 Form    : <WORK>/04_soc_io_pads/04_soc_io_pads.xlsx
 Output  : <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
+Clock inventory: <WORK>/01_soc_clocks/clock_inventory.csv
+Harden SDC manifest: <legacy inference>
+Connection inventory: <not used>
+Run completeness: complete
+Available harden SDC: 1
+Missing harden SDC: 0
+Not-required harden SDC: 0
+Missing instances: <none>
 Warnings: 2
 Errors  : 0
 Sync changed: no
 
 Messages:
+INFO: resolved input root: <WORK>/04_soc_io_pads
+INFO: resolved info workbook: <WORK>/04_soc_io_pads/info_all.xlsx
+INFO: resolved form workbook: <WORK>/04_soc_io_pads/04_soc_io_pads.xlsx
+INFO: resolved common clock inventory: <WORK>/01_soc_clocks/clock_inventory.csv
+INFO: resolved output SDC: <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
+INFO: resolved output report: <WORK>/04_soc_io_pads/io_pad_check_report_common_prects_ss_125.txt
 INFO: loaded 1 instance(s) from info_all.xlsx
 INFO: loaded 1 instance port sheet(s) from 1 workbook(s)
 INFO: extracted 6 IO/pad candidate(s) from u_io.sdc
