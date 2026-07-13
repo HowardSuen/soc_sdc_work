@@ -11,9 +11,16 @@ Current scope:
 
 import argparse
 import csv
-import glob
+import hashlib
+import json
+import os
+import platform
 import re
+import shlex
 import sys
+import traceback
+from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -145,6 +152,9 @@ class InstInfo:
     inputs: Dict[str, PortInfo] = field(default_factory=dict)
     outputs: Dict[str, PortInfo] = field(default_factory=dict)
     inouts: Dict[str, PortInfo] = field(default_factory=dict)
+    sdc_availability: str = "unknown"
+    sdc_note: str = ""
+    sdc_digest: str = ""
 
 
 @dataclass
@@ -191,6 +201,12 @@ class ClockRecord:
     producer_object: str = ""
     source_line: int = 0
     original_command: str = ""
+    source_type: str = ""
+    source_file: str = ""
+    target_object: str = ""
+    final_sdc_digest: str = ""
+    run_completeness: str = ""
+    missing_instances: str = ""
 
 
 @dataclass
@@ -232,6 +248,56 @@ class ConnectionEdge:
     validation_status: str = ""
 
 
+@dataclass
+class SocClockCommand:
+    raw: str
+    source_line: int
+    command: str
+    tokens: List[str]
+    clock_name: str
+    period: str
+    waveform: str
+    target_token: str
+    target_kind: str
+    target_objects: List[str]
+    source_token: str
+    master_clock: str
+    has_add: bool = False
+
+
+@dataclass
+class HardenSdcManifestEntry:
+    scenario: str
+    inst_name: str
+    module_name: str
+    sdc_path: str
+    availability_status: str
+    note: str
+    source_row: int
+
+
+@dataclass
+class RunCompleteness:
+    status: str
+    available_instances: List[str] = field(default_factory=list)
+    missing_instances: List[str] = field(default_factory=list)
+    not_required_instances: List[str] = field(default_factory=list)
+    manifest_path: str = ""
+    manifest_digest: str = ""
+
+    @property
+    def available_count(self) -> int:
+        return len(self.available_instances)
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_instances)
+
+    @property
+    def not_required_count(self) -> int:
+        return len(self.not_required_instances)
+
+
 class Report:
     def __init__(self) -> None:
         self.lines: List[str] = []
@@ -248,6 +314,44 @@ class Report:
     def error(self, msg: str) -> None:
         self.error_count += 1
         self.lines.append(f"ERROR: {msg}")
+
+
+def _author_part_a() -> str:
+    return chr(72) + chr(111)
+
+
+def _author_part_b() -> str:
+    return chr(119) + chr(97)
+
+
+def _author_part_c() -> str:
+    return chr(114) + chr(100)
+
+
+def author_name() -> str:
+    return _author_part_a() + _author_part_b() + _author_part_c()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
+    try:
+        tmp.write_text(text, encoding=encoding)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def clean_cell(value) -> str:
@@ -559,7 +663,156 @@ def attach_port_data(instances: Dict[str, InstInfo], sheets: Dict[str, Dict[str,
         report.warn(f"port workbook sheet {sheet_name!r} does not match any inst_name; ignored")
 
 
-def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> None:
+def resolve_manifest_path(run_root: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else run_root / path
+
+
+def apply_harden_sdc_manifest(
+    instances: Dict[str, InstInfo],
+    manifest_path: Path,
+    run_root: Path,
+    scenario: str,
+    require_complete: bool,
+    report: Report,
+) -> RunCompleteness:
+    if not manifest_path.is_file():
+        report.error(f"{manifest_path}: HARDEN_SDC_MANIFEST_MISSING: required target runtime manifest is absent")
+        return RunCompleteness(status="invalid", manifest_path=str(manifest_path.resolve()))
+
+    required_fields = {"scenario", "inst_name", "module_name", "availability_status"}
+    entries: Dict[str, HardenSdcManifestEntry] = {}
+    manifest_digest = sha256_file(manifest_path)
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fields = set(reader.fieldnames or [])
+        missing_fields = sorted(required_fields - fields)
+        if missing_fields:
+            report.error(
+                f"{manifest_path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing field(s): {', '.join(missing_fields)}"
+            )
+        if "sdc_path" not in fields and "resolved_sdc_path" not in fields:
+            report.error(
+                f"{manifest_path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing sdc_path "
+                "(legacy resolved_sdc_path is also accepted)"
+            )
+        for row_idx, row in enumerate(reader, start=2):
+            row_scenario = clean_cell(row.get("scenario"))
+            inst_name = clean_cell(row.get("inst_name"))
+            if not inst_name:
+                report.error(f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_EMPTY_INSTANCE")
+                continue
+            if row_scenario != scenario:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_SCENARIO_MISMATCH: "
+                    f"row scenario={row_scenario or '<empty>'}, requested={scenario}"
+                )
+                continue
+            if inst_name in entries:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_DUPLICATE_INSTANCE: "
+                    f"duplicate ({inst_name}, {scenario}) mapping"
+                )
+                continue
+            entry = HardenSdcManifestEntry(
+                scenario=row_scenario,
+                inst_name=inst_name,
+                module_name=clean_cell(row.get("module_name")),
+                sdc_path=(
+                    clean_cell(row.get("sdc_path"))
+                    or clean_cell(row.get("resolved_sdc_path"))
+                    or clean_cell(row.get("requested_sdc_path"))
+                ),
+                availability_status=clean_cell(row.get("availability_status")).lower(),
+                note=clean_cell(row.get("note")),
+                source_row=row_idx,
+            )
+            entries[inst_name] = entry
+
+    for inst_name in sorted(set(entries) - set(instances)):
+        report.error(
+            f"{manifest_path.name} row {entries[inst_name].source_row}: HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: "
+            f"{inst_name} is not present in info_all.xlsx"
+        )
+
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    for inst_name, inst in sorted(instances.items()):
+        entry = entries.get(inst_name)
+        if entry is None:
+            report.error(
+                f"{manifest_path.name}: HARDEN_SDC_MANIFEST_INSTANCE_MISSING: "
+                f"no ({inst_name}, {scenario}) row"
+            )
+            inst.sdc_availability = "invalid"
+            continue
+        inst.sdc_availability = entry.availability_status
+        inst.sdc_note = entry.note
+        if entry.module_name and entry.module_name != inst.module_name:
+            report.error(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_MODULE_MISMATCH: "
+                f"{inst_name} module={entry.module_name}, info_all={inst.module_name}"
+            )
+        if entry.availability_status == "available":
+            available.append(inst_name)
+            if not entry.sdc_path:
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_AVAILABLE_PATH_EMPTY: {inst_name}"
+                )
+                continue
+            sdc_path = resolve_manifest_path(run_root, entry.sdc_path)
+            if not sdc_path.is_file():
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_AVAILABLE_FILE_MISSING: "
+                    f"{inst_name} resolved path does not exist: {sdc_path}"
+                )
+                continue
+            actual_digest = sha256_file(sdc_path)
+            inst.sdc_path = sdc_path
+            inst.sdc_digest = actual_digest
+            report.info(
+                f"manifest selected {inst_name}: status=available path={sdc_path.resolve()} digest={actual_digest}"
+            )
+        elif entry.availability_status == "missing":
+            missing.append(inst_name)
+            requested = entry.sdc_path or "<unspecified>"
+            report.warn(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MISSING: "
+                f"{inst_name} requested={requested}; pending ports are preserved"
+            )
+        elif entry.availability_status == "not_required":
+            not_required.append(inst_name)
+            report.info(f"manifest marks {inst_name} as not_required: {entry.note or '<no note>'}")
+        else:
+            report.error(
+                f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_STATUS_INVALID: "
+                f"{inst_name} status={entry.availability_status or '<empty>'}"
+            )
+
+    completeness_status = "partial" if missing else "complete"
+    completeness = RunCompleteness(
+        status=completeness_status,
+        available_instances=available,
+        missing_instances=missing,
+        not_required_instances=not_required,
+        manifest_path=str(manifest_path.resolve()),
+        manifest_digest=manifest_digest,
+    )
+
+    if require_complete and missing:
+        report.error(
+            "HARDEN_SDC_COMPLETENESS_REQUIRED: missing required harden SDC instance(s): "
+            + ", ".join(missing)
+        )
+    report.info(
+        f"Run completeness: {completeness.status}; available={len(available)} "
+        f"missing={len(missing)} not_required={len(not_required)}"
+    )
+    return completeness
+
+
+def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report) -> RunCompleteness:
     all_sdcs = sorted(cwd.glob("*.sdc"))
     by_name = {p.name: p for p in all_sdcs}
     by_lower = {p.name.lower(): p for p in all_sdcs}
@@ -594,16 +847,27 @@ def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report)
 
         if len(unique_matches) == 1:
             inst.sdc_path = unique_matches[0]
+            inst.sdc_availability = "available"
+            inst.sdc_digest = sha256_file(inst.sdc_path)
         elif len(unique_matches) > 1:
             inst.sdc_path = unique_matches[0]
+            inst.sdc_availability = "available"
+            inst.sdc_digest = sha256_file(inst.sdc_path)
             report.warn(
                 f"multiple SDC candidates for {inst.inst_name}: "
                 f"{', '.join(p.name for p in unique_matches)}; using {inst.sdc_path.name}"
             )
         else:
-            report.error(
-                f"no SDC found for {inst.inst_name}; tried: {', '.join(candidates)}"
+            inst.sdc_availability = "missing"
+            report.warn(
+                f"HARDEN_SDC_MISSING: no SDC found for {inst.inst_name}; tried: {', '.join(candidates)}; "
+                "continuing in partial mode and preserving pending ports"
             )
+    available = sorted(inst.inst_name for inst in instances.values() if inst.sdc_availability == "available")
+    missing = sorted(inst.inst_name for inst in instances.values() if inst.sdc_availability == "missing")
+    status = "partial" if missing else "complete"
+    report.info(f"Run completeness: {status}; available={len(available)} missing={len(missing)} legacy_sdc_resolution=true")
+    return RunCompleteness(status=status, available_instances=available, missing_instances=missing)
 
 
 def read_text(path: Path) -> str:
@@ -903,6 +1167,92 @@ def get_clocks_obj(objects: Sequence[str]) -> str:
     if len(objects) == 1:
         return f"[get_clocks {tcl_obj(objects[0])}]"
     return f"[get_clocks {tcl_obj(' '.join(objects))}]"
+
+
+def parse_soc_clock_commands(text: str, report: Report, source_name: str) -> List[SocClockCommand]:
+    commands: List[SocClockCommand] = []
+    for tcl_cmd in iter_tcl_commands_with_line(text):
+        tokens = tokenize_tcl_words(tcl_cmd.raw)
+        if not tokens:
+            continue
+        command = tokens[0]
+        if command not in CLOCK_COMMANDS:
+            report.error(
+                f"{clock_location(source_name, tcl_cmd.line_no)}: CLOCK_MANUAL_UNSUPPORTED_COMMAND: "
+                f"manual/final clock SDC only permits create_clock/create_generated_clock; "
+                f"command: {compact_command(tcl_cmd.raw)}"
+            )
+            continue
+        target_tokens: List[str] = []
+        source_token = ""
+        idx = 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "-source":
+                if idx + 1 < len(tokens):
+                    source_token = tokens[idx + 1]
+                idx += 2
+                continue
+            if tok in CLOCK_OPTIONS_WITH_VALUE:
+                idx += 2
+                continue
+            if tok.startswith("-") or tok in CLOCK_OPTIONS_NO_VALUE:
+                idx += 1
+                continue
+            obj_kind, _ = parse_get_object(tok)
+            if obj_kind in {"get_ports", "get_pins"}:
+                target_tokens.append(tok)
+            idx += 1
+        if len(target_tokens) > 1:
+            report.error(
+                f"{clock_location(source_name, tcl_cmd.line_no)}: CLOCK_MULTI_TARGET_NOT_SUPPORTED: "
+                f"SoC clock command has multiple positional targets; command: {compact_command(tcl_cmd.raw)}"
+            )
+            continue
+        target_token = target_tokens[0] if target_tokens else ""
+        target_kind, target_objects = parse_get_object(target_token) if target_token else ("", [])
+        if len(target_objects) > 1:
+            report.error(
+                f"{clock_location(source_name, tcl_cmd.line_no)}: CLOCK_MULTI_TARGET_NOT_SUPPORTED: "
+                f"SoC clock target expands to multiple objects; command: {compact_command(tcl_cmd.raw)}"
+            )
+            continue
+        clock_name = get_option(tokens, "-name")
+        if not clock_name:
+            clock_name = sanitize_name(target_objects[0]) if target_objects else ""
+        commands.append(
+            SocClockCommand(
+                raw=tcl_cmd.raw,
+                source_line=tcl_cmd.line_no,
+                command="create_generated_clock" if command == "create_generate_clock" else command,
+                tokens=tokens,
+                clock_name=clock_name,
+                period=get_option(tokens, "-period"),
+                waveform=get_option(tokens, "-waveform"),
+                target_token=target_token,
+                target_kind=target_kind,
+                target_objects=target_objects,
+                source_token=source_token,
+                master_clock=get_option(tokens, "-master_clock"),
+                has_add="-add" in tokens,
+            )
+        )
+    return commands
+
+
+def decimal_equal(left: str, right: str) -> bool:
+    try:
+        return Decimal(left) == Decimal(right)
+    except (InvalidOperation, ValueError):
+        return left == right
+
+
+def waveform_equal(left: str, right: str) -> bool:
+    left_parts = split_object_list(left)
+    right_parts = split_object_list(right)
+    if len(left_parts) != len(right_parts):
+        return False
+    return all(decimal_equal(a, b) for a, b in zip(left_parts, right_parts))
 
 
 def parse_clock_commands(text: str, report: Report, sdc_name: str) -> List[ParsedClock]:
@@ -1336,10 +1686,7 @@ def process_instance(
                 )
             )
             issue = harden_clock_issue(inst, cmd, target_rule_id, target_message)
-            if target_rule_id == "CLOCK_TARGET_NOT_IN_OWNER_SHEET":
-                report.warn(issue)
-            else:
-                report.error(issue)
+            report.error(issue)
             continue
 
         test_tokens = test_like_clock_tokens(cmd)
@@ -1379,6 +1726,14 @@ def process_instance(
                 rule_id, message = clock_port_reference_error(inst, source_port, "source")
                 if rule_id:
                     source_errors.append((rule_id, message))
+            source_kind, _ = parse_get_object(cmd.source_token) if cmd.source_token else ("", [])
+            if source_kind == "get_pins":
+                source_errors.append(
+                    (
+                        "CLOCK_GENERATED_SOURCE_INTERNAL_PIN",
+                        "generated clock source uses harden-local get_pins; provide a boundary get_ports source",
+                    )
+                )
             if source_errors:
                 note = "; ".join(message for _, message in source_errors)
                 records.append(
@@ -1578,6 +1933,21 @@ def process_instance(
                 original_command=cmd.raw,
             )
         )
+    for rec in records:
+        if not rec.source_type:
+            if rec.final_action in {"emit_top_clock", "duplicate_top_clock", "check_only"}:
+                rec.source_type = "auto_top"
+            else:
+                rec.source_type = "auto_harden_output"
+        if not rec.source_file:
+            rec.source_file = rec.original_sdc
+        if not rec.target_object and rec.port_name:
+            if rec.direction == "output":
+                rec.target_object = f"{rec.inst_name}/{rec.port_name}"
+            elif rec.direction in {"input", "inout"} and rec.from_whom:
+                kind, value = parse_connection(rec.from_whom)
+                if kind == "top":
+                    rec.target_object = f"top/{value}"
     return records
 
 
@@ -1607,8 +1977,226 @@ def virtual_clock_records(specs: Sequence[VirtualClockSpec]) -> List[ClockRecord
                 note=spec.note or "virtual clock emitted from virtual clock table",
                 emitted_command=command,
                 producer_object=f"virtual/{spec.clock_name}",
+                source_type="virtual_spec",
+                source_file=spec.source_file,
+                target_object="",
             )
         )
+    return records
+
+
+def missing_sdc_records(
+    instances: Dict[str, InstInfo],
+    completeness: RunCompleteness,
+) -> List[ClockRecord]:
+    records: List[ClockRecord] = []
+    for inst_name in completeness.missing_instances:
+        inst = instances[inst_name]
+        records.append(
+            ClockRecord(
+                inst_name=inst.inst_name,
+                module_name=inst.module_name,
+                port_name="",
+                direction="instance",
+                clock_name="",
+                clock_kind="missing_sdc_evidence",
+                period="",
+                waveform="",
+                direct_source="",
+                root_source="",
+                from_whom="",
+                original_sdc="",
+                original_clock_name="",
+                final_action="missing_sdc",
+                note=(
+                    "harden SDC is unavailable; clock evidence is incomplete and all pending ports are preserved"
+                    + (f"; {inst.sdc_note}" if inst.sdc_note else "")
+                ),
+                source_type="missing_sdc",
+                source_file=(Path(completeness.manifest_path).name if completeness.manifest_path else "legacy_sdc_resolution"),
+            )
+        )
+    return records
+
+
+def known_top_ports(
+    instances: Dict[str, InstInfo],
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+) -> Set[str]:
+    result: Set[str] = set()
+    for inst in instances.values():
+        for info in list(inst.inputs.values()) + list(inst.inouts.values()):
+            kind, value = parse_connection(info.from_whom or info.connectivity)
+            if kind == "top" and value:
+                result.add(value)
+    for edge in connection_by_dst.values():
+        if edge.src_instance in {"", "top"} and edge.src_port:
+            result.add(edge.src_port)
+    return result
+
+
+def source_object_from_soc_command(command: SocClockCommand) -> str:
+    kind, objects = parse_get_object(command.source_token) if command.source_token else ("", [])
+    if kind == "get_ports" and len(objects) == 1:
+        return "top/" + objects[0]
+    if kind == "get_pins" and len(objects) == 1:
+        return objects[0]
+    if kind == "get_clocks" and objects:
+        return "clock:" + " ".join(objects)
+    return ""
+
+
+def manual_clock_records(
+    path: Path,
+    instances: Dict[str, InstInfo],
+    connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+    report: Report,
+) -> List[ClockRecord]:
+    if not path.is_file():
+        return []
+    try:
+        text = read_text(path)
+    except Exception as exc:
+        report.error(f"{path}: failed to read manual clock overlay: {exc}")
+        return []
+    top_ports = known_top_ports(instances, connection_by_dst)
+    commands = parse_soc_clock_commands(text, report, path.name)
+    records: List[ClockRecord] = []
+    for command in commands:
+        note = "manual SoC-visible clock overlay"
+        inst_name = ""
+        module_name = ""
+        port_name = ""
+        direction = ""
+        producer_object = ""
+        final_action = "skipped"
+        target_valid = True
+
+        if not command.clock_name or not get_option(command.tokens, "-name"):
+            report.error(
+                f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_MISSING_NAME: "
+                f"manual clock must use an explicit -name; command: {compact_command(command.raw)}"
+            )
+            target_valid = False
+        if not command.target_token or len(command.target_objects) != 1:
+            report.error(
+                f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_TARGET_REQUIRED: "
+                f"manual clock must target one SoC top port or harden output pin; "
+                f"command: {compact_command(command.raw)}"
+            )
+            target_valid = False
+        elif command.target_kind == "get_ports":
+            port_name = command.target_objects[0]
+            direction = "top"
+            producer_object = "top/" + port_name
+            if port_name not in top_ports:
+                report.error(
+                    f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_TOP_PORT_NOT_IN_INTEGRATION: "
+                    f"top port {port_name} is not referenced by owner sheets/connection inventory"
+                )
+                target_valid = False
+            else:
+                final_action = "emit_top_clock"
+        elif command.target_kind == "get_pins":
+            target = command.target_objects[0]
+            if "/" not in target:
+                report.error(
+                    f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_TARGET_NOT_SOC_PIN: "
+                    f"manual pin target must be <inst>/<output_port>: {target}"
+                )
+                target_valid = False
+            else:
+                inst_name, port_name = target.split("/", 1)
+                inst = instances.get(inst_name)
+                if not inst:
+                    report.error(
+                        f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_TARGET_INSTANCE_UNKNOWN: "
+                        f"instance {inst_name} is not present in info_all.xlsx"
+                    )
+                    target_valid = False
+                else:
+                    lookup = lookup_port(inst, port_name)
+                    module_name = inst.module_name
+                    direction = lookup.direction
+                    rule_id, message = clock_port_reference_error(inst, port_name, "target")
+                    if rule_id or lookup.direction != "output":
+                        report.error(
+                            f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_TARGET_NOT_OUTPUT: "
+                            f"{message or 'manual harden pin target must be an exact output canonical bit'}"
+                        )
+                        target_valid = False
+                    else:
+                        producer_object = target
+                        final_action = "emit_output_clock"
+        else:
+            target_valid = False
+
+        direct_source = source_object_from_soc_command(command)
+        if command.command == "create_generated_clock" and not direct_source:
+            report.error(
+                f"{clock_location(path.name, command.source_line)}: CLOCK_GENERATED_MISSING_SOURCE: "
+                f"manual generated clock has no parseable -source; command: {compact_command(command.raw)}"
+            )
+            target_valid = False
+        source_kind, source_objects = parse_get_object(command.source_token) if command.source_token else ("", [])
+        if source_kind == "get_ports" and (len(source_objects) != 1 or source_objects[0] not in top_ports):
+            report.error(
+                f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_SOURCE_TOP_PORT_UNKNOWN: "
+                f"manual source top port is not present in integration data"
+            )
+            target_valid = False
+        elif source_kind == "get_pins" and len(source_objects) == 1:
+            source_pin = source_objects[0]
+            if "/" not in source_pin:
+                report.error(
+                    f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_SOURCE_PIN_UNKNOWN: "
+                    f"manual source pin must be <inst>/<port>: {source_pin}"
+                )
+                target_valid = False
+            else:
+                source_inst_name, source_port = source_pin.split("/", 1)
+                source_inst = instances.get(source_inst_name)
+                source_rule_id = ""
+                source_message = ""
+                if source_inst:
+                    source_rule_id, source_message = clock_port_reference_error(source_inst, source_port, "source")
+                if not source_inst or source_rule_id:
+                    report.error(
+                        f"{clock_location(path.name, command.source_line)}: CLOCK_MANUAL_SOURCE_PIN_UNKNOWN: "
+                        f"{source_message or ('manual source pin ' + source_pin + ' is not an exact integration port')}"
+                    )
+                    target_valid = False
+
+        if not target_valid:
+            final_action = "skipped"
+        records.append(
+            ClockRecord(
+                inst_name=inst_name,
+                module_name=module_name,
+                port_name=port_name,
+                direction=direction or "unknown",
+                clock_name=command.clock_name or "<unnamed>",
+                clock_kind="create_generated_clock" if command.command == "create_generated_clock" else "create_clock",
+                period=command.period,
+                waveform=command.waveform,
+                direct_source=direct_source,
+                root_source=producer_object if command.command == "create_clock" else "",
+                from_whom="",
+                original_sdc=path.name,
+                original_clock_name=command.clock_name,
+                final_action=final_action,
+                note=note if target_valid else "manual clock failed validation",
+                emitted_command=command.raw if target_valid else "",
+                is_forwarded="-combinational" in command.tokens,
+                producer_object=producer_object,
+                source_line=command.source_line,
+                original_command=command.raw,
+                source_type="manual_overlay",
+                source_file=path.name,
+                target_object=producer_object,
+            )
+        )
+    report.info(f"loaded {len(commands)} manual clock command(s) from {path.name}")
     return records
 
 
@@ -1639,7 +2227,7 @@ def dedupe_top_clocks(records: List[ClockRecord], report: Report) -> None:
         rec.final_action = "duplicate_top_clock"
         rec.emitted_command = ""
         rec.note = f"duplicate top clock; first emitted by {first.inst_name}/{first.port_name}"
-        if first.period and rec.period and first.period != rec.period:
+        if first.period and rec.period and not decimal_equal(first.period, rec.period):
             report.warn(
                 f"{key}: period mismatch among top clock users: "
                 f"{first.inst_name}/{first.port_name}={first.period}, "
@@ -1660,7 +2248,11 @@ def dedupe_virtual_clocks(records: List[ClockRecord], report: Report) -> None:
         rec.final_action = "duplicate_virtual_clock"
         rec.emitted_command = ""
         rec.note = f"duplicate virtual clock; first emitted from {first.original_sdc}"
-        if first.period and rec.period and first.period != rec.period:
+        report.warn(
+            f"virtual clock {key}: CLOCK_DUPLICATE_VIRTUAL_CLOCK: duplicate declaration ignored; "
+            f"first emitted from {first.original_sdc}"
+        )
+        if first.period and rec.period and not decimal_equal(first.period, rec.period):
             report.warn(
                 f"virtual clock {key}: period mismatch {first.period} vs {rec.period}"
             )
@@ -1717,6 +2309,22 @@ def compute_root_sources(
         if obj in seen:
             return obj
         seen.add(obj)
+        if obj.startswith("clock:"):
+            names = [name for name in obj[len("clock:"):].split() if name]
+            if len(names) == 1:
+                by_name = {
+                    rec.clock_name: rec
+                    for rec in records
+                    if rec.final_action in EMITTED_CLOCK_ACTIONS
+                }
+                source_clock = by_name.get(names[0])
+                if source_clock:
+                    if source_clock.root_source:
+                        return source_clock.root_source
+                    if source_clock.direct_source:
+                        return root_for_object(source_clock.direct_source, seen)
+                    return source_clock.producer_object or obj
+            return obj
         connected = resolve_source_connection(obj, instances, connection_by_dst)
         if connected != obj:
             return root_for_object(connected, seen)
@@ -1731,12 +2339,82 @@ def compute_root_sources(
         if rec.root_source:
             continue
         if rec.final_action == "emit_output_clock":
-            rec.root_source = root_for_object(rec.direct_source) if rec.is_forwarded else rec.producer_object
+            rec.root_source = root_for_object(rec.direct_source) if rec.direct_source else rec.producer_object
+        elif rec.final_action == "emit_top_clock":
+            rec.root_source = root_for_object(rec.direct_source) if rec.direct_source else rec.producer_object
         elif rec.final_action == "check_only":
             rec.root_source = root_for_object(rec.direct_source)
 
 
-def run_checks(records: List[ClockRecord], instances: Dict[str, InstInfo], report: Report) -> None:
+def validate_clock_universe(records: List[ClockRecord], report: Report) -> None:
+    active_names = {
+        rec.clock_name
+        for rec in records
+        if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command
+    }
+    for rec in records:
+        if rec.source_type != "manual_overlay" or rec.final_action not in EMITTED_CLOCK_ACTIONS:
+            continue
+        tokens = tokenize_tcl_words(rec.emitted_command)
+        source_token = get_option(tokens, "-source")
+        source_kind, source_objects = parse_get_object(source_token) if source_token else ("", [])
+        missing_names: List[str] = []
+        if source_kind == "get_clocks":
+            missing_names.extend(name for name in source_objects if name not in active_names)
+        master_clock = get_option(tokens, "-master_clock")
+        if master_clock and master_clock not in active_names:
+            missing_names.append(master_clock)
+        if missing_names:
+            report.error(
+                record_clock_issue(
+                    rec,
+                    "CLOCK_MANUAL_REFERENCE_NOT_IN_UNIVERSE",
+                    "manual source/master clock is absent from final clock universe: "
+                    + ", ".join(sorted(set(missing_names))),
+                )
+            )
+            rec.final_action = "skipped"
+            rec.emitted_command = ""
+            rec.note = "manual clock source/master is absent from final clock universe"
+
+    first_by_target: Dict[str, ClockRecord] = {}
+    for rec in records:
+        if rec.final_action not in EMITTED_CLOCK_ACTIONS or not rec.emitted_command or not rec.target_object:
+            continue
+        first = first_by_target.get(rec.target_object)
+        if first is None:
+            first_by_target[rec.target_object] = rec
+            continue
+        tokens = tokenize_tcl_words(rec.emitted_command)
+        if "-add" not in tokens:
+            report.error(
+                record_clock_issue(
+                    rec,
+                    "CLOCK_TARGET_CONFLICT",
+                    f"target {rec.target_object} already has clock {first.clock_name}; additional clock requires -add and review",
+                )
+            )
+            if rec.source_type == "manual_overlay":
+                rec.final_action = "skipped"
+                rec.emitted_command = ""
+                rec.note = "manual target conflicts with an existing clock"
+        else:
+            report.warn(
+                record_clock_issue(
+                    rec,
+                    "CLOCK_TARGET_MULTI_CLOCK_REVIEW",
+                    f"target {rec.target_object} has multiple clocks with explicit -add; review mux/mode semantics",
+                )
+            )
+
+
+def run_checks(
+    records: List[ClockRecord],
+    instances: Dict[str, InstInfo],
+    report: Report,
+    missing_instances: Optional[Set[str]] = None,
+) -> None:
+    missing_instances = missing_instances or set()
     emitted_by_name: Dict[str, List[ClockRecord]] = {}
     for rec in records:
         if rec.final_action in EMITTED_CLOCK_ACTIONS:
@@ -1770,20 +2448,40 @@ def run_checks(records: List[ClockRecord], instances: Dict[str, InstInfo], repor
         upstream_obj = f"{kind}/{value}"
         upstream = producers.get(upstream_obj)
         if not upstream:
+            rule_id = "CLOCK_SOURCE_SDC_MISSING" if kind in missing_instances else "CLOCK_UPSTREAM_NOT_EMITTED"
+            detail = (
+                f"upstream harden {kind} SDC is missing; clock source {upstream_obj} remains incomplete"
+                if rule_id == "CLOCK_SOURCE_SDC_MISSING"
+                else f"upstream clock {upstream_obj} was not emitted"
+            )
             report.warn(
                 record_clock_issue(
                     rec,
-                    "CLOCK_UPSTREAM_NOT_EMITTED",
-                    f"upstream clock {upstream_obj} was not emitted",
+                    rule_id,
+                    detail,
                 )
             )
+            if rule_id == "CLOCK_SOURCE_SDC_MISSING":
+                rec.final_action = "incomplete_missing_sdc"
+                rec.note = (
+                    f"clock sink depends on missing upstream harden SDC {kind}; "
+                    "pending port is preserved"
+                )
             continue
-        if rec.period and upstream.period and rec.period != upstream.period:
+        if rec.period and upstream.period and not decimal_equal(rec.period, upstream.period):
             report.warn(
                 record_clock_issue(
                     rec,
                     "CLOCK_PERIOD_MISMATCH",
                     f"period {rec.period} differs from upstream {upstream_obj} period {upstream.period}",
+                )
+            )
+        if rec.waveform and upstream.waveform and not waveform_equal(rec.waveform, upstream.waveform):
+            report.warn(
+                record_clock_issue(
+                    rec,
+                    "CLOCK_WAVEFORM_MISMATCH",
+                    f"waveform {rec.waveform} differs from upstream {upstream_obj} waveform {upstream.waveform}",
                 )
             )
 
@@ -1840,16 +2538,40 @@ def dependency_ordered_emitted(records: List[ClockRecord], report: Report) -> Li
     return ordered
 
 
-def write_sdc(path: Path, records: List[ClockRecord], report: Report) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def completeness_lines(
+    completeness: RunCompleteness,
+    prefix: str = "",
+) -> List[str]:
+    missing = ",".join(completeness.missing_instances) or "<none>"
+    return [
+        f"{prefix}Run completeness: {completeness.status}",
+        f"{prefix}Harden SDC available: {completeness.available_count}",
+        f"{prefix}Harden SDC missing: {completeness.missing_count}",
+        f"{prefix}Harden SDC not_required: {completeness.not_required_count}",
+        f"{prefix}Missing instances: {missing}",
+    ]
+
+
+def write_sdc(
+    path: Path,
+    records: List[ClockRecord],
+    report: Report,
+    completeness: RunCompleteness,
+) -> None:
     emitted = dependency_ordered_emitted(records, report)
     lines = [
         "################################################################################",
         "# Auto-generated SoC func clock constraints",
+        f"# Author: {author_name()}",
+        "# Stage: 01_soc_clocks",
+        "# Script: 01_extract_soc_clocks.py",
+    ]
+    lines.extend(completeness_lines(completeness, "# "))
+    lines.extend([
         "# Source: local info_all.xlsx, port_*.xlsx and harden SoC integration SDC files",
         "################################################################################",
         "",
-    ]
+    ])
     for rec in emitted:
         if rec.final_action == "emit_virtual_clock":
             lines.append(f"# virtual clock {rec.clock_name} from {rec.original_sdc}")
@@ -1861,7 +2583,7 @@ def write_sdc(path: Path, records: List[ClockRecord], report: Report) -> None:
             lines.append(f"# Note: {rec.note}")
         lines.append(rec.emitted_command)
         lines.append("")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
     report.info(f"wrote {len(emitted)} clock command(s) to {path}")
 
 
@@ -1883,16 +2605,30 @@ def write_inventory(path: Path, records: List[ClockRecord]) -> None:
         "original_clock_name",
         "original_command",
         "final_action",
+        "source_type",
+        "source_file",
+        "target_object",
+        "final_sdc_digest",
+        "run_completeness",
+        "missing_instances",
         "note",
     ]
-    with path.open("w", encoding="utf-8", newline="") as file_obj:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
+    with tmp.open("w", encoding="utf-8", newline="") as file_obj:
         writer = csv.DictWriter(file_obj, fieldnames=fields)
         writer.writeheader()
         for rec in records:
             writer.writerow({field: getattr(rec, field) for field in fields})
+    tmp.replace(path)
 
 
-def write_report(path: Path, report: Report, records: List[ClockRecord]) -> None:
+def write_report(
+    path: Path,
+    report: Report,
+    records: List[ClockRecord],
+    completeness: RunCompleteness,
+) -> None:
     action_counts: Dict[str, int] = {}
     for rec in records:
         action_counts[rec.final_action] = action_counts.get(rec.final_action, 0) + 1
@@ -1900,16 +2636,209 @@ def write_report(path: Path, report: Report, records: List[ClockRecord]) -> None
         "01_soc_clocks extraction report",
         "================================",
         "",
+        f"Author: {author_name()}",
+        "Stage: 01_soc_clocks",
+        "Script: 01_extract_soc_clocks.py",
+        "",
+    ]
+    lines.extend(completeness_lines(completeness))
+    lines.extend([
+        "",
         f"Warnings: {report.warning_count}",
         f"Errors  : {report.error_count}",
         "",
         "Action counts:",
-    ]
+    ])
     for action in sorted(action_counts):
         lines.append(f"  {action}: {action_counts[action]}")
     lines.extend(["", "Messages:"])
     lines.extend(report.lines or ["INFO: no messages"])
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+
+
+def soc_clock_fingerprint(command: SocClockCommand) -> Tuple[str, str, str, str, str]:
+    target = ""
+    if command.target_kind and command.target_objects:
+        target = command.target_kind + ":" + " ".join(command.target_objects)
+    source_kind, source_objects = parse_get_object(command.source_token) if command.source_token else ("", [])
+    source = source_kind + ":" + " ".join(source_objects) if source_kind else command.source_token
+    return command.command, command.clock_name, target, source, command.master_clock
+
+
+def reconcile_final_sdc(path: Path, records: List[ClockRecord], report: Report) -> None:
+    final_commands = parse_soc_clock_commands(read_text(path), report, path.name)
+    expected_commands: List[SocClockCommand] = []
+    for rec in records:
+        if rec.final_action not in EMITTED_CLOCK_ACTIONS or not rec.emitted_command:
+            continue
+        parsed = parse_soc_clock_commands(rec.emitted_command, report, rec.source_file or rec.original_sdc)
+        expected_commands.extend(parsed)
+    final_set = Counter(soc_clock_fingerprint(command) for command in final_commands)
+    expected_set = Counter(soc_clock_fingerprint(command) for command in expected_commands)
+    if final_set != expected_set:
+        missing = list((expected_set - final_set).elements())
+        extra = list((final_set - expected_set).elements())
+        report.error(
+            f"{path}: CLOCK_FINAL_RECONCILE_MISMATCH: final SDC and active inventory records differ; "
+            f"missing={missing}; extra={extra}"
+        )
+    else:
+        report.info(f"reconciled {len(final_commands)} final clock command(s) against active inventory")
+
+
+def write_inventory_meta(
+    path: Path,
+    scenario: str,
+    sdc_path: Path,
+    inventory_path: Path,
+    records: Sequence[ClockRecord],
+    completeness: RunCompleteness,
+) -> None:
+    active_names = sorted(
+        rec.clock_name
+        for rec in records
+        if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command
+    )
+    clock_set_digest = hashlib.sha256("\n".join(active_names).encode("utf-8")).hexdigest()
+    payload = {
+        "author": author_name(),
+        "stage": "01_soc_clocks",
+        "script": "01_extract_soc_clocks.py",
+        "scenario": scenario,
+        "final_sdc_path": str(sdc_path.resolve()),
+        "final_sdc_digest": sha256_file(sdc_path),
+        "inventory_path": str(inventory_path.resolve()),
+        "inventory_digest": sha256_file(inventory_path),
+        "clock_set_digest": clock_set_digest,
+        "clock_count": len(active_names),
+        "run_completeness": completeness.status,
+        "available_harden_count": completeness.available_count,
+        "missing_harden_count": completeness.missing_count,
+        "not_required_harden_count": completeness.not_required_count,
+        "missing_instances": completeness.missing_instances,
+    }
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def record_debug_dict(rec: ClockRecord) -> Dict[str, object]:
+    return {
+        "inst_name": rec.inst_name,
+        "module_name": rec.module_name,
+        "port_name": rec.port_name,
+        "direction": rec.direction,
+        "clock_name": rec.clock_name,
+        "clock_kind": rec.clock_kind,
+        "period": rec.period,
+        "waveform": rec.waveform,
+        "direct_source": rec.direct_source,
+        "root_source": rec.root_source,
+        "from_whom": rec.from_whom,
+        "producer_object": rec.producer_object,
+        "target_object": rec.target_object,
+        "original_sdc": rec.original_sdc,
+        "source_line": rec.source_line,
+        "original_clock_name": rec.original_clock_name,
+        "original_command": rec.original_command,
+        "emitted_command": rec.emitted_command,
+        "final_action": rec.final_action,
+        "source_type": rec.source_type,
+        "source_file": rec.source_file,
+        "note": rec.note,
+    }
+
+
+def write_debug_bundle(
+    debug_dir: Path,
+    argv: Sequence[str],
+    resolved_paths: Dict[str, Path],
+    input_paths: Sequence[Path],
+    instances: Dict[str, InstInfo],
+    records: List[ClockRecord],
+    completeness: RunCompleteness,
+    report: Report,
+) -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    inputs = []
+    seen_paths: Set[str] = set()
+    for path in input_paths:
+        resolved = str(path.resolve())
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        inputs.append(
+            {
+                "path": resolved,
+                "exists": path.is_file(),
+                "sha256": sha256_file(path) if path.is_file() else "",
+                "size": path.stat().st_size if path.is_file() else 0,
+            }
+        )
+    instance_rows = []
+    for inst in sorted(instances.values(), key=lambda item: item.inst_name):
+        instance_rows.append(
+            {
+                "inst_name": inst.inst_name,
+                "module_name": inst.module_name,
+                "sdc_availability": inst.sdc_availability,
+                "sdc_path": str(inst.sdc_path.resolve()) if inst.sdc_path else "",
+                "sdc_digest": inst.sdc_digest,
+                "sdc_note": inst.sdc_note,
+                "input_count": len(inst.inputs),
+                "output_count": len(inst.outputs),
+                "inout_count": len(inst.inouts),
+            }
+        )
+    payload = {
+        "author": author_name(),
+        "stage": "01_soc_clocks",
+        "script": str(Path(__file__).resolve()),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "cwd": str(Path.cwd().resolve()),
+        "argv": list(argv),
+        "repro_command": " ".join([shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve()))] + [shlex.quote(arg) for arg in argv]),
+        "resolved_paths": {name: str(path.resolve()) for name, path in sorted(resolved_paths.items())},
+        "run_completeness": completeness.status,
+        "available_instances": completeness.available_instances,
+        "missing_instances": completeness.missing_instances,
+        "not_required_instances": completeness.not_required_instances,
+        "manifest_path": completeness.manifest_path,
+        "manifest_digest": completeness.manifest_digest,
+        "warnings": report.warning_count,
+        "errors": report.error_count,
+        "inputs": inputs,
+        "instances": instance_rows,
+        "records": [record_debug_dict(rec) for rec in records],
+    }
+    atomic_write_text(debug_dir / "run_context.json", json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(debug_dir / "repro_command.txt", payload["repro_command"] + "\n")
+    atomic_write_text(debug_dir / "messages.log", "\n".join(report.lines).rstrip() + "\n")
+    write_inventory(debug_dir / "clock_records_debug.csv", records)
+
+    fields = [
+        "inst_name",
+        "module_name",
+        "availability",
+        "sdc_path",
+        "sdc_digest",
+        "note",
+    ]
+    tmp = debug_dir / (".manifest_decisions.csv.tmp.%s" % os.getpid())
+    with tmp.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fields)
+        writer.writeheader()
+        for inst in sorted(instances.values(), key=lambda item: item.inst_name):
+            writer.writerow(
+                {
+                    "inst_name": inst.inst_name,
+                    "module_name": inst.module_name,
+                    "availability": inst.sdc_availability,
+                    "sdc_path": str(inst.sdc_path.resolve()) if inst.sdc_path else "",
+                    "sdc_digest": inst.sdc_digest,
+                    "note": inst.sdc_note,
+                }
+            )
+    tmp.replace(debug_dir / "manifest_decisions.csv")
 
 
 def removable_clock_records(records: Sequence[ClockRecord]) -> List[ClockRecord]:
@@ -2007,8 +2936,13 @@ def removed_log_line(rec: ClockRecord) -> str:
     return " ".join(fields)
 
 
-def update_pending_for_01(cwd: Path, pending_root: Path, records: Sequence[ClockRecord], report: Report) -> None:
-    pending_dir = pending_root / "pending"
+def update_pending_for_01(
+    cwd: Path,
+    pending_dir: Path,
+    log_dir: Path,
+    records: Sequence[ClockRecord],
+    report: Report,
+) -> None:
     if not pending_dir.exists():
         return
     if not pending_dir.is_dir():
@@ -2019,7 +2953,6 @@ def update_pending_for_01(cwd: Path, pending_root: Path, records: Sequence[Clock
     if not removable:
         return
 
-    log_dir = pending_root / "removed_log"
     previous_removed = read_removed_keys(log_dir)
 
     by_inst: Dict[str, List[ClockRecord]] = {}
@@ -2069,7 +3002,7 @@ def update_pending_for_01(cwd: Path, pending_root: Path, records: Sequence[Clock
 
         if remove_line_indices:
             kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
-            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+            atomic_write_text(pending_file, "\n".join(kept).rstrip() + ("\n" if kept else ""))
 
     if removed_records:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -2088,7 +3021,7 @@ def update_pending_for_01(cwd: Path, pending_root: Path, records: Sequence[Clock
                 existing_keys.add(key)
         if new_lines:
             log_lines = [line for line in existing_lines if line.strip()] + new_lines
-            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+            atomic_write_text(log_path, "\n".join(log_lines).rstrip() + "\n")
         try:
             display_path = log_path.relative_to(cwd)
         except ValueError:
@@ -2112,7 +3045,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate common/01_soc_clocks.sdc from local harden SDC and integration xlsx files."
     )
-    parser.add_argument("--info", default="info_all.xlsx", help="integration info workbook")
+    parser.add_argument(
+        "--run-root",
+        help="target runtime root; when set, inputs are read from <run-root>/inputs and outputs use 01_middle/01_result",
+    )
+    parser.add_argument("--scenario", default="common", help="clock scenario; current func-only implementation accepts common")
+    parser.add_argument(
+        "--harden-sdc-manifest",
+        help="00 harden SDC manifest; target default: 00_middle/scenario/<scenario>/harden_sdc_manifest.csv",
+    )
+    parser.add_argument(
+        "--require-complete-harden-sdc",
+        action="store_true",
+        help="treat any manifest/inferred missing harden SDC as an error",
+    )
+    parser.add_argument("--info", help="integration info workbook")
     parser.add_argument(
         "--port-files",
         nargs="*",
@@ -2120,33 +3067,32 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="common/01_soc_clocks.sdc",
         help="output SoC clock SDC path",
     )
     parser.add_argument(
         "--inventory",
-        default="clock_inventory.csv",
         help="output clock inventory CSV path",
     )
     parser.add_argument(
         "--report",
-        default="clock_check_report.txt",
         help="output extraction/check report path",
     )
     parser.add_argument(
         "--virtual-clocks",
-        default="virtual_clocks.csv",
         help=(
             "optional local CSV for virtual clocks; columns: clock_name/name, period, "
             "optional waveform, note"
         ),
     )
     parser.add_argument(
+        "--manual-clocks",
+        help="optional manual SoC-visible clock overlay; default: 01_soc_clocks_manual.sdc",
+    )
+    parser.add_argument(
         "--connection-inventory",
-        default="00_harden_port_inventory/connection_inventory.csv",
         help=(
-            "optional 00 bit-to-bit connection inventory. When present, 01 uses it "
-            "to resolve clock input source bits before falling back to owner From Whom"
+            "00 bit-to-bit connection inventory. Required in target runtime; legacy mode "
+            "falls back to owner From Whom when absent"
         ),
     )
     parser.add_argument(
@@ -2156,10 +3102,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--pending-root",
-        default="00_harden_port_inventory",
         help=(
-            "optional 00 harden port inventory root. If <root>/pending exists, "
-            "01 removes covered clock ports and writes removed_log/01_soc_clocks.removed"
+            "legacy 00 harden port inventory root. Target runtime uses the fixed scenario pending path; "
+            "01 removes covered clock ports and writes its removed log"
         ),
     )
     parser.add_argument(
@@ -2167,15 +3112,118 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="do not consume 00_harden_port_inventory/pending even if it exists",
     )
+    parser.add_argument(
+        "--diagnose-only",
+        action="store_true",
+        help="parse and check inputs without writing the official SDC or updating pending",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="write an offline debug bundle with resolved paths, digests, manifest decisions and clock records",
+    )
+    parser.add_argument(
+        "--debug-dir",
+        help="debug bundle directory; implies --debug",
+    )
+    parser.add_argument(
+        "--debug-verbose",
+        action="store_true",
+        help="print report messages and clock source decisions to stdout; implies --debug",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str]) -> int:
+def _main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd()
     report = Report()
+    print(f"Author: {author_name()}")
+    if args.diagnose_only:
+        args.no_write_sdc = True
+        args.no_update_pending = True
+    debug_enabled = args.debug or bool(args.debug_dir) or args.debug_verbose
 
-    info_path = cwd / args.info
+    if args.scenario != "common":
+        print("ERROR: current 01 implementation supports only --scenario common", file=sys.stderr)
+        return 2
+
+    target_layout = bool(args.run_root)
+    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
+    input_root = run_root / "inputs" if target_layout else cwd
+
+    def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
+        path = Path(value) if value else Path(default)
+        return path if path.is_absolute() else base / path
+
+    info_path = resolve_path(input_root, args.info, "info_all.xlsx")
+    output_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.output,
+        "01_result/common/01_soc_clocks.sdc" if target_layout else "common/01_soc_clocks.sdc",
+    )
+    inventory_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.inventory,
+        "01_middle/common/clock_inventory.csv" if target_layout else "clock_inventory.csv",
+    )
+    report_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.report,
+        "01_result/reports/clock_check_report.txt" if target_layout else "clock_check_report.txt",
+    )
+    virtual_path = resolve_path(input_root, args.virtual_clocks, "virtual_clocks.csv")
+    manual_path = resolve_path(input_root, args.manual_clocks, "01_soc_clocks_manual.sdc")
+    connection_path = resolve_path(
+        run_root if target_layout else cwd,
+        args.connection_inventory,
+        "00_middle/connection_inventory.csv" if target_layout else "00_harden_port_inventory/connection_inventory.csv",
+    )
+    manifest_path: Optional[Path]
+    if target_layout:
+        manifest_path = resolve_path(
+            run_root,
+            args.harden_sdc_manifest,
+            f"00_middle/scenario/{args.scenario}/harden_sdc_manifest.csv",
+        )
+    elif args.harden_sdc_manifest:
+        manifest_path = resolve_path(cwd, args.harden_sdc_manifest, args.harden_sdc_manifest)
+    else:
+        manifest_path = None
+    if target_layout:
+        if args.pending_root:
+            pending_base = resolve_path(run_root, args.pending_root, args.pending_root)
+            pending_dir = pending_base / "pending"
+        else:
+            pending_dir = run_root / "00_middle/scenario/common/pending"
+        removed_log_dir = run_root / "01_middle/scenario/common/removed_log"
+        common_meta_path: Optional[Path] = run_root / "01_middle/common/clock_inventory.meta"
+        assembled_inventory_path: Optional[Path] = run_root / "01_middle/assembled/common/clock_inventory.csv"
+        assembled_meta_path: Optional[Path] = run_root / "01_middle/assembled/common/clock_inventory.meta"
+    else:
+        pending_base = resolve_path(cwd, args.pending_root, "00_harden_port_inventory")
+        pending_dir = pending_base / "pending"
+        removed_log_dir = pending_base / "removed_log"
+        common_meta_path = None
+        assembled_inventory_path = None
+        assembled_meta_path = None
+
+    debug_dir = resolve_path(
+        run_root if target_layout else cwd,
+        args.debug_dir,
+        "01_middle/debug/01_soc_clocks" if target_layout else "debug/01_soc_clocks",
+    )
+
+    report.info(f"resolved input root: {input_root.resolve()}")
+    report.info(f"resolved info workbook: {info_path.resolve()}")
+    report.info(f"resolved connection inventory: {connection_path.resolve()}")
+    report.info(f"resolved output SDC: {output_path.resolve()}")
+    report.info(f"resolved output inventory: {inventory_path.resolve()}")
+    report.info(f"resolved output report: {report_path.resolve()}")
+    if manifest_path is not None:
+        report.info(f"resolved harden SDC manifest: {manifest_path.resolve()}")
+    if debug_enabled:
+        report.info(f"resolved debug directory: {debug_dir.resolve()}")
     if not info_path.is_file():
         print(f"ERROR: info workbook not found in execution directory: {info_path}", file=sys.stderr)
         return 2
@@ -2187,9 +3235,9 @@ def main(argv: Sequence[str]) -> int:
         return 2
 
     if args.port_files:
-        port_files = [cwd / item for item in args.port_files]
+        port_files = [resolve_path(input_root, item, item) for item in args.port_files]
     else:
-        port_files = default_port_files(cwd, info_path.name)
+        port_files = default_port_files(input_root, info_path.name)
     if not port_files:
         print("ERROR: no owner port workbook found. Expected local port_*.xlsx or --port-files.", file=sys.stderr)
         return 2
@@ -2200,37 +3248,195 @@ def main(argv: Sequence[str]) -> int:
 
     sheets = read_port_workbooks(port_files, report)
     attach_port_data(instances, sheets, report)
-    resolve_sdc_paths(instances, cwd, report)
-    connection_by_dst = read_connection_inventory(cwd / args.connection_inventory, report)
+    if manifest_path is not None:
+        completeness = apply_harden_sdc_manifest(
+            instances,
+            manifest_path,
+            run_root,
+            args.scenario,
+            args.require_complete_harden_sdc,
+            report,
+        )
+    else:
+        completeness = resolve_sdc_paths(instances, input_root, report)
+        if args.require_complete_harden_sdc and completeness.missing_instances:
+            report.error(
+                "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): "
+                + ", ".join(completeness.missing_instances)
+            )
 
-    records: List[ClockRecord] = []
-    if args.virtual_clocks:
-        records.extend(virtual_clock_records(read_virtual_clock_csv(cwd / args.virtual_clocks, report)))
+    if target_layout and not connection_path.is_file():
+        report.error(
+            f"{connection_path}: TARGET_UPSTREAM_CONNECTION_INVENTORY_MISSING: "
+            "target runtime requires the fixed 00 connection inventory"
+        )
+    if target_layout and not args.no_update_pending and not pending_dir.is_dir():
+        report.error(
+            f"{pending_dir}: TARGET_UPSTREAM_PENDING_MISSING: "
+            "target runtime requires the scenario pending directory unless --no-update-pending is used"
+        )
+    connection_by_dst = read_connection_inventory(connection_path, report)
+
+    records: List[ClockRecord] = missing_sdc_records(instances, completeness)
     for inst_name in sorted(instances):
         records.extend(process_instance(instances[inst_name], report, connection_by_dst))
-
-    dedupe_virtual_clocks(records, report)
     dedupe_top_clocks(records, report)
+    records.extend(virtual_clock_records(read_virtual_clock_csv(virtual_path, report)))
+    dedupe_virtual_clocks(records, report)
+    records.extend(manual_clock_records(manual_path, instances, connection_by_dst, report))
+    validate_clock_universe(records, report)
     inst_lookup = build_instance_lookup(instances)
     compute_root_sources(records, inst_lookup, connection_by_dst)
-    run_checks(records, inst_lookup, report)
+    run_checks(records, inst_lookup, report, set(completeness.missing_instances))
+
+    missing_text = ";".join(completeness.missing_instances)
+    for rec in records:
+        rec.run_completeness = completeness.status
+        rec.missing_instances = missing_text
 
     if not args.no_write_sdc:
-        write_sdc(cwd / args.output, records, report)
-    write_inventory(cwd / args.inventory, records)
-    if not args.no_update_pending and args.pending_root:
-        update_pending_for_01(cwd, cwd / args.pending_root, records, report)
-    write_report(cwd / args.report, report, records)
+        write_sdc(output_path, records, report, completeness)
+        final_digest = sha256_file(output_path)
+        for rec in records:
+            if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command:
+                rec.final_sdc_digest = final_digest
+        reconcile_final_sdc(output_path, records, report)
+    write_inventory(inventory_path, records)
+    if not args.no_update_pending:
+        if report.error_count:
+            report.warn(
+                "PENDING_UPDATE_SKIPPED_DUE_TO_ERRORS: pending files were not modified because validation errors exist"
+            )
+        else:
+            update_pending_for_01(run_root, pending_dir, removed_log_dir, records, report)
+    if target_layout and not args.no_write_sdc:
+        assert common_meta_path is not None
+        assert assembled_inventory_path is not None
+        assert assembled_meta_path is not None
+        write_inventory_meta(common_meta_path, "common", output_path, inventory_path, records, completeness)
+        write_inventory(assembled_inventory_path, records)
+        write_inventory_meta(assembled_meta_path, "common", output_path, assembled_inventory_path, records, completeness)
+    if debug_enabled:
+        report.info(f"writing offline debug bundle to {debug_dir.resolve()}")
+    write_report(report_path, report, records, completeness)
+
+    if debug_enabled:
+        resolved_paths = {
+            "run_root": run_root,
+            "input_root": input_root,
+            "info": info_path,
+            "connection_inventory": connection_path,
+            "pending_dir": pending_dir,
+            "removed_log_dir": removed_log_dir,
+            "output_sdc": output_path,
+            "output_inventory": inventory_path,
+            "output_report": report_path,
+            "debug_dir": debug_dir,
+        }
+        if manifest_path is not None:
+            resolved_paths["harden_sdc_manifest"] = manifest_path
+        input_paths: List[Path] = [info_path, connection_path, virtual_path, manual_path]
+        input_paths.extend(port_files)
+        input_paths.extend(
+            inst.sdc_path for inst in instances.values() if inst.sdc_path is not None
+        )
+        if manifest_path is not None:
+            input_paths.append(manifest_path)
+        write_debug_bundle(
+            debug_dir,
+            argv,
+            resolved_paths,
+            input_paths,
+            instances,
+            records,
+            completeness,
+            report,
+        )
+        if args.debug_verbose:
+            for line in report.lines:
+                print("DEBUG: " + line)
+            for rec in records:
+                print(
+                    "DEBUG_CLOCK: name=%s action=%s target=%s direct=%s root=%s source=%s:%s"
+                    % (
+                        rec.clock_name or "<none>",
+                        rec.final_action,
+                        rec.target_object or "<none>",
+                        rec.direct_source or "<none>",
+                        rec.root_source or "<none>",
+                        rec.original_sdc or "<none>",
+                        rec.source_line,
+                    )
+                )
 
     print(f"Instances : {len(instances)}")
     print(f"Records   : {len(records)}")
     if not args.no_write_sdc:
-        print(f"SDC       : {cwd / args.output}")
-    print(f"Inventory : {cwd / args.inventory}")
-    print(f"Report    : {cwd / args.report}")
+        print(f"SDC       : {output_path}")
+    print(f"Inventory : {inventory_path}")
+    print(f"Report    : {report_path}")
+    print(f"Completeness: {completeness.status}")
+    print(f"Available : {completeness.available_count}")
+    print(f"Missing   : {completeness.missing_count}")
+    if debug_enabled:
+        print(f"Debug     : {debug_dir}")
     print(f"Warnings  : {report.warning_count}")
     print(f"Errors    : {report.error_count}")
     return 1 if report.error_count else 0
+
+
+def debug_dir_from_argv(argv: Sequence[str]) -> Optional[Path]:
+    debug_requested = any(
+        arg in {"--debug", "--debug-verbose"} or arg.startswith("--debug-dir=")
+        for arg in argv
+    )
+    debug_dir_value = ""
+    run_root_value = ""
+    for idx, arg in enumerate(argv):
+        if arg == "--debug-dir" and idx + 1 < len(argv):
+            debug_requested = True
+            debug_dir_value = argv[idx + 1]
+        elif arg.startswith("--debug-dir="):
+            debug_dir_value = arg.split("=", 1)[1]
+        elif arg == "--run-root" and idx + 1 < len(argv):
+            run_root_value = argv[idx + 1]
+        elif arg.startswith("--run-root="):
+            run_root_value = arg.split("=", 1)[1]
+    if not debug_requested:
+        return None
+    if debug_dir_value:
+        path = Path(debug_dir_value).expanduser()
+        if path.is_absolute():
+            return path
+        base = Path(run_root_value).expanduser() if run_root_value else Path.cwd()
+        return base / path
+    if run_root_value:
+        return Path(run_root_value).expanduser() / "01_middle/debug/01_soc_clocks"
+    return Path.cwd() / "debug/01_soc_clocks"
+
+
+def main(argv: Sequence[str]) -> int:
+    try:
+        return _main(argv)
+    except Exception:
+        trace = traceback.format_exc()
+        print(trace, file=sys.stderr)
+        debug_dir = debug_dir_from_argv(argv)
+        if debug_dir is not None:
+            try:
+                atomic_write_text(debug_dir / "fatal_traceback.txt", trace)
+                atomic_write_text(
+                    debug_dir / "fatal_repro_command.txt",
+                    " ".join(
+                        [shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve()))]
+                        + [shlex.quote(arg) for arg in argv]
+                    )
+                    + "\n",
+                )
+                print(f"Fatal debug: {debug_dir}", file=sys.stderr)
+            except Exception:
+                print("WARNING: failed to write fatal debug bundle", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

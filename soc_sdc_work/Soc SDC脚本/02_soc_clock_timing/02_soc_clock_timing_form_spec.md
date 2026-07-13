@@ -1,5 +1,7 @@
 # 02 Clock Timing SDC Form Specification
 
+本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。使用 `--run-root` 时，表单/resolve manifest 写入 `02_middle/`，最终 SDC/report 写入 `02_result/`；未指定时保留 legacy cwd 兼容模式。
+
 本文档记录 02 clock timing budget 的输入表单格式和脚本生成机制。
 
 ## 1. 目标
@@ -61,8 +63,13 @@ derate_ocv
 ## 3. 通用约定
 
 - `clock_name` / `from_clock` / `to_clock` 必须引用 `01_soc_clocks.sdc` 已创建的 clock name。
-- 脚本读取 `01_soc_clocks` 生成的 `clock_inventory.csv` 做 clock name 合法性检查。02 只依赖 01 CSV 中真实输出的字段，例如 `clock_name`、`clock_kind`、`direction`、`direct_source`、`final_action`；不应假设存在 01 内部 dataclass 才有的临时字段。
+- target runtime 中，脚本读取 `01_middle/assembled/<scenario>/clock_inventory.csv` 及其 meta 做 clock name 合法性检查。assembled inventory 必须包含 common + 当前 scenario 的 auto、virtual 和 manual overlay 全部最终 clock，不是 auto-only 或 common-only 中间文件。
+- 02 不应各自重新实现完整 Tcl clock parser；默认使用 final inventory 的结构化字段，并通过 `final_sdc_digest` 和最终 01 SDC 的 clock name 集合检查 manifest 是否 stale。digest 或 clock 集合不一致时阻断生成。
+- 02 只依赖 01 CSV 中真实输出的字段，例如 `clock_name`、`clock_kind`、`direction`、`direct_source`、`final_action`、`source_type`、`final_sdc_digest`；不应假设存在 01 内部 dataclass 才有的临时字段。
 - 02 不直接读取或删除 `00_harden_port_inventory/pending/*.ports`。若某个 vector harden port 的不同 bit 被 01 创建成多个 clock object，02 只看到这些 bit 对应的独立 `clock_name`，例如 `u_x_clk_o_bit0`、`u_x_clk_o_bit1`；不能再用 bus/range 语义推导 budget。
+- 01 assembled meta 可以标记 `Run completeness: partial`。02 可继续为当前 assembled inventory 中已存在的 clock 生成 budget，不因其它 harden SDC 缺失而整体停止。
+- 表单中某 clock 暂未出现在 01 inventory，且能追溯到 missing harden SDC 时，不应标为普通 `STALE_NOT_IN_01`；应标为 `BLOCKED_BY_MISSING_SDC`（或等价明确状态），只阻断该 clock 行的生成。
+- 若 clock 无法追溯到 missing SDC，或 01 assembled run 是 complete，则仍按真实 stale clock 处理。
 - `scenario` 建议使用 `common`、`func`、`scan`、`mbist`、`gpio_in`、`gpio_out`。
 - `scenario = common` 表示所有 mode 都成立的 clock timing budget，只能输出到 `common/`。
 - `scenario != common` 表示 scenario 专属 clock timing budget，必须输出到 `scenarios/`。
@@ -74,6 +81,7 @@ derate_ocv
 - 对于 `scenario != common`，生成时按优先级选择胜出行：当前具体 scenario 行优先于 `common` 行；同一 clock/stage/corner 最终只 emit 一个胜出行。
 - 如果具体 scenario 行 `apply = no`，它仍然是胜出行，可用于显式压掉较低优先级的 common 默认约束。
 - 所有数值使用当前 STA/综合 flow 的 SDC 时间单位；建议项目统一在 flow 文档中声明，例如 ns。脚本生成 SDC 时会把可解析数值规范化为稳定的十进制表示，避免 xlsx 单元格是文本还是数字导致输出精度风格漂移。
+- 数值必须是有限值；`NaN` / `Inf` / `Infinity` 等虽可被 Python `float()` 解析，仍必须阻断生成。
 - 空白数值表示不生成对应命令。
 - `apply = yes` 才生成约束；`apply = no` 表示保留记录但不生成。
 - `note` 只用于人工审查，不参与生成。
@@ -124,7 +132,7 @@ transition_min           生成 set_clock_transition -min
 transition_max           生成 set_clock_transition -max
 propagated               yes/no；yes 时生成 set_propagated_clock
 apply                    yes/no
-sync_status              脚本同步状态，人工不建议手填；OK / NEW_FROM_01 / STALE_NOT_IN_01
+sync_status              脚本同步状态，人工不建议手填；OK / NEW_FROM_01 / STALE_NOT_IN_01 / BLOCKED_BY_MISSING_SDC
 note                     人工说明
 ```
 
@@ -132,6 +140,7 @@ note                     人工说明
 
 - `NEW_FROM_01`：脚本发现 01 中新增 clock 后自动追加的行。用户补齐该行 budget 后，脚本在下一轮 sync 自动复位为 `OK`。
 - `STALE_NOT_IN_01`：脚本发现该 clock 已不在 01 inventory 中。若后续 clock 又回到 01 inventory，且该行仍有明确约束意图，脚本自动复位为 `OK`。
+- `BLOCKED_BY_MISSING_SDC`：该 clock 暂未出现在 01 partial inventory，且能追溯到 harden-SDC manifest 中的 missing instance。保留行和数值，不当作 stale 删除；SDC 到位、01 恢复 clock 后可自动复位为 `OK`。
 - `OK` / 空白：可参与生成。
 
 自动复位到 `OK` 的条件：
@@ -271,6 +280,10 @@ set_timing_derate -data -late 1.07
 python3 02_extract_soc_clock_timing.py -scenario common -stage prects -corner ss_125
 python3 02_extract_soc_clock_timing.py -scenario func   -stage prects -corner ss_125
 python3 02_extract_soc_clock_timing.py -scenario scan   -stage postcts -corner ff_m40
+
+# target runtime
+python3 02_extract_soc_clock_timing.py --run-root /path/to/run \
+  -scenario common -stage prects -corner ss_125
 ```
 
 `-scenario` 合法值建议为：
@@ -308,17 +321,30 @@ postroute
 
 ### 7.2 读取 01 clock 信息
 
-脚本默认从上层 `01_soc_clocks` 工作目录读取 01 生成的中间文件：
+当前 legacy 模式默认从上层 `01_soc_clocks` 工作目录读取 01 inventory；若最终 SDC/meta 存在则同时校验，也可通过参数明确覆盖：
 
 ```text
 ../01_soc_clocks/clock_inventory.csv
+../01_soc_clocks/common/01_soc_clocks.sdc
 ```
 
-该文件用于获得 SoC 当前有效 clock 列表。脚本保留 `-input` 参数覆盖路径：
+这两个文件共同定义 SoC 当前有效 clock 列表。脚本保留 `-input` 参数覆盖 inventory 路径，并应提供 `--clock-sdc` 覆盖最终 01 SDC 路径：
 
 ```bash
 -input /path/to/clock_inventory.csv
+--inventory-meta /path/to/clock_inventory.meta
+--clock-sdc /path/to/common/01_soc_clocks.sdc
 ```
+
+使用 `--run-root` 时固定读取：
+
+```text
+01_middle/assembled/<scenario>/clock_inventory.csv
+01_middle/assembled/<scenario>/clock_inventory.meta
+```
+
+02 不再自行 source/解析 common + scenario 01 SDC；assembled meta 负责证明该 inventory 与对应最终 SDC digest 一致。
+脚本同时校验 inventory digest、clock-set digest、最终 SDC digest、CSV 中 `final_sdc_digest` 和最终 SDC 的 clock name 集合。
 
 stage 表单和输出 SDC 路径不单独提供命令行选项，统一由 `-scenario` / `-stage` / `-corner` 推导：
 
@@ -381,16 +407,17 @@ stage 表单 clock_budget 中当前 -scenario/-corner 的有效胜出 clock_name
 7. 新增行用黄色背景标记。
 8. 脚本打印提醒并中断，不生成 SDC。
 
-若表单任意 scenario/corner 中有、01 中没有：
+若表单当前 effective scenario（`common` 或 `common + 当前具体 scenario`）中有、01 中没有：
 
 1. 脚本保留该行。
-2. `sync_status` 填 `STALE_NOT_IN_01`。
-3. 该行用红色背景标记。
-4. 脚本打印提醒并中断，不生成 SDC。
+2. 若能追溯到 missing harden SDC，`sync_status` 填 `BLOCKED_BY_MISSING_SDC`，用橙色/灰色标记，跳过该 clock 但继续生成其它 clock。
+3. 若无法追溯到 missing SDC，或 01 run 为 complete，`sync_status` 填 `STALE_NOT_IN_01`，用红色标记并按真实 stale 中断。
+
+其它 scenario 的专属行不与当前 assembled inventory 交叉比较，避免运行 `func` 时把 `scan`-only clock 误判为 stale。missing instance 追溯采用保守规则：clock name 必须等于 instance name，或以 `<inst>_` / `<inst>/` / `<inst>.` 开头；无法明确追溯时仍按真实 stale 处理。
 
 若当前 scenario/corner 的有效胜出 clock 与 01 完全一致，且不存在 stale clock：
 
-1. 脚本应将已具备明确约束意图的 `NEW_FROM_01` / 已恢复的 `STALE_NOT_IN_01` 行自动复位为 `OK`，并清除旧的黄色/红色标记。
+1. 脚本应将已具备明确约束意图的 `NEW_FROM_01` / 已恢复的 `STALE_NOT_IN_01` / `BLOCKED_BY_MISSING_SDC` 行自动复位为 `OK`，并清除旧的颜色标记。
 2. `sync_status = OK` 或空白在生成时视为可用。
 3. 进入字段合法性检查。
 
@@ -400,18 +427,21 @@ stage 表单 clock_budget 中当前 -scenario/-corner 的有效胜出 clock_name
 
 - 新生成了 stage 表单，用户尚未填写 budget。
 - 当前 `-scenario/-corner` 有尚未补齐约束意图、无法自动复位为 `OK` 的 `NEW_FROM_01` 行。
-- 任意 scenario/corner 有仍不在 01 inventory 中的 `STALE_NOT_IN_01` 行。
+- 当前 effective scenario 有仍不在 01 assembled inventory 中的 `STALE_NOT_IN_01` 行。
 - 当前 `-scenario/-corner` 的有效胜出 clock 与 01 clock inventory 不一致。
 - 当前 `-scenario/-corner` 的 `apply`、`propagated` 等枚举字段非法。
 - 当前 `-scenario/-corner` 的数值字段填写了非数字内容。
 - 当前 `-scenario/-corner` 中 `apply = yes` 的行缺少生成该命令所需的关键信息。
+- 数值为 `NaN` / `Inf` / `Infinity` 等非有限值。
 - 全表任意 `apply = yes` 行若缺少 `scenario` 或 `corner`，视为结构完整性错误并中断；这类行无法安全参与 scenario/corner resolve，不按当前目标过滤。
 
 当前阶段暂不强制区分不同 stage 哪些数值列必填或必须留空；只检查“用户填了的值是否合法”以及“要生成某条具体 SDC 命令时，所需字段是否存在”。除 `apply = yes` 的结构完整性检查外，命令生成相关检查只阻塞当前 `-scenario/-stage/-corner`；其它 scenario/corner 中尚未填写的数值不阻塞当前输出。
 
+`BLOCKED_BY_MISSING_SDC` 不属于全局中断条件。它从当前 effective clock set 中排除受影响 clock，输出/report 标记 partial；其它 `OK` 行正常生成。开启 strict completeness mode 时由上游 01/manifest gate 统一阻断。
+
 ### 7.6 SDC 生成
 
-只有当当前 `-scenario/-corner` 的有效胜出 clock 与 01 clock inventory 完全一致、不存在 stale clock，且胜出行字段合法时，脚本才生成 02 SDC。
+当前 `-scenario/-corner` 的可用胜出 clock 必须与 01 partial/complete inventory 中已存在的 clock 一致，不存在真实 stale clock，且胜出行字段合法。`BLOCKED_BY_MISSING_SDC` 行不参与本次 SDC 生成，但会进入 partial report。
 
 第一版只处理 `clock_budget` sheet 中：
 
@@ -435,6 +465,14 @@ scenario != common:
 ```
 
 同一 clock/stage/corner 只 emit 一个胜出行。
+
+target runtime 成功生成时同时写入：
+
+```text
+02_middle/resolved/<scenario>_<stage>_<corner>.manifest
+```
+
+该 manifest 记录 01 inventory/meta/final SDC digest、表单 digest、输出 SDC digest、run completeness 和每个 winning row 是否实际 emit。
 
 生成文件建议为：
 
@@ -471,11 +509,12 @@ set_propagated_clock
 02 生成脚本至少检查：
 
 - 当前 `-scenario/-stage/-corner` resolve 后的有效胜出 clock 是否覆盖 01 的 `clock_inventory.csv`。
-- 表单任意 scenario/corner 中是否存在 01 已不存在的 stale clock。
+- 表单当前 effective scenario 中是否存在 01 assembled inventory 已不存在的 stale clock。
 - 同一 `scenario/stage/corner/clock_name` 是否重复定义。
 - `apply`、`propagated` 是否为合法 yes/no（`clock_budget` sheet）。
-- `sync_status` 是否为合法状态：空白、`OK`、`NEW_FROM_01`、`STALE_NOT_IN_01`。
-- 是否存在会阻止生成的同步状态：当前 `-scenario/-corner` 的 `NEW_FROM_01`，或任意 scenario/corner 的 `STALE_NOT_IN_01`。
+- `sync_status` 是否为合法状态：空白、`OK`、`NEW_FROM_01`、`STALE_NOT_IN_01`、`BLOCKED_BY_MISSING_SDC`。
+- 是否存在会阻止生成的同步状态：当前 `-scenario/-corner` 的 `NEW_FROM_01`，或当前 effective scenario 的 `STALE_NOT_IN_01`。
+- `BLOCKED_BY_MISSING_SDC` 只阻断当前受影响 clock/view，不阻断其它已到位 clock 的输出；strict completeness mode 除外。
 - 基于 01 `clock_inventory.csv` 中的 `clock_kind` 做 warning 级检查：
 - `clock_kind = virtual_clock` 的胜出行若填写 `network_latency_*` 或 `transition_*`，脚本应 warning，因为 virtual clock 没有物理 clock network。
 - `clock_kind` 为 generated 类 clock 的胜出行若填写 `source_latency_*`，脚本应 warning，因为 generated clock 通常继承 master/source clock 的 source latency，重复设置容易双重计算。

@@ -11,9 +11,14 @@ stops before SDC generation.
 
 import argparse
 import csv
+import hashlib
+import json
+import math
+import os
+import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     from dataclasses import dataclass
@@ -75,7 +80,8 @@ SCENARIOS = {"common", "func", "scan", "mbist", "gpio_in", "gpio_out"}
 ACTIVE_01_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
 YES_NO = {"yes", "no"}
 SYNC_OK = {"", "OK"}
-SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01"}
+SYNC_BLOCKED_MISSING = "BLOCKED_BY_MISSING_SDC"
+SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING}
 
 CLOCK_BUDGET_HEADERS = [
     "scenario",
@@ -140,6 +146,7 @@ TITLE_FILL = PatternFill("solid", fgColor="335C81")
 SUBTITLE_FILL = PatternFill("solid", fgColor="EAF3F6")
 NEW_FILL = PatternFill("solid", fgColor="FFF2CC")
 STALE_FILL = PatternFill("solid", fgColor="F4CCCC")
+BLOCKED_FILL = PatternFill("solid", fgColor="FCE5CD")
 CLEAR_FILL = PatternFill(fill_type=None)
 THIN_BORDER = Border(
     left=Side(style="thin", color="B8C6CC"),
@@ -155,6 +162,18 @@ class ClockInfo:
     direction: str = ""
     clock_kind: str = ""
     source: str = ""
+
+
+@dataclass
+class InventoryContext:
+    path: Path
+    clocks: Dict[str, ClockInfo]
+    scenario: str = ""
+    completeness: str = "complete"
+    missing_instances: Tuple[str, ...] = ()
+    meta_path: Optional[Path] = None
+    final_sdc_path: Optional[Path] = None
+    final_sdc_digest: str = ""
 
 
 @dataclass
@@ -181,6 +200,60 @@ class Report:
     def error(self, msg: str) -> None:
         self.error_count += 1
         self.lines.append(f"ERROR: {msg}")
+
+
+def _author_part_a() -> str:
+    return chr(72) + chr(111)
+
+
+def _author_part_b() -> str:
+    return chr(119) + chr(97)
+
+
+def _author_part_c() -> str:
+    return chr(114) + chr(100)
+
+
+def author_name() -> str:
+    return _author_part_a() + _author_part_b() + _author_part_c()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_clock_set(clock_names: Iterable[str]) -> str:
+    payload = "\n".join(sorted(clock_names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
+    try:
+        tmp_path.write_text(content, encoding=encoding)
+        os.replace(str(tmp_path), str(path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def atomic_save_workbook(wb, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(".%s.tmp.%s.xlsx" % (path.stem, os.getpid()))
+    try:
+        wb.save(str(tmp_path))
+        os.replace(str(tmp_path), str(path))
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def clean_cell(value) -> str:
@@ -272,6 +345,145 @@ def read_clock_inventory(path: Path, report: Report) -> Dict[str, ClockInfo]:
     return clocks
 
 
+def read_active_inventory_digests(path: Path) -> Set[str]:
+    digests: Set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        for row in reader:
+            if clean_cell(row.get("final_action")) not in ACTIVE_01_ACTIONS:
+                continue
+            value = clean_cell(row.get("final_sdc_digest"))
+            if value:
+                digests.add(value)
+    return digests
+
+
+def extract_clock_names_from_sdc(path: Path) -> Set[str]:
+    text = path.read_text(encoding="utf-8")
+    logical_lines: List[str] = []
+    pending = ""
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line and not pending:
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        logical_lines.append(pending + line)
+        pending = ""
+    if pending:
+        logical_lines.append(pending)
+
+    names: Set[str] = set()
+    name_pattern = re.compile(r'(?:^|\s)-name\s+(?:\{([^}]*)\}|"([^"]*)"|(\S+))')
+    for line in logical_lines:
+        stripped = line.lstrip()
+        if not (stripped.startswith("create_clock ") or stripped.startswith("create_generated_clock ")):
+            continue
+        match = name_pattern.search(stripped)
+        if match:
+            names.add(next(group for group in match.groups() if group is not None))
+    return names
+
+
+def load_inventory_context(
+    inventory_path: Path,
+    report: Report,
+    expected_scenario: str,
+    meta_path: Optional[Path] = None,
+    clock_sdc_path: Optional[Path] = None,
+    require_meta: bool = False,
+) -> InventoryContext:
+    clocks = read_clock_inventory(inventory_path, report)
+    context = InventoryContext(path=inventory_path, clocks=clocks, scenario=expected_scenario)
+
+    if meta_path is not None and meta_path.is_file():
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            raise RuntimeError(f"invalid 01 clock inventory meta {meta_path}: {exc}")
+        context.meta_path = meta_path
+        context.scenario = clean_cell(payload.get("scenario"))
+        context.completeness = normalize_key(payload.get("run_completeness")) or "complete"
+        context.missing_instances = tuple(
+            sorted(clean_cell(item) for item in payload.get("missing_instances", []) if clean_cell(item))
+        )
+        final_path_text = clean_cell(payload.get("final_sdc_path"))
+        if final_path_text:
+            context.final_sdc_path = Path(final_path_text)
+        context.final_sdc_digest = clean_cell(payload.get("final_sdc_digest"))
+
+        if context.scenario != expected_scenario:
+            report.error(
+                f"01 inventory meta scenario mismatch: expected {expected_scenario}, got {context.scenario or '<blank>'}"
+            )
+        expected_inventory_digest = clean_cell(payload.get("inventory_digest"))
+        actual_inventory_digest = sha256_file(inventory_path)
+        if expected_inventory_digest != actual_inventory_digest:
+            report.error(
+                f"stale 01 inventory: meta digest {expected_inventory_digest or '<blank>'} "
+                f"does not match {actual_inventory_digest}"
+            )
+        expected_clock_set_digest = clean_cell(payload.get("clock_set_digest"))
+        actual_clock_set_digest = sha256_clock_set(clocks)
+        if expected_clock_set_digest != actual_clock_set_digest:
+            report.error(
+                f"stale 01 inventory: clock set digest {expected_clock_set_digest or '<blank>'} "
+                f"does not match {actual_clock_set_digest}"
+            )
+        expected_clock_count = payload.get("clock_count")
+        if expected_clock_count is not None:
+            try:
+                clock_count = int(expected_clock_count)
+            except (TypeError, ValueError):
+                report.error(f"01 inventory meta has invalid clock_count: {expected_clock_count}")
+            else:
+                if clock_count != len(clocks):
+                    report.error(f"01 inventory meta clock_count={clock_count}, actual={len(clocks)}")
+    elif require_meta:
+        raise RuntimeError(f"01 assembled clock inventory meta not found: {meta_path}")
+    elif meta_path is not None:
+        report.warn(f"01 inventory meta not found; legacy validation only: {meta_path}")
+
+    effective_sdc_path = clock_sdc_path or context.final_sdc_path
+    if effective_sdc_path is not None:
+        if not effective_sdc_path.is_file():
+            raise RuntimeError(f"01 final clock SDC not found: {effective_sdc_path}")
+        actual_sdc_digest = sha256_file(effective_sdc_path)
+        if context.final_sdc_digest and context.final_sdc_digest != actual_sdc_digest:
+            report.error(
+                f"stale 01 final SDC: meta digest {context.final_sdc_digest} does not match {actual_sdc_digest}"
+            )
+        inventory_digests = read_active_inventory_digests(inventory_path)
+        if inventory_digests and inventory_digests != {actual_sdc_digest}:
+            report.error(
+                "stale 01 inventory: active final_sdc_digest value(s) do not match final SDC digest: "
+                + ", ".join(sorted(inventory_digests))
+            )
+        sdc_clock_names = extract_clock_names_from_sdc(effective_sdc_path)
+        if sdc_clock_names != set(clocks):
+            missing = sorted(set(clocks) - sdc_clock_names)
+            extra = sorted(sdc_clock_names - set(clocks))
+            report.error(
+                f"01 final SDC clock set differs from inventory; missing_in_sdc={missing}; extra_in_sdc={extra}"
+            )
+        context.final_sdc_path = effective_sdc_path
+        context.final_sdc_digest = actual_sdc_digest
+        report.info(f"verified 01 final SDC digest and {len(sdc_clock_names)} clock name(s): {effective_sdc_path}")
+    elif require_meta:
+        report.error("01 assembled meta does not provide final_sdc_path")
+    else:
+        report.warn("01 final clock SDC was not found; legacy inventory authenticity check was skipped")
+
+    if context.completeness not in {"complete", "partial"}:
+        report.error(f"01 inventory meta has invalid run_completeness: {context.completeness}")
+    report.info(
+        f"01 run completeness: {context.completeness}; missing instances: "
+        f"{', '.join(context.missing_instances) or '<none>'}"
+    )
+    return context
+
+
 def style_title(ws, title: str, subtitle: str, width_cols: int) -> None:
     ws.sheet_view.showGridLines = False
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=width_cols)
@@ -352,7 +564,11 @@ def setup_clock_budget_sheet(wb: Workbook, stage: str) -> None:
     add_validation(ws, "A5:A5000", ["common", "func", "scan", "mbist", "gpio_in", "gpio_out"])
     add_validation(ws, "B5:B5000", sorted(STAGES))
     add_validation(ws, "M5:N5000", ["yes", "no"])
-    add_validation(ws, "O5:O5000", ["OK", "NEW_FROM_01", "STALE_NOT_IN_01"])
+    add_validation(
+        ws,
+        "O5:O5000",
+        ["OK", "NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING],
+    )
 
 
 def setup_aux_sheet(wb: Workbook, name: str, headers: Sequence[str], stage: str) -> None:
@@ -383,8 +599,7 @@ def create_new_workbook(
     for clock_name in sorted(clocks):
         append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
     refresh_clock_budget_table(ws)
-    form_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(form_path)
+    atomic_save_workbook(wb, form_path)
 
 
 def find_header_row(ws, required: str = "clock_name") -> Tuple[int, Dict[str, int]]:
@@ -522,7 +737,7 @@ def sync_workbook(
     scenario: str,
     stage: str,
     corner: str,
-    clocks: Dict[str, ClockInfo],
+    inventory: InventoryContext,
     report: Report,
 ) -> Tuple[object, int, Dict[str, int], List[BudgetRow]]:
     if "clock_budget" not in wb.sheetnames:
@@ -535,12 +750,17 @@ def sync_workbook(
         report.warn(f"{form_path.name}: added missing clock_budget header(s)")
 
     rows = read_budget_rows(ws, header_row, mapping)
-    form_clocks = {clean_cell(row.values.get("clock_name")) for row in rows if clean_cell(row.values.get("clock_name"))}
     selected_scenario_corner_clocks = {row_clock_name(row) for row in resolve_winning_rows(rows, scenario, stage, corner)}
-    inv_clocks = set(clocks)
+    inv_clocks = set(inventory.clocks)
 
     missing = sorted(inv_clocks - selected_scenario_corner_clocks)
-    stale = sorted(form_clocks - inv_clocks)
+    relevant_scenarios = {"common"} if scenario == "common" else {"common", scenario}
+    relevant_rows = [
+        row
+        for row in rows
+        if row_scenario_key(row) in relevant_scenarios and (row_stage_key(row) or stage) == stage
+    ]
+    stale = sorted({row_clock_name(row) for row in relevant_rows if row_clock_name(row)} - inv_clocks)
 
     for clock_name in missing:
         append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
@@ -556,18 +776,30 @@ def sync_workbook(
         clock_name = clean_cell(row.values.get("clock_name"))
         if not clock_name:
             continue
-        if clock_name in stale:
-            ws.cell(row.row_idx, mapping["sync_status"], "STALE_NOT_IN_01")
-            style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), STALE_FILL)
-            report.sync_changed = True
-            report.sync_blocking_changed = True
-            report.warn(
-                f"{form_path.name} row {row.row_idx}: stale clock not found in 01 inventory: {clock_name}"
-            )
+        row_is_relevant = row_scenario_key(row) in relevant_scenarios and (row_stage_key(row) or stage) == stage
+        if row_is_relevant and clock_name in stale:
+            if clock_traces_to_missing_instance(clock_name, inventory.missing_instances):
+                if clean_cell(row.values.get("sync_status")) != SYNC_BLOCKED_MISSING:
+                    ws.cell(row.row_idx, mapping["sync_status"], SYNC_BLOCKED_MISSING)
+                    style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), BLOCKED_FILL)
+                    report.sync_changed = True
+                report.warn(
+                    f"{form_path.name} row {row.row_idx}: {clock_name} is blocked by missing harden SDC; "
+                    "other available clocks may still be generated"
+                )
+            else:
+                if clean_cell(row.values.get("sync_status")) != "STALE_NOT_IN_01":
+                    ws.cell(row.row_idx, mapping["sync_status"], "STALE_NOT_IN_01")
+                    style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), STALE_FILL)
+                    report.sync_changed = True
+                report.sync_blocking_changed = True
+                report.warn(
+                    f"{form_path.name} row {row.row_idx}: stale clock not found in 01 inventory: {clock_name}"
+                )
             continue
 
         sync_status = clean_cell(row.values.get("sync_status"))
-        if sync_status in {"NEW_FROM_01", "STALE_NOT_IN_01"}:
+        if clock_name in inv_clocks and sync_status in {"NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING}:
             if row_ready_for_sync_ok(row):
                 ws.cell(row.row_idx, mapping["sync_status"], "OK")
                 style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), CLEAR_FILL)
@@ -585,6 +817,16 @@ def sync_workbook(
     refresh_clock_budget_table(ws)
     rows = read_budget_rows(ws, header_row, mapping)
     return ws, header_row, mapping, rows
+
+
+def clock_traces_to_missing_instance(clock_name: str, missing_instances: Sequence[str]) -> bool:
+    for inst_name in missing_instances:
+        if clock_name == inst_name:
+            return True
+        for separator in ("_", "/", "."):
+            if clock_name.startswith(inst_name + separator):
+                return True
+    return False
 
 
 def row_ready_for_sync_ok(row: BudgetRow) -> bool:
@@ -608,6 +850,7 @@ def validate_rows(
 ) -> None:
     seen_keys = set()
     winning_row_ids = {row.row_idx for row in resolve_winning_rows(rows, scenario, stage, corner)}
+    relevant_scenarios = {"common"} if scenario == "common" else {"common", scenario}
     selected_count = 0
     for row in rows:
         values = row.values
@@ -643,7 +886,11 @@ def validate_rows(
         selected = row.row_idx in winning_row_ids
         if sync_value not in SYNC_VALUES:
             report.error(f"clock_budget row {row.row_idx} {clock_name}: invalid sync_status {sync_value}")
-        if sync_value == "STALE_NOT_IN_01":
+        if (
+            sync_value == "STALE_NOT_IN_01"
+            and row_scenario in relevant_scenarios
+            and (row_stage or stage) == stage
+        ):
             report.error(f"clock_budget row {row.row_idx} {clock_name}: blocking sync_status {sync_value}")
         if selected and sync_value == "NEW_FROM_01":
             report.error(f"clock_budget row {row.row_idx} {clock_name}: blocking sync_status {sync_value}")
@@ -656,6 +903,11 @@ def validate_rows(
         if not selected:
             continue
         selected_count += 1
+        if sync_value == SYNC_BLOCKED_MISSING:
+            report.warn(
+                f"clock_budget row {row.row_idx} {clock_name}: skipped because sync_status={SYNC_BLOCKED_MISSING}"
+            )
+            continue
         clock_info = clocks.get(clock_name)
         if clock_info:
             warn_clock_kind_budget_mismatch(row, clock_info, report)
@@ -670,8 +922,11 @@ def validate_rows(
 
         for col in NUMERIC_COLUMNS:
             text = clean_cell(values.get(col))
-            if text and parse_number(text) is None:
+            number = parse_number(text) if text else None
+            if text and number is None:
                 report.error(f"clock_budget row {row.row_idx} {clock_name}: {col} must be numeric, got {text}")
+            elif number is not None and not math.isfinite(number):
+                report.error(f"clock_budget row {row.row_idx} {clock_name}: {col} must be finite, got {text}")
 
         if apply_value == "yes":
             if not row_generates_any_command(values):
@@ -726,13 +981,24 @@ def warn_propagated_budget_mismatch(row: BudgetRow, report: Report) -> None:
         )
 
 
-def generate_sdc(rows: Sequence[BudgetRow], scenario: str, stage: str, corner: str) -> List[str]:
+def generate_sdc(
+    rows: Sequence[BudgetRow],
+    scenario: str,
+    stage: str,
+    corner: str,
+    inventory: InventoryContext,
+) -> List[str]:
     lines = [
         "################################################################################",
         (
             "# Auto-generated SoC clock timing constraints for "
             f"scenario: {scenario}, stage: {stage}, corner: {corner}"
         ),
+        f"# Author: {author_name()}",
+        "# Stage: 02_soc_clock_timing",
+        "# Script: 02_extract_soc_clock_timing.py",
+        f"# Run completeness: {inventory.completeness}",
+        f"# Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
         f"# Source: 02_soc_clock_timing_budget_{stage}.xlsx clock_budget sheet",
         "# Rows are resolved by scenario priority: selected scenario > common.",
         "################################################################################",
@@ -791,11 +1057,15 @@ def write_report(
     corner: str,
     form_path: Path,
     output_path: Path,
+    inventory: Optional[InventoryContext] = None,
 ) -> None:
     lines = [
         "02_soc_clock_timing extraction report",
         "=====================================",
         "",
+        f"Author  : {author_name()}",
+        "Stage ID: 02_soc_clock_timing",
+        "Script  : 02_extract_soc_clock_timing.py",
         f"Scenario: {scenario}",
         f"Stage   : {stage}",
         f"Corner  : {corner}",
@@ -804,11 +1074,66 @@ def write_report(
         f"Warnings: {report.warning_count}",
         f"Errors  : {report.error_count}",
         f"Sync changed: {'yes' if report.sync_changed else 'no'}",
-        "",
-        "Messages:",
     ]
+    if inventory is not None:
+        lines.extend([
+            f"Run completeness: {inventory.completeness}",
+            f"Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
+            f"Inventory: {inventory.path.resolve()}",
+            f"Inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
+            f"Final clock SDC: {inventory.final_sdc_path.resolve() if inventory.final_sdc_path else '<none>'}",
+        ])
+    lines.extend(["", "Messages:"])
     lines.extend(report.lines or ["INFO: no messages"])
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+
+
+def write_resolved_manifest(
+    path: Path,
+    rows: Sequence[BudgetRow],
+    scenario: str,
+    stage: str,
+    corner: str,
+    inventory: InventoryContext,
+    form_path: Path,
+    output_path: Path,
+) -> None:
+    winners = []
+    for row in resolve_winning_rows(rows, scenario, stage, corner):
+        values = row.values
+        apply_value = normalize_key(values.get("apply"))
+        sync_value = clean_cell(values.get("sync_status"))
+        emitted = apply_value == "yes" and sync_value in SYNC_OK
+        winners.append({
+            "row": row.row_idx,
+            "clock_name": row_clock_name(row),
+            "source_scenario": clean_cell(values.get("scenario")),
+            "apply": apply_value,
+            "sync_status": sync_value,
+            "emitted": emitted,
+            "command_count": len(commands_for_row(values)) if emitted else 0,
+        })
+    payload = {
+        "author": author_name(),
+        "stage": "02_soc_clock_timing",
+        "script": "02_extract_soc_clock_timing.py",
+        "scenario": scenario,
+        "timing_stage": stage,
+        "corner": corner,
+        "run_completeness": inventory.completeness,
+        "missing_instances": list(inventory.missing_instances),
+        "inventory_path": str(inventory.path.resolve()),
+        "inventory_digest": sha256_file(inventory.path),
+        "inventory_meta_path": str(inventory.meta_path.resolve()) if inventory.meta_path else "",
+        "final_sdc_path": str(inventory.final_sdc_path.resolve()) if inventory.final_sdc_path else "",
+        "final_sdc_digest": inventory.final_sdc_digest,
+        "form_path": str(form_path.resolve()),
+        "form_digest": sha256_file(form_path),
+        "output_path": str(output_path.resolve()),
+        "output_digest": sha256_file(output_path),
+        "winning_rows": winners,
+    }
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -818,24 +1143,45 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "from a stage-specific timing budget xlsx."
         )
     )
+    parser.add_argument(
+        "--run-root",
+        help="target runtime root; reads 01_middle/assembled and writes 02_middle/02_result",
+    )
     parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS), help="timing scenario")
     parser.add_argument("-stage", "--stage", required=True, choices=sorted(STAGES), help="timing stage")
     parser.add_argument("-corner", "--corner", required=True, help="corner / analysis view name")
     parser.add_argument(
         "-input",
         "--input",
-        default="../01_soc_clocks/clock_inventory.csv",
+        default=None,
         help="01 clock inventory CSV path",
     )
+    parser.add_argument("--inventory-meta", help="01 assembled clock inventory meta JSON path")
+    parser.add_argument("--clock-sdc", help="final 01 clock SDC path used for digest and clock-set validation")
+    parser.add_argument("--form", help="stage timing budget workbook path")
     parser.add_argument(
         "--report",
         help="output report path; default: clock_timing_check_report_<scenario>_<stage>_<corner>.txt",
     )
+    parser.add_argument("--resolved-manifest", help="resolved 02 manifest output path")
+    parser.add_argument(
+        "--require-complete-harden-sdc",
+        action="store_true",
+        help="block when the 01 assembled inventory reports partial harden SDC availability",
+    )
     return parser.parse_args(argv)
+
+
+def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
+    candidate = Path(value) if value else Path(default)
+    if candidate.is_absolute():
+        return candidate
+    return base / candidate
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    print(f"Author: {author_name()}")
     scenario = args.scenario
     stage = args.stage
     corner = clean_cell(args.corner)
@@ -844,31 +1190,105 @@ def main(argv: Sequence[str]) -> int:
         return 2
     corner_token = safe_filename_token(corner)
     cwd = Path.cwd()
+    target_layout = bool(args.run_root)
+    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
     report = Report()
     if corner_token != corner:
         report.warn(f"corner name {corner} is written as filename token {corner_token}")
 
-    form_path = cwd / f"02_soc_clock_timing_budget_{stage}.xlsx"
-    output_path = output_sdc_path(cwd, scenario, stage, corner_token)
-    report_path = cwd / (args.report or f"clock_timing_check_report_{scenario}_{stage}_{corner_token}.txt")
-    inventory_path = cwd / args.input
+    if target_layout:
+        form_path = resolve_path(
+            run_root,
+            args.form,
+            f"02_middle/02_soc_clock_timing_budget_{stage}.xlsx",
+        )
+        output_path = output_sdc_path(run_root / "02_result", scenario, stage, corner_token)
+        report_path = resolve_path(
+            run_root,
+            args.report,
+            f"02_result/reports/clock_timing_check_report_{scenario}_{stage}_{corner_token}.txt",
+        )
+        inventory_path = resolve_path(
+            run_root,
+            args.input,
+            f"01_middle/assembled/{scenario}/clock_inventory.csv",
+        )
+        meta_path: Optional[Path] = resolve_path(
+            run_root,
+            args.inventory_meta,
+            f"01_middle/assembled/{scenario}/clock_inventory.meta",
+        )
+        clock_sdc_path = resolve_path(run_root, args.clock_sdc, args.clock_sdc) if args.clock_sdc else None
+        resolved_manifest_path = resolve_path(
+            run_root,
+            args.resolved_manifest,
+            f"02_middle/resolved/{scenario}_{stage}_{corner_token}.manifest",
+        )
+    else:
+        form_path = resolve_path(cwd, args.form, f"02_soc_clock_timing_budget_{stage}.xlsx")
+        output_path = output_sdc_path(cwd, scenario, stage, corner_token)
+        report_path = resolve_path(
+            cwd,
+            args.report,
+            f"clock_timing_check_report_{scenario}_{stage}_{corner_token}.txt",
+        )
+        inventory_path = resolve_path(cwd, args.input, "../01_soc_clocks/clock_inventory.csv")
+        if args.inventory_meta:
+            meta_path = resolve_path(cwd, args.inventory_meta, args.inventory_meta)
+        else:
+            candidate_meta = inventory_path.with_suffix(".meta")
+            meta_path = candidate_meta if candidate_meta.is_file() else None
+        if args.clock_sdc:
+            clock_sdc_path = resolve_path(cwd, args.clock_sdc, args.clock_sdc)
+        else:
+            candidate_sdc = cwd / "../01_soc_clocks/common/01_soc_clocks.sdc"
+            clock_sdc_path = candidate_sdc if candidate_sdc.is_file() else None
+        resolved_manifest_path = (
+            resolve_path(cwd, args.resolved_manifest, args.resolved_manifest)
+            if args.resolved_manifest
+            else None
+        )
+
+    report.info(f"resolved run root: {run_root.resolve()}")
+    report.info(f"resolved inventory: {inventory_path.resolve()}")
+    report.info(f"resolved inventory meta: {meta_path.resolve() if meta_path else '<none>'}")
+    report.info(f"resolved final clock SDC: {clock_sdc_path.resolve() if clock_sdc_path else '<from meta or unavailable>'}")
+    report.info(f"resolved timing form: {form_path.resolve()}")
+    report.info(f"resolved output SDC: {output_path.resolve()}")
+    report.info(f"resolved report: {report_path.resolve()}")
 
     try:
-        clocks = read_clock_inventory(inventory_path, report)
+        inventory = load_inventory_context(
+            inventory_path,
+            report,
+            expected_scenario=scenario,
+            meta_path=meta_path,
+            clock_sdc_path=clock_sdc_path,
+            require_meta=target_layout,
+        )
     except Exception as exc:
+        report.error(str(exc))
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     if report.error_count:
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
         print(f"ERROR: failed to load clean 01 clock inventory. Report: {report_path}", file=sys.stderr)
+        return 1
+    if args.require_complete_harden_sdc and inventory.completeness != "complete":
+        report.error(
+            "01 assembled inventory is partial and --require-complete-harden-sdc was requested"
+        )
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
+        print(f"ERROR: incomplete harden SDC availability. Report: {report_path}", file=sys.stderr)
         return 1
 
     if not form_path.is_file():
-        create_new_workbook(form_path, scenario, stage, corner, clocks)
+        create_new_workbook(form_path, scenario, stage, corner, inventory.clocks)
         report.sync_changed = True
         report.warn(f"created new stage workbook: {form_path}")
         report.warn("fill timing budget values and set sync_status to OK before generating SDC")
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
         print(f"Created new workbook: {form_path}")
         print(f"Report: {report_path}")
         print("SDC was not generated because the workbook needs review.")
@@ -877,32 +1297,43 @@ def main(argv: Sequence[str]) -> int:
     try:
         wb = load_workbook(form_path)
         ws, header_row, mapping, rows = sync_workbook(
-            wb, form_path, scenario, stage, corner, clocks, report
+            wb, form_path, scenario, stage, corner, inventory, report
         )
         if report.sync_changed:
-            wb.save(form_path)
+            atomic_save_workbook(wb, form_path)
             if report.sync_blocking_changed:
-                write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+                write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
                 print(f"Updated workbook: {form_path}")
                 print(f"Report: {report_path}")
                 print("SDC was not generated because clock list sync changed the workbook.")
                 return 1
             rows = read_budget_rows(ws, header_row, mapping)
 
-        validate_rows(rows, mapping, clocks, scenario, stage, corner, report)
+        validate_rows(rows, mapping, inventory.clocks, scenario, stage, corner, report)
         if report.error_count:
-            write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+            write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
             print(f"ERROR: validation failed. Report: {report_path}", file=sys.stderr)
             return 1
 
-        lines = generate_sdc(rows, scenario, stage, corner)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        lines = generate_sdc(rows, scenario, stage, corner, inventory)
+        atomic_write_text(output_path, "\n".join(lines).rstrip() + "\n")
         report.info(f"wrote SDC: {output_path}")
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+        if resolved_manifest_path is not None:
+            write_resolved_manifest(
+                resolved_manifest_path,
+                rows,
+                scenario,
+                stage,
+                corner,
+                inventory,
+                form_path,
+                output_path,
+            )
+            report.info(f"wrote resolved manifest: {resolved_manifest_path}")
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
     except Exception as exc:
         report.error(str(exc))
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
+        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
         print(f"ERROR: {exc}", file=sys.stderr)
         print(f"Report: {report_path}", file=sys.stderr)
         return 2
@@ -913,6 +1344,8 @@ def main(argv: Sequence[str]) -> int:
     print(f"Form  : {form_path}")
     print(f"SDC   : {output_path}")
     print(f"Report: {report_path}")
+    if resolved_manifest_path is not None and resolved_manifest_path.is_file():
+        print(f"Manifest: {resolved_manifest_path}")
     print(f"Warnings: {report.warning_count}")
     print(f"Errors  : {report.error_count}")
     return 0

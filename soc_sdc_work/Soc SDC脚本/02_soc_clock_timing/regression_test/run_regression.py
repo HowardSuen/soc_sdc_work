@@ -12,6 +12,8 @@ The test builds fresh inputs under work_complex/ and checks:
 from __future__ import print_function
 
 import csv
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -85,6 +87,12 @@ def write_inventory(path, clocks):
         "original_clock_name",
         "original_command",
         "final_action",
+        "source_type",
+        "source_file",
+        "target_object",
+        "final_sdc_digest",
+        "run_completeness",
+        "missing_instances",
         "note",
     ]
     with path.open("w", encoding="utf-8", newline="") as file_obj:
@@ -133,6 +141,61 @@ def base_clocks():
             "final_action": "emit_virtual_clock",
         },
     ]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_target_bundle(root, scenario, clocks, completeness="complete", missing_instances=None):
+    missing_instances = sorted(missing_instances or [])
+    sdc = root / "01_result" / ("common/01_soc_clocks.sdc" if scenario == "common" else "scenarios/%s_clocks.sdc" % scenario)
+    sdc.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# target regression clock SDC"]
+    for clock in clocks:
+        name = clock["clock_name"]
+        if "generated" in clock.get("clock_kind", ""):
+            lines.append("create_generated_clock -name {%s} -source [get_clocks {master}] -divide_by 2 [get_pins {u/out}]" % name)
+        else:
+            lines.append("create_clock -name {%s} -period 10" % name)
+    sdc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sdc_digest = sha256_file(sdc)
+
+    inventory = root / "01_middle" / "assembled" / scenario / "clock_inventory.csv"
+    enriched = []
+    for clock in clocks:
+        row = dict(clock)
+        row["final_sdc_digest"] = sdc_digest
+        row["run_completeness"] = completeness
+        row["missing_instances"] = ";".join(missing_instances)
+        enriched.append(row)
+    write_inventory(inventory, enriched)
+    clock_names = sorted(clock["clock_name"] for clock in clocks)
+    clock_set_digest = hashlib.sha256("\n".join(clock_names).encode("utf-8")).hexdigest()
+    meta = inventory.with_suffix(".meta")
+    payload = {
+        "scenario": scenario,
+        "final_sdc_path": str(sdc.resolve()),
+        "final_sdc_digest": sdc_digest,
+        "inventory_path": str(inventory.resolve()),
+        "inventory_digest": sha256_file(inventory),
+        "clock_set_digest": clock_set_digest,
+        "clock_count": len(clock_names),
+        "run_completeness": completeness,
+        "available_harden_count": 1,
+        "missing_harden_count": len(missing_instances),
+        "not_required_harden_count": 0,
+        "missing_instances": missing_instances,
+    }
+    meta.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return inventory, meta, sdc
 
 
 def run_initial_gate(d):
@@ -493,6 +556,142 @@ def run_duplicate_key_case():
     require("duplicate scenario/stage/corner/clock_name key" in report, "duplicate key error missing")
 
 
+def fill_all_target_rows(root, stage="prects"):
+    path = root / "02_middle" / ("02_soc_clock_timing_budget_%s.xlsx" % stage)
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if not ws.cell(row_idx, mapping["clock_name"]).value:
+            continue
+        set_row(ws, row_idx, mapping, {
+            "setup_uncertainty": 0.1,
+            "apply": "yes",
+        })
+    wb.save(str(path))
+
+
+def run_target_runtime_and_partial_case():
+    root = WORK / "target_runtime"
+    clean_dir(root)
+    clocks = [
+        {
+            "inst_name": "top",
+            "direction": "input",
+            "clock_name": "top_clk",
+            "clock_kind": "create_clock",
+            "direct_source": "top/clk",
+            "final_action": "emit_top_clock",
+        },
+        {
+            "inst_name": "u_missing",
+            "direction": "output",
+            "clock_name": "u_missing_clk_o",
+            "clock_kind": "create_generated_clock",
+            "direct_source": "u_missing/ref_i",
+            "final_action": "emit_output_clock",
+        },
+    ]
+    write_target_bundle(root, "common", clocks)
+    first = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(first.returncode == 1, "target first run should create 02_middle workbook")
+    require(first.stdout.count("Author: Howard") == 1, "target stdout author marker missing or duplicated")
+    fill_all_target_rows(root)
+
+    complete = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(complete.returncode == 0, "target complete generation failed:\n%s\n%s" % (complete.stdout, complete.stderr))
+    output = root / "02_result/common/02_soc_clock_timing_prects_ss_125.sdc"
+    report = root / "02_result/reports/clock_timing_check_report_common_prects_ss_125.txt"
+    manifest = root / "02_middle/resolved/common_prects_ss_125.manifest"
+    for path in (output, report, manifest):
+        require(path.is_file(), "target artifact missing: %s" % path)
+    require("Author: Howard" in output.read_text(encoding="utf-8"), "target SDC author metadata missing")
+    require("Author  : Howard" in report.read_text(encoding="utf-8"), "target report author metadata missing")
+
+    write_target_bundle(root, "common", clocks[:1], completeness="partial", missing_instances=["u_missing"])
+    partial = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(partial.returncode == 0, "partial target generation should continue for available clocks:\n%s\n%s" % (partial.stdout, partial.stderr))
+    partial_sdc = output.read_text(encoding="utf-8")
+    partial_report = report.read_text(encoding="utf-8")
+    require("Run completeness: partial" in partial_sdc, "partial completeness missing from SDC")
+    require("[get_clocks {top_clk}]" in partial_sdc, "available clock missing from partial output")
+    require("[get_clocks {u_missing_clk_o}]" not in partial_sdc, "blocked clock leaked into partial output")
+    require("BLOCKED_BY_MISSING_SDC" in partial_report, "partial blocked status missing from report")
+    wb = load_workbook(str(root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"))
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    blocked = False
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value == "u_missing_clk_o":
+            blocked = ws.cell(row_idx, mapping["sync_status"]).value == "BLOCKED_BY_MISSING_SDC"
+    require(blocked, "missing-instance clock was not marked BLOCKED_BY_MISSING_SDC")
+
+    strict = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "--require-complete-harden-sdc"], BASE)
+    require(strict.returncode == 1, "strict completeness should block partial inventory")
+
+    sdc = root / "01_result/common/01_soc_clocks.sdc"
+    sdc.write_text(sdc.read_text(encoding="utf-8") + "# stale mutation\n", encoding="utf-8")
+    stale_digest = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(stale_digest.returncode == 1, "stale final SDC digest should block generation")
+    require("stale 01 final SDC" in report.read_text(encoding="utf-8"), "stale final SDC digest error missing")
+
+
+def run_cross_scenario_stale_scope_case():
+    root = WORK / "cross_scenario"
+    clean_dir(root)
+    clocks = [{
+        "inst_name": "top",
+        "direction": "input",
+        "clock_name": "func_clk",
+        "clock_kind": "create_clock",
+        "direct_source": "top/func_clk",
+        "final_action": "emit_top_clock",
+    }]
+    write_target_bundle(root, "func", clocks)
+    first = sh([EX02, "--run-root", root, "-scenario", "func", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(first.returncode == 1, "cross-scenario first run should create workbook")
+    fill_all_target_rows(root)
+    path = root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    append_row(ws, mapping, {
+        "scenario": "scan",
+        "stage": "prects",
+        "corner": "ss_125",
+        "clock_name": "scan_only_clk",
+        "setup_uncertainty": 0.2,
+        "apply": "yes",
+        "sync_status": "OK",
+    })
+    wb.save(str(path))
+    result = sh([EX02, "--run-root", root, "-scenario", "func", "-stage", "prects", "-corner", "ss_125"], BASE)
+    require(result.returncode == 0, "unrelated scan-only row should not be stale in func run:\n%s\n%s" % (result.stdout, result.stderr))
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value == "scan_only_clk":
+            require(ws.cell(row_idx, mapping["sync_status"]).value == "OK", "unrelated scenario row was marked stale")
+
+
+def run_nonfinite_numeric_case():
+    d = WORK / "nonfinite_numeric"
+    build_clean_workbook(d)
+    wb = open_budget(d)
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
+            ws.cell(row_idx, mapping["setup_uncertainty"], "nan")
+            break
+    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
+    require(result.returncode == 1, "non-finite numeric case should fail")
+    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("must be finite" in report, "non-finite numeric error missing")
+
+
 def main():
     clean_dir(WORK)
     positive_dir = run_positive_generation()
@@ -502,10 +701,13 @@ def main():
     run_stale_case()
     run_stale_recovery_case()
     run_invalid_numeric_case()
+    run_nonfinite_numeric_case()
     run_duplicate_key_case()
+    run_target_runtime_and_partial_case()
+    run_cross_scenario_stale_scope_case()
     print("02 complex regression: PASS")
     print("  positive artifacts: %s" % positive_dir)
-    print("  extra cases: postcts, uppercase_corner, bit_clock_name, stale, stale_recovery, invalid_numeric, duplicate_key")
+    print("  extra cases: postcts, uppercase_corner, bit_clock_name, stale, stale_recovery, invalid_numeric, nonfinite, duplicate_key, target_runtime, partial, cross_scenario")
     return 0
 
 
