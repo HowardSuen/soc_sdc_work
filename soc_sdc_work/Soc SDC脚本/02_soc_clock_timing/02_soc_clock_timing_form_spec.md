@@ -50,15 +50,16 @@ scenario != common:
 02_soc_clock_timing_budget_postroute.xlsx
 ```
 
-建议包含 3 个 sheet：
+建议包含 4 个 sheet：
 
 ```text
+runtime_metadata
 clock_budget
 clock_pair_uncertainty
 derate_ocv
 ```
 
-第一版脚本强制支持 `clock_budget`。`clock_pair_uncertainty` 和 `derate_ocv` 先作为预留格式。
+`runtime_metadata` 记录最近一次同步的 Author、scenario/stage/corner、run completeness、port-accounting 状态和 01 upstream 绝对路径。第一版脚本强制支持 `clock_budget`。`clock_pair_uncertainty` 和 `derate_ocv` 先作为预留格式。
 
 ## 3. 通用约定
 
@@ -66,14 +67,14 @@ derate_ocv
 - target runtime 中，脚本读取 `01_middle/assembled/<scenario>/clock_inventory.csv` 及其 meta 做 clock name 合法性检查。assembled inventory 必须包含 common + 当前 scenario 的 auto、virtual 和 manual overlay 全部最终 clock，不是 auto-only 或 common-only 中间文件。
 - 02 不应各自重新实现完整 Tcl clock parser；默认使用 final inventory 的结构化字段，并通过 `final_sdc_digest` 和最终 01 SDC 的 clock name 集合检查 manifest 是否 stale。digest 或 clock 集合不一致时阻断生成。
 - 02 只依赖 01 CSV 中真实输出的字段，例如 `clock_name`、`clock_kind`、`direction`、`direct_source`、`final_action`、`source_type`、`final_sdc_digest`；不应假设存在 01 内部 dataclass 才有的临时字段。
-- 02 不直接读取或删除 `00_harden_port_inventory/pending/*.ports`。若某个 vector harden port 的不同 bit 被 01 创建成多个 clock object，02 只看到这些 bit 对应的独立 `clock_name`，例如 `u_x_clk_o_bit0`、`u_x_clk_o_bit1`；不能再用 bus/range 语义推导 budget。
+- 02 不读取或删除任何 target/legacy pending。若某个 vector harden port 的不同 bit 被 01 创建成多个 clock object，02 只看到这些 bit 对应的独立 `clock_name`，例如 `u_x_clk_o_bit0`、`u_x_clk_o_bit1`；不能再用 bus/range 语义推导 budget。
 - 01 assembled meta 可以标记 `Run completeness: partial`。02 可继续为当前 assembled inventory 中已存在的 clock 生成 budget，不因其它 harden SDC 缺失而整体停止。
 - 表单中某 clock 暂未出现在 01 inventory，且能追溯到 missing harden SDC 时，不应标为普通 `STALE_NOT_IN_01`；应标为 `BLOCKED_BY_MISSING_SDC`（或等价明确状态），只阻断该 clock 行的生成。
 - 若 clock 无法追溯到 missing SDC，或 01 assembled run 是 complete，则仍按真实 stale clock 处理。
 - `scenario` 建议使用 `common`、`func`、`scan`、`mbist`、`gpio_in`、`gpio_out`。
 - `scenario = common` 表示所有 mode 都成立的 clock timing budget，只能输出到 `common/`。
 - `scenario != common` 表示 scenario 专属 clock timing budget，必须输出到 `scenarios/`。
-- `stage` 建议使用 `synth`、`prects`、`postcts`、`postroute`；表单按 stage 独立后，同一份表单内的 `stage` 应保持一致。
+- `stage` 使用 `synth`、`prects`、`postcts`、`postroute`；表单按 stage 独立后，同一份表单内的 `stage` 必须非空且保持一致。空白 stage 不得隐式解释为当前命令行 stage。
 - `corner` 使用项目 flow 中的 corner / analysis view 名称，例如 `ss_125`、`ff_m40` 或 `SS_125`。脚本保留用户输入的大小写并用于表单匹配和输出文件名；若项目 MMMC view 名大小写敏感，表单与 assembly 必须使用同一写法。
 - SDC 本身没有 corner 条件化能力；同一个输出 SDC 中不能同时平铺多个 corner 的 `set_clock_uncertainty`、`set_clock_latency`、`set_clock_transition`、`set_timing_derate`。
 - SDC 也没有 scenario 条件化能力；同一个 common 输出 SDC 中不能混入 `func` / `scan` / `mbist` 等 scenario 专属 timing。
@@ -83,12 +84,14 @@ derate_ocv
 - 所有数值使用当前 STA/综合 flow 的 SDC 时间单位；建议项目统一在 flow 文档中声明，例如 ns。脚本生成 SDC 时会把可解析数值规范化为稳定的十进制表示，避免 xlsx 单元格是文本还是数字导致输出精度风格漂移。
 - 数值必须是有限值；`NaN` / `Inf` / `Infinity` 等虽可被 Python `float()` 解析，仍必须阻断生成。
 - 空白数值表示不生成对应命令。
-- `apply = yes` 才生成约束；`apply = no` 表示保留记录但不生成。
+- `apply` 必须显式填 `yes` 或 `no`。`apply = yes` 才生成约束；`apply = no` 表示保留记录但不生成，且必须填写非空 `note` 说明理由。
 - `note` 只用于人工审查，不参与生成。
 - `clock_budget` 建议按 `clock_name -> corner -> scenario` 排序，让同一个 clock 在当前 stage 下的不同 scenario/corner 约束相邻，便于人工比较。
 - 当前阶段不规定不同 `stage` 下哪些数值列必填、哪些必须留空；这些规则后续随具体项目的 STA methodology、CTS 策略和 MMMC flow 再收敛。
 
 如果同时存在 `scenario = common` 和具体 scenario 的同一 clock/stage/corner 记录，脚本必须在生成阶段 resolve 出唯一胜出行。不能同时 emit common 行和具体 scenario 行，再依赖 source 顺序覆盖。
+
+`corner` 和 `clock_name` 按大小写敏感字符串参与匹配和重复 key 检查；例如 `SS_125` 和 `ss_125` 是两个不同 corner。
 
 ## 4. Sheet: `clock_budget`
 
@@ -379,10 +382,12 @@ emit_virtual_clock
 4. `stage` 填当前 `-stage`。
 5. `corner` 填当前 `-corner`。
 6. `clock_name` 来自 01 clock inventory。
-7. `apply` 默认填 `no`。
-8. `sync_status` 填 `NEW_FROM_01`。
-9. 新增行用黄色背景标记。
-10. 脚本打印提醒并中断，不生成 SDC。
+7. `propagated` 默认填 `no`。
+8. `apply` 默认填 `no`。
+9. `sync_status` 填 `NEW_FROM_01`。
+10. 新增行用黄色背景标记。
+11. 生成/更新 `runtime_metadata` sheet。
+12. 脚本打印提醒并中断，不生成 SDC。
 
 这样做是为了让用户先补齐 timing budget，再显式 review。
 
@@ -402,10 +407,11 @@ stage 表单 clock_budget 中当前 -scenario/-corner 的有效胜出 clock_name
 2. `scenario` 填当前 `-scenario`。
 3. `stage` 填当前 `-stage`。
 4. `corner` 填当前 `-corner`。
-5. `apply` 默认填 `no`。
-6. `sync_status` 填 `NEW_FROM_01`。
-7. 新增行用黄色背景标记。
-8. 脚本打印提醒并中断，不生成 SDC。
+5. `propagated` 默认填 `no`。
+6. `apply` 默认填 `no`。
+7. `sync_status` 填 `NEW_FROM_01`。
+8. 新增行用黄色背景标记。
+9. 脚本打印提醒并中断，不生成 SDC。
 
 若表单当前 effective scenario（`common` 或 `common + 当前具体 scenario`）中有、01 中没有：
 
@@ -429,11 +435,13 @@ stage 表单 clock_budget 中当前 -scenario/-corner 的有效胜出 clock_name
 - 当前 `-scenario/-corner` 有尚未补齐约束意图、无法自动复位为 `OK` 的 `NEW_FROM_01` 行。
 - 当前 effective scenario 有仍不在 01 assembled inventory 中的 `STALE_NOT_IN_01` 行。
 - 当前 `-scenario/-corner` 的有效胜出 clock 与 01 clock inventory 不一致。
-- 当前 `-scenario/-corner` 的 `apply`、`propagated` 等枚举字段非法。
+- 当前 `-scenario/-corner` 的 `apply`、`propagated` 等枚举字段非法；`apply` 空白也是非法。
+- 当前胜出行 `apply = no` 但 `note` 为空。
 - 当前 `-scenario/-corner` 的数值字段填写了非数字内容。
 - 当前 `-scenario/-corner` 中 `apply = yes` 的行缺少生成该命令所需的关键信息。
 - 数值为 `NaN` / `Inf` / `Infinity` 等非有限值。
-- 全表任意 `apply = yes` 行若缺少 `scenario` 或 `corner`，视为结构完整性错误并中断；这类行无法安全参与 scenario/corner resolve，不按当前目标过滤。
+- 全表任意 `apply = yes` 行若缺少 `scenario`、`stage` 或 `corner`，视为结构完整性错误并中断；这类行无法安全参与 resolve，不按当前目标过滤。
+- `clock_budget` 表头重复、缺失或无法唯一映射。旧表单缺少可安全新增的列时，脚本可追加并中断一次等待 review；不得改写无关表头。
 
 当前阶段暂不强制区分不同 stage 哪些数值列必填或必须留空；只检查“用户填了的值是否合法”以及“要生成某条具体 SDC 命令时，所需字段是否存在”。除 `apply = yes` 的结构完整性检查外，命令生成相关检查只阻塞当前 `-scenario/-stage/-corner`；其它 scenario/corner 中尚未填写的数值不阻塞当前输出。
 
@@ -474,6 +482,8 @@ target runtime 成功生成时同时写入：
 
 该 manifest 记录 01 inventory/meta/final SDC digest、表单 digest、输出 SDC digest、run completeness 和每个 winning row 是否实际 emit。
 
+stdout、最终 SDC、report、resolved manifest 和 workbook `runtime_metadata` 至少记录 Author、canonical Scenario、run completeness、`Port accounting: not applicable`、`Connection inventory: not used by stage 02` 以及当前 01 assembled inventory/meta 路径。02 不读取 harden SDC manifest，也不读取或修改 pending/removed log。
+
 生成文件建议为：
 
 ```text
@@ -510,8 +520,9 @@ set_propagated_clock
 
 - 当前 `-scenario/-stage/-corner` resolve 后的有效胜出 clock 是否覆盖 01 的 `clock_inventory.csv`。
 - 表单当前 effective scenario 中是否存在 01 assembled inventory 已不存在的 stale clock。
-- 同一 `scenario/stage/corner/clock_name` 是否重复定义。
-- `apply`、`propagated` 是否为合法 yes/no（`clock_budget` sheet）。
+- 同一 `scenario/stage/corner/clock_name` 是否重复定义；corner 大小写敏感。
+- `apply`、`propagated` 是否为合法 yes/no（`clock_budget` sheet）；`apply` 必须显式填写，`apply=no` 必须有 note。
+- `scenario/stage/corner` 是否完整，以及表头是否唯一、可安全映射。
 - `sync_status` 是否为合法状态：空白、`OK`、`NEW_FROM_01`、`STALE_NOT_IN_01`、`BLOCKED_BY_MISSING_SDC`。
 - 是否存在会阻止生成的同步状态：当前 `-scenario/-corner` 的 `NEW_FROM_01`，或当前 effective scenario 的 `STALE_NOT_IN_01`。
 - `BLOCKED_BY_MISSING_SDC` 只阻断当前受影响 clock/view，不阻断其它已到位 clock 的输出；strict completeness mode 除外。
@@ -542,7 +553,8 @@ set_propagated_clock
 第一版 02 脚本先只支持：
 
 ```text
-clock_budget
+runtime_metadata   # 脚本维护，不生成 timing 命令
+clock_budget       # 生成 timing 命令
 ```
 
 并只生成：

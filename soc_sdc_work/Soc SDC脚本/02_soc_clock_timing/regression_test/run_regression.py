@@ -7,7 +7,10 @@ The test builds fresh inputs under work_complex/ and checks:
   * scenario resolved-effective generation with common fallback and scenario override
   * explicit apply=no suppression of a common fallback row
   * warnings for virtual/generated/propagated methodology risks
-  * blocking negative cases: stale clock, invalid numeric value, duplicate key
+  * runtime metadata in stdout, SDC, report, workbook, and resolved manifest
+  * blocking negative cases: stale clock, invalid numeric value, duplicate key,
+    blank stage/apply, apply=no without note, and duplicate headers
+  * safe missing-header migration, reordered headers, and case-sensitive corners
 """
 from __future__ import print_function
 
@@ -204,6 +207,14 @@ def run_initial_gate(d):
     result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
     require(result.returncode == 1, "first 02 run should create workbook and stop")
     require((d / "02_soc_clock_timing_budget_prects.xlsx").is_file(), "stage workbook was not created")
+    wb = open_budget(d)
+    metadata = runtime_metadata_map(wb)
+    require(metadata["Scenario"] == "common", "legacy workbook scenario metadata missing")
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value:
+            require(ws.cell(row_idx, mapping["propagated"]).value == "no", "new row propagated default is not no")
     report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
     require("created new stage workbook" in report, "first-run report missing workbook creation warning")
 
@@ -222,6 +233,16 @@ def header_map(ws):
         if "clock_name" in mapping:
             return row_idx, mapping
     raise AssertionError("clock_budget header not found")
+
+
+def runtime_metadata_map(wb):
+    require("runtime_metadata" in wb.sheetnames, "runtime_metadata sheet missing")
+    ws = wb["runtime_metadata"]
+    return {
+        str(ws.cell(row_idx, 1).value).strip(): str(ws.cell(row_idx, 2).value).strip()
+        for row_idx in range(2, ws.max_row + 1)
+        if ws.cell(row_idx, 1).value
+    }
 
 
 def last_data_row(ws, header_row, mapping):
@@ -406,6 +427,23 @@ def run_uppercase_corner_case():
     require("corner: SS_125" in sdc, "uppercase corner not preserved in SDC header")
     require("set_clock_uncertainty -setup 0.07 [get_clocks {top_sys_clk_pad}]" in sdc, "uppercase corner command missing")
 
+    wb = open_budget(d)
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    append_row(ws, mapping, {
+        "scenario": "common",
+        "stage": "prects",
+        "corner": "ss_125",
+        "clock_name": "top_sys_clk_pad",
+        "setup_uncertainty": 0.08,
+        "propagated": "no",
+        "apply": "yes",
+        "sync_status": "OK",
+    })
+    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
+    rerun = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "SS_125", "-input", "clock_inventory.csv"], d)
+    require(rerun.returncode == 0, "case-distinct corner row was incorrectly treated as duplicate")
+
 
 def run_bit_clock_name_case():
     d = WORK / "bit_clock_name"
@@ -556,6 +594,120 @@ def run_duplicate_key_case():
     require("duplicate scenario/stage/corner/clock_name key" in report, "duplicate key error missing")
 
 
+def run_blank_apply_case():
+    d = WORK / "blank_apply"
+    build_clean_workbook(d)
+    wb = open_budget(d)
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
+            ws.cell(row_idx, mapping["apply"]).value = None
+            ws.cell(row_idx, mapping["sync_status"], "OK")
+            break
+    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
+    require(result.returncode == 1, "blank apply should fail")
+    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("apply must be explicitly yes/no" in report, "blank apply error missing")
+
+
+def run_apply_no_without_note_case():
+    d = WORK / "apply_no_without_note"
+    build_clean_workbook(d)
+    wb = open_budget(d)
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
+            set_row(ws, row_idx, mapping, {"apply": "no", "sync_status": "OK"})
+            ws.cell(row_idx, mapping["note"]).value = None
+            break
+    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
+    require(result.returncode == 1, "apply=no without note should fail")
+    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("apply=no requires a non-empty note" in report, "apply=no note error missing")
+
+
+def run_blank_stage_case():
+    d = WORK / "blank_stage"
+    build_clean_workbook(d)
+    wb = open_budget(d)
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    append_row(ws, mapping, {
+        "scenario": "common",
+        "stage": "",
+        "corner": "ff_m40",
+        "clock_name": "top_sys_clk_pad",
+        "setup_uncertainty": 0.09,
+        "propagated": "no",
+        "apply": "yes",
+        "sync_status": "OK",
+    })
+    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
+    require(result.returncode == 1, "apply=yes row with blank stage should fail")
+    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("apply=yes but stage is blank" in report, "blank stage structural error missing")
+
+
+def run_header_integrity_cases():
+    missing_dir = WORK / "missing_header"
+    build_clean_workbook(missing_dir)
+    path = missing_dir / "02_soc_clock_timing_budget_prects.xlsx"
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    ws.delete_cols(mapping["sync_status"])
+    wb.save(str(path))
+    first = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], missing_dir)
+    require(first.returncode == 1, "missing header migration should update workbook and gate once")
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    require("sync_status" in mapping and "note" in mapping, "missing sync_status header was not restored")
+    notes = [ws.cell(row_idx, mapping["note"]).value for row_idx in range(1, ws.max_row + 1)]
+    require("func override" in notes, "missing-header migration corrupted note data")
+    second = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], missing_dir)
+    require(second.returncode == 0, "migrated workbook did not generate on review rerun")
+
+    reordered_dir = WORK / "reordered_headers"
+    build_clean_workbook(reordered_dir)
+    path = reordered_dir / "02_soc_clock_timing_budget_prects.xlsx"
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    header_row, mapping = header_map(ws)
+    left = mapping["sync_status"]
+    right = mapping["note"]
+    for row_idx in range(header_row, ws.max_row + 1):
+        left_value = ws.cell(row_idx, left).value
+        ws.cell(row_idx, left, ws.cell(row_idx, right).value)
+        ws.cell(row_idx, right, left_value)
+    wb.save(str(path))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], reordered_dir)
+    require(result.returncode == 0, "reordered valid headers should remain usable")
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    _, mapping = header_map(ws)
+    notes = [ws.cell(row_idx, mapping["note"]).value for row_idx in range(1, ws.max_row + 1)]
+    require("func override" in notes, "reordered-header handling corrupted note data")
+
+    duplicate_dir = WORK / "duplicate_header"
+    build_clean_workbook(duplicate_dir)
+    path = duplicate_dir / "02_soc_clock_timing_budget_prects.xlsx"
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    header_row, _ = header_map(ws)
+    ws.cell(header_row, ws.max_column + 1, "apply")
+    wb.save(str(path))
+    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], duplicate_dir)
+    require(result.returncode == 2, "duplicate header should fail structurally")
+    report = (duplicate_dir / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("duplicate header(s): apply" in report, "duplicate header error missing")
+
+
 def fill_all_target_rows(root, stage="prects"):
     path = root / "02_middle" / ("02_soc_clock_timing_budget_%s.xlsx" % stage)
     wb = load_workbook(str(path))
@@ -596,6 +748,16 @@ def run_target_runtime_and_partial_case():
     first = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
     require(first.returncode == 1, "target first run should create 02_middle workbook")
     require(first.stdout.count("Author: Howard") == 1, "target stdout author marker missing or duplicated")
+    require("Scenario: common" in first.stdout, "target stdout scenario metadata missing")
+    require("Run completeness: complete" in first.stdout, "target stdout completeness metadata missing")
+    require("Port accounting: not applicable" in first.stdout, "target stdout accounting metadata missing")
+    first_wb = load_workbook(str(root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"))
+    first_metadata = runtime_metadata_map(first_wb)
+    require(first_metadata["Author"] == "Howard", "workbook author metadata missing")
+    require(first_metadata["Scenario"] == "common", "workbook scenario metadata missing")
+    require(first_metadata["Run completeness"] == "complete", "workbook completeness metadata missing")
+    require(first_metadata["Port accounting"].startswith("not applicable"), "workbook accounting metadata missing")
+    require(first_metadata["Connection inventory"] == "not used by stage 02", "workbook connection metadata missing")
     fill_all_target_rows(root)
 
     complete = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
@@ -605,8 +767,18 @@ def run_target_runtime_and_partial_case():
     manifest = root / "02_middle/resolved/common_prects_ss_125.manifest"
     for path in (output, report, manifest):
         require(path.is_file(), "target artifact missing: %s" % path)
-    require("Author: Howard" in output.read_text(encoding="utf-8"), "target SDC author metadata missing")
-    require("Author  : Howard" in report.read_text(encoding="utf-8"), "target report author metadata missing")
+    output_text = output.read_text(encoding="utf-8")
+    report_text = report.read_text(encoding="utf-8")
+    require("Author: Howard" in output_text, "target SDC author metadata missing")
+    require("# Scenario: common" in output_text, "target SDC scenario metadata missing")
+    require("# Port accounting: not applicable" in output_text, "target SDC accounting metadata missing")
+    require("# Connection inventory: not used by stage 02" in output_text, "target SDC connection metadata missing")
+    require("Author: Howard" in report_text, "target report author metadata missing")
+    require("Port accounting: not applicable" in report_text, "target report accounting metadata missing")
+    require("Connection inventory: not used by stage 02" in report_text, "target report connection metadata missing")
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    require(manifest_payload["port_accounting"].startswith("not applicable"), "manifest accounting metadata missing")
+    require(manifest_payload["connection_inventory"] == "not used by stage 02", "manifest connection metadata missing")
 
     write_target_bundle(root, "common", clocks[:1], completeness="partial", missing_instances=["u_missing"])
     partial = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
@@ -618,6 +790,9 @@ def run_target_runtime_and_partial_case():
     require("[get_clocks {u_missing_clk_o}]" not in partial_sdc, "blocked clock leaked into partial output")
     require("BLOCKED_BY_MISSING_SDC" in partial_report, "partial blocked status missing from report")
     wb = load_workbook(str(root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"))
+    partial_metadata = runtime_metadata_map(wb)
+    require(partial_metadata["Run completeness"] == "partial", "workbook partial completeness was not refreshed")
+    require(partial_metadata["Missing instances"] == "u_missing", "workbook missing-instance metadata was not refreshed")
     ws = wb["clock_budget"]
     header_row, mapping = header_map(ws)
     blocked = False
@@ -703,11 +878,15 @@ def main():
     run_invalid_numeric_case()
     run_nonfinite_numeric_case()
     run_duplicate_key_case()
+    run_blank_apply_case()
+    run_apply_no_without_note_case()
+    run_blank_stage_case()
+    run_header_integrity_cases()
     run_target_runtime_and_partial_case()
     run_cross_scenario_stale_scope_case()
     print("02 complex regression: PASS")
     print("  positive artifacts: %s" % positive_dir)
-    print("  extra cases: postcts, uppercase_corner, bit_clock_name, stale, stale_recovery, invalid_numeric, nonfinite, duplicate_key, target_runtime, partial, cross_scenario")
+    print("  extra cases: postcts, uppercase_corner, bit_clock_name, stale, stale_recovery, invalid_numeric, nonfinite, duplicate_key, explicit_apply, blank_stage, header_integrity, target_runtime, partial, cross_scenario")
     return 0
 
 

@@ -82,6 +82,10 @@ YES_NO = {"yes", "no"}
 SYNC_OK = {"", "OK"}
 SYNC_BLOCKED_MISSING = "BLOCKED_BY_MISSING_SDC"
 SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING}
+RUNTIME_METADATA_SHEET = "runtime_metadata"
+PORT_ACCOUNTING_STATUS = "not applicable (stage 02 never updates pending)"
+CONNECTION_INVENTORY_STATUS = "not used by stage 02"
+HARDEN_SDC_MANIFEST_STATUS = "not used by stage 02"
 
 CLOCK_BUDGET_HEADERS = [
     "scenario",
@@ -583,20 +587,89 @@ def setup_aux_sheet(wb: Workbook, name: str, headers: Sequence[str], stage: str)
     set_widths(ws, [12, 10, 12, 20, 20, 16, 16, 12, 40, 40][: len(headers)])
 
 
+def runtime_metadata_rows(
+    scenario: str,
+    stage: str,
+    corner: str,
+    inventory: InventoryContext,
+) -> List[Tuple[str, str]]:
+    return [
+        ("Author", author_name()),
+        ("Stage ID", "02_soc_clock_timing"),
+        ("Script", "02_extract_soc_clock_timing.py"),
+        ("Scenario", scenario),
+        ("Timing stage", stage),
+        ("Corner", corner),
+        ("Run completeness", inventory.completeness),
+        ("Port accounting", PORT_ACCOUNTING_STATUS),
+        ("Connection inventory", CONNECTION_INVENTORY_STATUS),
+        ("Harden SDC manifest", HARDEN_SDC_MANIFEST_STATUS),
+        ("Clock inventory", str(inventory.path.resolve())),
+        ("Clock inventory meta", str(inventory.meta_path.resolve()) if inventory.meta_path else "<none>"),
+        ("Final clock SDC", str(inventory.final_sdc_path.resolve()) if inventory.final_sdc_path else "<none>"),
+        ("Missing instances", ", ".join(inventory.missing_instances) or "<none>"),
+    ]
+
+
+def update_runtime_metadata_sheet(
+    wb,
+    scenario: str,
+    stage: str,
+    corner: str,
+    inventory: InventoryContext,
+) -> bool:
+    expected = runtime_metadata_rows(scenario, stage, corner, inventory)
+    if RUNTIME_METADATA_SHEET in wb.sheetnames:
+        ws = wb[RUNTIME_METADATA_SHEET]
+        existing = [
+            (clean_cell(ws.cell(row_idx, 1).value), clean_cell(ws.cell(row_idx, 2).value))
+            for row_idx in range(2, ws.max_row + 1)
+            if clean_cell(ws.cell(row_idx, 1).value)
+        ]
+        if existing == expected:
+            return False
+        for merged_range in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(merged_range))
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(RUNTIME_METADATA_SHEET, 0)
+
+    ws.sheet_view.showGridLines = False
+    ws.cell(1, 1, "02 SoC Clock Timing Runtime Metadata")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+    ws.cell(1, 1).fill = TITLE_FILL
+    ws.cell(1, 1).font = Font(bold=True, color="FFFFFF", size=14)
+    for row_idx, (key, value) in enumerate(expected, start=2):
+        ws.cell(row_idx, 1, key)
+        ws.cell(row_idx, 2, value)
+        ws.cell(row_idx, 1).font = Font(bold=True)
+        ws.cell(row_idx, 1).fill = SUBTITLE_FILL
+        for col_idx in (1, 2):
+            ws.cell(row_idx, col_idx).border = THIN_BORDER
+            ws.cell(row_idx, col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 100
+    ws.freeze_panes = "A2"
+    if "clock_budget" in wb.sheetnames:
+        wb.active = wb.sheetnames.index("clock_budget")
+    return True
+
+
 def create_new_workbook(
     form_path: Path,
     scenario: str,
     stage: str,
     corner: str,
-    clocks: Dict[str, ClockInfo],
+    inventory: InventoryContext,
 ) -> None:
     wb = Workbook()
     setup_clock_budget_sheet(wb, stage)
     setup_aux_sheet(wb, "clock_pair_uncertainty", PAIR_HEADERS, stage)
     setup_aux_sheet(wb, "derate_ocv", DERATE_HEADERS, stage)
 
+    update_runtime_metadata_sheet(wb, scenario, stage, corner, inventory)
     ws = wb["clock_budget"]
-    for clock_name in sorted(clocks):
+    for clock_name in sorted(inventory.clocks):
         append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
     refresh_clock_budget_table(ws)
     atomic_save_workbook(wb, form_path)
@@ -605,11 +678,19 @@ def create_new_workbook(
 def find_header_row(ws, required: str = "clock_name") -> Tuple[int, Dict[str, int]]:
     for row_idx in range(1, min(ws.max_row, 30) + 1):
         mapping: Dict[str, int] = {}
+        duplicates: Set[str] = set()
         for col_idx in range(1, ws.max_column + 1):
             value = clean_cell(ws.cell(row_idx, col_idx).value)
             if value:
+                if value in mapping:
+                    duplicates.add(value)
                 mapping[value] = col_idx
         if required in mapping:
+            if duplicates:
+                raise RuntimeError(
+                    f"sheet {ws.title} row {row_idx} contains duplicate header(s): "
+                    + ", ".join(sorted(duplicates))
+                )
             return row_idx, mapping
     raise RuntimeError(f"sheet {ws.title} does not contain a {required} header")
 
@@ -626,9 +707,15 @@ def ensure_clock_budget_headers(ws) -> Tuple[int, Dict[str, int], bool]:
             ws.insert_cols(insert_at)
             mapping = {key: (value + 1 if value >= insert_at else value) for key, value in mapping.items()}
         ws.cell(header_row, insert_at, header)
-        mapping[header] = insert_at
         changed = True
-    write_header(ws, CLOCK_BUDGET_HEADERS, header_row)
+        header_row, mapping = find_header_row(ws)
+    for header in CLOCK_BUDGET_HEADERS:
+        cell = ws.cell(header_row, mapping[header])
+        cell.fill = HEADER_FILL
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        cell.border = THIN_BORDER
+    ws.freeze_panes = f"A{header_row + 1}"
     return header_row, mapping, changed
 
 
@@ -648,6 +735,7 @@ def append_clock_row(
         "stage": stage,
         "corner": corner,
         "clock_name": clock_name,
+        "propagated": "no",
         "apply": "no",
         "sync_status": sync_status,
     }
@@ -706,7 +794,7 @@ def resolve_winning_rows(rows: Sequence[BudgetRow], scenario: str, stage: str, c
         clock_name = row_clock_name(row)
         if not clock_name:
             continue
-        if (row_stage_key(row) or stage) != stage:
+        if row_stage_key(row) != stage:
             continue
         if row_corner_key(row) != corner:
             continue
@@ -758,7 +846,7 @@ def sync_workbook(
     relevant_rows = [
         row
         for row in rows
-        if row_scenario_key(row) in relevant_scenarios and (row_stage_key(row) or stage) == stage
+        if row_scenario_key(row) in relevant_scenarios and row_stage_key(row) == stage
     ]
     stale = sorted({row_clock_name(row) for row in relevant_rows if row_clock_name(row)} - inv_clocks)
 
@@ -776,7 +864,7 @@ def sync_workbook(
         clock_name = clean_cell(row.values.get("clock_name"))
         if not clock_name:
             continue
-        row_is_relevant = row_scenario_key(row) in relevant_scenarios and (row_stage_key(row) or stage) == stage
+        row_is_relevant = row_scenario_key(row) in relevant_scenarios and row_stage_key(row) == stage
         if row_is_relevant and clock_name in stale:
             if clock_traces_to_missing_instance(clock_name, inventory.missing_instances):
                 if clean_cell(row.values.get("sync_status")) != SYNC_BLOCKED_MISSING:
@@ -871,8 +959,8 @@ def validate_rows(
         elif row_scenario not in SCENARIOS:
             report.error(f"clock_budget row {row.row_idx} {clock_name}: invalid scenario {row_scenario}")
 
-        row_corner = normalize_key(values.get("corner"))
-        key = (row_scenario, row_stage or stage, row_corner, clock_name)
+        row_corner = clean_cell(values.get("corner"))
+        key = (row_scenario, row_stage, row_corner, clock_name)
         if key in seen_keys:
             report.error(
                 f"clock_budget row {row.row_idx} {clock_name}: duplicate scenario/stage/corner/clock_name key {key}"
@@ -889,7 +977,7 @@ def validate_rows(
         if (
             sync_value == "STALE_NOT_IN_01"
             and row_scenario in relevant_scenarios
-            and (row_stage or stage) == stage
+            and row_stage == stage
         ):
             report.error(f"clock_budget row {row.row_idx} {clock_name}: blocking sync_status {sync_value}")
         if selected and sync_value == "NEW_FROM_01":
@@ -897,6 +985,8 @@ def validate_rows(
 
         if apply_value == "yes" and not row_scenario:
             report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but scenario is blank")
+        if apply_value == "yes" and not row_stage:
+            report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but stage is blank")
         if apply_value == "yes" and not row_corner:
             report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but corner is blank")
 
@@ -913,8 +1003,11 @@ def validate_rows(
             warn_clock_kind_budget_mismatch(row, clock_info, report)
         warn_propagated_budget_mismatch(row, report)
 
-        if apply_value and apply_value not in YES_NO:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: apply must be yes/no, got {apply_value}")
+        if apply_value not in YES_NO:
+            report.error(
+                f"clock_budget row {row.row_idx} {clock_name}: apply must be explicitly yes/no, "
+                f"got {apply_value or '<blank>'}"
+            )
         if propagated_value and propagated_value not in YES_NO:
             report.error(
                 f"clock_budget row {row.row_idx} {clock_name}: propagated must be yes/no, got {propagated_value}"
@@ -928,6 +1021,10 @@ def validate_rows(
             elif number is not None and not math.isfinite(number):
                 report.error(f"clock_budget row {row.row_idx} {clock_name}: {col} must be finite, got {text}")
 
+        if apply_value == "no" and not clean_cell(values.get("note")):
+            report.error(
+                f"clock_budget row {row.row_idx} {clock_name}: apply=no requires a non-empty note"
+            )
         if apply_value == "yes":
             if not row_generates_any_command(values):
                 report.error(
@@ -997,7 +1094,13 @@ def generate_sdc(
         f"# Author: {author_name()}",
         "# Stage: 02_soc_clock_timing",
         "# Script: 02_extract_soc_clock_timing.py",
+        f"# Scenario: {scenario}",
         f"# Run completeness: {inventory.completeness}",
+        f"# Port accounting: {PORT_ACCOUNTING_STATUS}",
+        f"# Connection inventory: {CONNECTION_INVENTORY_STATUS}",
+        f"# Harden SDC manifest: {HARDEN_SDC_MANIFEST_STATUS}",
+        f"# Clock inventory: {inventory.path.resolve()}",
+        f"# Clock inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
         f"# Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
         f"# Source: 02_soc_clock_timing_budget_{stage}.xlsx clock_budget sheet",
         "# Rows are resolved by scenario priority: selected scenario > common.",
@@ -1063,12 +1166,16 @@ def write_report(
         "02_soc_clock_timing extraction report",
         "=====================================",
         "",
-        f"Author  : {author_name()}",
+        f"Author: {author_name()}",
         "Stage ID: 02_soc_clock_timing",
         "Script  : 02_extract_soc_clock_timing.py",
         f"Scenario: {scenario}",
         f"Stage   : {stage}",
         f"Corner  : {corner}",
+        f"Run completeness: {inventory.completeness if inventory is not None else 'unknown'}",
+        f"Port accounting: {PORT_ACCOUNTING_STATUS}",
+        f"Connection inventory: {CONNECTION_INVENTORY_STATUS}",
+        f"Harden SDC manifest: {HARDEN_SDC_MANIFEST_STATUS}",
         f"Form    : {form_path}",
         f"Output  : {output_path}",
         f"Warnings: {report.warning_count}",
@@ -1077,10 +1184,9 @@ def write_report(
     ]
     if inventory is not None:
         lines.extend([
-            f"Run completeness: {inventory.completeness}",
             f"Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
-            f"Inventory: {inventory.path.resolve()}",
-            f"Inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
+            f"Clock inventory: {inventory.path.resolve()}",
+            f"Clock inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
             f"Final clock SDC: {inventory.final_sdc_path.resolve() if inventory.final_sdc_path else '<none>'}",
         ])
     lines.extend(["", "Messages:"])
@@ -1121,6 +1227,9 @@ def write_resolved_manifest(
         "timing_stage": stage,
         "corner": corner,
         "run_completeness": inventory.completeness,
+        "port_accounting": PORT_ACCOUNTING_STATUS,
+        "connection_inventory": CONNECTION_INVENTORY_STATUS,
+        "harden_sdc_manifest": HARDEN_SDC_MANIFEST_STATUS,
         "missing_instances": list(inventory.missing_instances),
         "inventory_path": str(inventory.path.resolve()),
         "inventory_digest": sha256_file(inventory.path),
@@ -1188,6 +1297,11 @@ def main(argv: Sequence[str]) -> int:
     if not corner:
         print("ERROR: -corner must not be blank", file=sys.stderr)
         return 2
+    print(f"Scenario: {scenario}")
+    print(f"Timing stage: {stage}")
+    print(f"Corner: {corner}")
+    print(f"Port accounting: {PORT_ACCOUNTING_STATUS}")
+    print(f"Connection inventory: {CONNECTION_INVENTORY_STATUS}")
     corner_token = safe_filename_token(corner)
     cwd = Path.cwd()
     target_layout = bool(args.run_root)
@@ -1267,14 +1381,18 @@ def main(argv: Sequence[str]) -> int:
             require_meta=target_layout,
         )
     except Exception as exc:
+        print("Run completeness: unknown")
         report.error(str(exc))
         write_report(report_path, report, scenario, stage, corner, form_path, output_path)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     if report.error_count:
+        print(f"Run completeness: {inventory.completeness}")
         write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
         print(f"ERROR: failed to load clean 01 clock inventory. Report: {report_path}", file=sys.stderr)
         return 1
+    print(f"Run completeness: {inventory.completeness}")
+    print(f"Clock inventory: {inventory.path.resolve()}")
     if args.require_complete_harden_sdc and inventory.completeness != "complete":
         report.error(
             "01 assembled inventory is partial and --require-complete-harden-sdc was requested"
@@ -1284,7 +1402,7 @@ def main(argv: Sequence[str]) -> int:
         return 1
 
     if not form_path.is_file():
-        create_new_workbook(form_path, scenario, stage, corner, inventory.clocks)
+        create_new_workbook(form_path, scenario, stage, corner, inventory)
         report.sync_changed = True
         report.warn(f"created new stage workbook: {form_path}")
         report.warn("fill timing budget values and set sync_status to OK before generating SDC")
@@ -1299,7 +1417,10 @@ def main(argv: Sequence[str]) -> int:
         ws, header_row, mapping, rows = sync_workbook(
             wb, form_path, scenario, stage, corner, inventory, report
         )
-        if report.sync_changed:
+        metadata_changed = update_runtime_metadata_sheet(wb, scenario, stage, corner, inventory)
+        if metadata_changed:
+            report.info(f"updated {RUNTIME_METADATA_SHEET} sheet for current runtime view")
+        if report.sync_changed or metadata_changed:
             atomic_save_workbook(wb, form_path)
             if report.sync_blocking_changed:
                 write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
@@ -1338,9 +1459,6 @@ def main(argv: Sequence[str]) -> int:
         print(f"Report: {report_path}", file=sys.stderr)
         return 2
 
-    print(f"Scenario: {scenario}")
-    print(f"Stage : {stage}")
-    print(f"Corner: {corner}")
     print(f"Form  : {form_path}")
     print(f"SDC   : {output_path}")
     print(f"Report: {report_path}")

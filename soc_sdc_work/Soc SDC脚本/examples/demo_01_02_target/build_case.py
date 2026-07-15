@@ -41,6 +41,8 @@ def write_connection_inventory():
     path = RUN_ROOT / "00_middle/connection_inventory.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
+        "schema_version",
+        "scenario_scope",
         "connection_id",
         "connection_type",
         "src_instance",
@@ -48,12 +50,23 @@ def write_connection_inventory():
         "src_port",
         "src_bit_index",
         "src_endpoint_key",
+        "src_soc_object",
         "dst_instance",
         "dst_direction",
         "dst_port",
         "dst_bit_index",
         "dst_endpoint_key",
+        "dst_soc_object",
+        "fanout_index",
+        "range_source_expr",
+        "range_sink_expr",
+        "bit_pair_order",
+        "source_workbook",
+        "source_sheet",
+        "source_row",
         "validation_status",
+        "owner_hint",
+        "note",
     ]
     rows = [
         {
@@ -86,7 +99,11 @@ def write_connection_inventory():
     with path.open("w", encoding="utf-8", newline="") as file_obj:
         writer = csv.DictWriter(file_obj, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            item = dict(row)
+            item["schema_version"] = "1"
+            item["scenario_scope"] = "common"
+            writer.writerow(item)
 
 
 def write_manifest():
