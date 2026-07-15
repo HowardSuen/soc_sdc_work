@@ -35,6 +35,16 @@ REQ_COLS = [
     "Output", "Output Width", "Output Used Width", "To Top",
 ]
 
+CONNECTION_FIELDS = [
+    "schema_version", "connection_id", "scenario_scope", "connection_type",
+    "src_instance", "src_direction", "src_port", "src_bit_index",
+    "src_endpoint_key", "src_soc_object", "dst_instance", "dst_direction",
+    "dst_port", "dst_bit_index", "dst_endpoint_key", "dst_soc_object",
+    "fanout_index", "range_source_expr", "range_sink_expr", "bit_pair_order",
+    "source_workbook", "source_sheet", "source_row", "validation_status",
+    "owner_hint", "note",
+]
+
 
 def clean_dir(path):
     if path.exists():
@@ -71,20 +81,34 @@ def write_pending(root, inst_name, lines):
     (pending / (inst_name + ".ports")).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def write_connection_inventory(root, rows):
-    path = root / "00_harden_port_inventory" / "connection_inventory.csv"
+def write_connection_inventory_path(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "connection_id", "connection_type",
-        "src_instance", "src_direction", "src_port", "src_bit_index", "src_endpoint_key",
-        "dst_instance", "dst_direction", "dst_port", "dst_bit_index", "dst_endpoint_key",
-        "validation_status",
-    ]
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=CONNECTION_FIELDS)
         writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+        for row_idx, row in enumerate(rows, start=2):
+            item = dict(row)
+            item.setdefault("schema_version", "1")
+            item.setdefault("scenario_scope", "common")
+            item.setdefault("src_soc_object", "%s/%s" % (item.get("src_instance", ""), item.get("src_port", "")))
+            item.setdefault("dst_soc_object", "%s/%s" % (item.get("dst_instance", ""), item.get("dst_port", "")))
+            item.setdefault("fanout_index", "0")
+            item.setdefault("range_source_expr", item.get("src_port", ""))
+            item.setdefault("range_sink_expr", item.get("dst_port", ""))
+            item.setdefault("bit_pair_order", "explicit_map")
+            item.setdefault("source_workbook", "regression")
+            item.setdefault("source_sheet", "connections")
+            item.setdefault("source_row", str(row_idx))
+            item.setdefault("owner_hint", "")
+            item.setdefault("note", "")
+            writer.writerow(item)
+
+
+def write_connection_inventory(root, rows):
+    write_connection_inventory_path(
+        root / "00_harden_port_inventory" / "connection_inventory.csv",
+        rows,
+    )
 
 
 def write_harden_sdc_manifest(root, rows):
@@ -196,6 +220,45 @@ def build_positive_case(d):
     ])
 
     write_connection_inventory(d, [
+        {
+            "connection_id": "CONN_top_sys_clk_pad__u_pll_ref_clk_in",
+            "connection_type": "clock_connection",
+            "src_instance": "top",
+            "src_direction": "input",
+            "src_port": "sys_clk_pad",
+            "src_endpoint_key": "top:input:sys_clk_pad",
+            "dst_instance": "u_pll",
+            "dst_direction": "input",
+            "dst_port": "ref_clk_in",
+            "dst_endpoint_key": "u_pll:input:ref_clk_in",
+            "validation_status": "matched",
+        },
+        {
+            "connection_id": "CONN_u_pll_core_clk_o__u_fab0_fab_clk_i",
+            "connection_type": "clock_connection",
+            "src_instance": "u_pll",
+            "src_direction": "output",
+            "src_port": "core_clk_o",
+            "src_endpoint_key": "u_pll:output:core_clk_o",
+            "dst_instance": "u_fab0",
+            "dst_direction": "input",
+            "dst_port": "fab_clk_i",
+            "dst_endpoint_key": "u_fab0:input:fab_clk_i",
+            "validation_status": "matched",
+        },
+        {
+            "connection_id": "CONN_top_ref_pad__u_edge_ref_i",
+            "connection_type": "clock_connection",
+            "src_instance": "top",
+            "src_direction": "input",
+            "src_port": "ref_pad",
+            "src_endpoint_key": "top:input:ref_pad",
+            "dst_instance": "u_edge",
+            "dst_direction": "input",
+            "dst_port": "ref_i",
+            "dst_endpoint_key": "u_edge:input:ref_i",
+            "validation_status": "matched",
+        },
         {
             "connection_id": "CONN_u_pll_bus_clk_o_bit1__u_fab0_fab_bus_clk_i_bit0",
             "connection_type": "clock_connection",
@@ -378,16 +441,24 @@ def run_target_layout_case():
             "sdc_path": "inputs/edge_mod.sdc", "availability_status": "available",
         },
     ])
+    for workbook in inputs.glob("*.xlsx"):
+        workbook.unlink()
     result = sh([EX01, "--run-root", root, "--debug"], BASE)
     require(result.returncode == 0, "target layout run failed:\n%s\n%s" % (result.stdout, result.stderr))
     require(result.stdout.count("Author: Howard") == 1, "target stdout author marker missing or duplicated")
+    rerun = sh([EX01, "--run-root", root, "--debug"], BASE)
+    require(rerun.returncode == 0, "target layout rerun was not idempotent:\n%s\n%s" % (rerun.stdout, rerun.stderr))
     sdc = root / "01_result" / "common" / "01_soc_clocks.sdc"
     inventory = root / "01_middle" / "common" / "clock_inventory.csv"
+    scenario_inventory = root / "01_middle" / "scenario" / "common" / "clock_inventory.csv"
     assembled = root / "01_middle" / "assembled" / "common" / "clock_inventory.csv"
     meta = root / "01_middle" / "assembled" / "common" / "clock_inventory.meta"
-    report = root / "01_result" / "reports" / "clock_check_report.txt"
-    for path in (sdc, inventory, assembled, meta, report):
+    report = root / "01_result" / "reports" / "clock_check_report_common.txt"
+    for path in (sdc, inventory, scenario_inventory, assembled, meta, report):
         require(path.is_file(), "target artifact missing: %s" % path)
+    target_report = report.read_text(encoding="utf-8")
+    require("Scenario: common" in target_report, "target report scenario metadata missing")
+    require("Port accounting: enabled" in target_report, "target report accounting status missing")
     payload = json.loads(meta.read_text(encoding="utf-8"))
     require(payload["scenario"] == "common" and payload["clock_count"] > 0, "assembled metadata invalid")
     require(payload["run_completeness"] == "complete", "complete target metadata missing")
@@ -419,14 +490,21 @@ def build_partial_target_case(root):
         encoding="utf-8",
     )
     conn = root / "00_middle" / "connection_inventory.csv"
-    conn.parent.mkdir(parents=True, exist_ok=True)
-    conn.write_text(
-        "connection_id,connection_type,src_instance,src_direction,src_port,src_bit_index,src_endpoint_key,"
-        "dst_instance,dst_direction,dst_port,dst_bit_index,dst_endpoint_key,validation_status\n"
-        "CONN_SRC_SINK,clock_connection,u_src,output,clk_o,,u_src:output:clk_o,"
-        "u_sink,input,clk_i,,u_sink:input:clk_i,matched\n",
-        encoding="utf-8",
-    )
+    write_connection_inventory_path(conn, [
+        {
+            "connection_id": "CONN_SRC_SINK",
+            "connection_type": "clock_connection",
+            "src_instance": "u_src",
+            "src_direction": "output",
+            "src_port": "clk_o",
+            "src_endpoint_key": "u_src:output:clk_o",
+            "dst_instance": "u_sink",
+            "dst_direction": "input",
+            "dst_port": "clk_i",
+            "dst_endpoint_key": "u_sink:input:clk_i",
+            "validation_status": "matched",
+        },
+    ])
     pending = root / "00_middle" / "scenario" / "common" / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     (pending / "u_src.ports").write_text("output clk_o\n", encoding="utf-8")
@@ -449,7 +527,7 @@ def run_partial_target_cases():
     build_partial_target_case(root)
     result = sh([EX01, "--run-root", root, "--debug"], BASE)
     require(result.returncode == 0, "partial target run failed:\n%s\n%s" % (result.stdout, result.stderr))
-    report = (root / "01_result" / "reports" / "clock_check_report.txt").read_text(encoding="utf-8")
+    report = (root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
     require("Run completeness: partial" in report, "partial completeness missing from report")
     require("CLOCK_SOURCE_SDC_MISSING" in report, "missing upstream clock todo missing")
     rows = list(csv.DictReader((root / "01_middle" / "common" / "clock_inventory.csv").open(encoding="utf-8-sig")))
@@ -462,7 +540,7 @@ def run_partial_target_cases():
     build_partial_target_case(strict_root)
     strict = sh([EX01, "--run-root", strict_root, "--require-complete-harden-sdc"], BASE)
     require(strict.returncode == 1, "strict partial target should fail")
-    strict_report = (strict_root / "01_result" / "reports" / "clock_check_report.txt").read_text(encoding="utf-8")
+    strict_report = (strict_root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
     require("HARDEN_SDC_COMPLETENESS_REQUIRED" in strict_report, "strict completeness error missing")
     require("PENDING_UPDATE_SKIPPED_DUE_TO_ERRORS" in strict_report, "strict run did not protect pending")
     require((strict_root / "00_middle" / "scenario" / "common" / "pending" / "u_sink.ports").read_text(encoding="utf-8") == "input clk_i\n", "strict error run modified pending")
@@ -475,7 +553,7 @@ def run_missing_manifest_case():
     (manifest_dir / "harden_sdc_manifest.csv").unlink()
     result = sh([EX01, "--run-root", root, "--no-update-pending"], BASE)
     require(result.returncode == 1, "missing target manifest should fail")
-    report = (root / "01_result" / "reports" / "clock_check_report.txt").read_text(encoding="utf-8")
+    report = (root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
     require("HARDEN_SDC_MANIFEST_MISSING" in report, "missing manifest error absent")
 
 
@@ -495,13 +573,21 @@ def build_sdc_update_case(root, period):
         encoding="utf-8",
     )
     conn = root / "00_middle" / "connection_inventory.csv"
-    conn.parent.mkdir(parents=True, exist_ok=True)
-    conn.write_text(
-        "connection_id,connection_type,src_instance,src_direction,src_port,src_bit_index,src_endpoint_key,"
-        "dst_instance,dst_direction,dst_port,dst_bit_index,dst_endpoint_key,validation_status\n"
-        "CONN_REF,clock_connection,top,input,ref_pad,,top:input:ref_pad,u_clk,input,ref_i,,u_clk:input:ref_i,matched\n",
-        encoding="utf-8",
-    )
+    write_connection_inventory_path(conn, [
+        {
+            "connection_id": "CONN_REF",
+            "connection_type": "clock_connection",
+            "src_instance": "top",
+            "src_direction": "input",
+            "src_port": "ref_pad",
+            "src_endpoint_key": "top:input:ref_pad",
+            "dst_instance": "u_clk",
+            "dst_direction": "input",
+            "dst_port": "ref_i",
+            "dst_endpoint_key": "u_clk:input:ref_i",
+            "validation_status": "matched",
+        },
+    ])
     pending = root / "00_middle" / "scenario" / "common" / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     (pending / "u_clk.ports").write_text("input ref_i\n", encoding="utf-8")
@@ -527,13 +613,49 @@ def run_sdc_update_rerun_case():
     require(before_sdc != after_sdc, "independent rerun did not expose SDC output difference")
 
 
+def run_target_connection_validation_cases():
+    scope_root = WORK / "target_scope_mismatch"
+    build_sdc_update_case(scope_root, "10.000")
+    scope_path = scope_root / "00_middle" / "connection_inventory.csv"
+    with scope_path.open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows[0]["scenario_scope"] = "scan"
+    write_connection_inventory_path(scope_path, rows)
+    scope_result = sh([EX01, "--run-root", scope_root, "--no-update-pending"], BASE)
+    require(scope_result.returncode == 1, "scenario-scope mismatch should fail exact clock edge resolution")
+    scope_report = (scope_root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
+    require("CLOCK_INPUT_EXACT_EDGE_MISSING" in scope_report, "scenario-scope mismatch error missing")
+
+    driver_root = WORK / "target_multi_driver"
+    build_sdc_update_case(driver_root, "10.000")
+    driver_path = driver_root / "00_middle" / "connection_inventory.csv"
+    with driver_path.open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    duplicate = dict(rows[0])
+    duplicate["connection_id"] = "CONN_REF_SECOND_DRIVER"
+    duplicate["src_port"] = "ref_pad_2"
+    duplicate["src_endpoint_key"] = "top:input:ref_pad_2"
+    duplicate["src_soc_object"] = "top/ref_pad_2"
+    rows.append(duplicate)
+    write_connection_inventory_path(driver_path, rows)
+    driver_result = sh([EX01, "--run-root", driver_root, "--no-update-pending"], BASE)
+    require(driver_result.returncode == 1, "multiple driver target connection should fail")
+    driver_report = (driver_root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
+    require("CONNECTION_DESTINATION_MULTI_DRIVER" in driver_report, "multiple-driver error missing")
+
+
 def run_diagnose_only_case():
     root = WORK / "target_diagnose_only"
     build_partial_target_case(root)
     result = sh([EX01, "--run-root", root, "--diagnose-only", "--debug-verbose"], BASE)
     require(result.returncode == 0, "diagnose-only run failed:\n%s\n%s" % (result.stdout, result.stderr))
     require(not (root / "01_result" / "common" / "01_soc_clocks.sdc").exists(), "diagnose-only wrote official SDC")
-    require((root / "01_result" / "reports" / "clock_check_report.txt").is_file(), "diagnose-only report missing")
+    diagnose_report = root / "01_result" / "reports" / "clock_check_report_common.txt"
+    require(diagnose_report.is_file(), "diagnose-only report missing")
+    require(
+        "Port accounting: disabled by explicit option" in diagnose_report.read_text(encoding="utf-8"),
+        "diagnose-only accounting status missing",
+    )
     require((root / "01_middle" / "debug" / "01_soc_clocks" / "run_context.json").is_file(), "diagnose-only debug bundle missing")
     require("DEBUG_CLOCK:" in result.stdout, "debug-verbose clock trace missing")
 
@@ -577,12 +699,7 @@ def run_not_required_target_case():
             {"Output": "status_o", "Output Width": 1},
         ]).to_excel(writer, sheet_name="u_special", index=False)
     conn = root / "00_middle" / "connection_inventory.csv"
-    conn.parent.mkdir(parents=True, exist_ok=True)
-    conn.write_text(
-        "connection_id,connection_type,src_instance,src_direction,src_port,src_bit_index,src_endpoint_key,"
-        "dst_instance,dst_direction,dst_port,dst_bit_index,dst_endpoint_key,validation_status\n",
-        encoding="utf-8",
-    )
+    write_connection_inventory_path(conn, [])
     pending = root / "00_middle" / "scenario" / "common" / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     (pending / "u_special.ports").write_text("output status_o\n", encoding="utf-8")
@@ -594,7 +711,7 @@ def run_not_required_target_case():
     ])
     result = sh([EX01, "--run-root", root], BASE)
     require(result.returncode == 0, "not_required target run failed")
-    report = (root / "01_result" / "reports" / "clock_check_report.txt").read_text(encoding="utf-8")
+    report = (root / "01_result" / "reports" / "clock_check_report_common.txt").read_text(encoding="utf-8")
     require("Run completeness: complete" in report and "Harden SDC not_required: 1" in report, "not_required completeness incorrect")
     require((pending / "u_special.ports").read_text(encoding="utf-8") == "output status_o\n", "not_required pending was consumed")
 
@@ -650,6 +767,7 @@ def main():
     run_partial_target_cases()
     run_missing_manifest_case()
     run_sdc_update_rerun_case()
+    run_target_connection_validation_cases()
     run_diagnose_only_case()
     run_legacy_partial_case()
     run_not_required_target_case()
@@ -658,6 +776,7 @@ def main():
     print("  negative cases: bad_source, multi_target, missing_source, internal_pin_source, unknown_target, manual_missing_reference")
     print("  target layout: PASS")
     print("  partial/strict/manifest/rerun-diff/debug target cases: PASS")
+    print("  target scenario-scope/multi-driver connection cases: PASS")
     print("  legacy partial/strict cases: PASS")
     print("  target not_required case: PASS")
     return 0

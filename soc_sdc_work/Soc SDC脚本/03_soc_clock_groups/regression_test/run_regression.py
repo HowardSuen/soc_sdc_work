@@ -363,6 +363,61 @@ def run_target_domain_relation_case():
     require("Author  : Howard" in report_path.read_text(encoding="utf-8"), "report author metadata missing")
 
 
+def run_sparse_group_domain_exclusion_case():
+    root = WORK / "sparse_group_domain_exclusion"
+    clean_dir(root)
+    rows = [base_target_rows()[0], base_target_rows()[1], base_target_rows()[3]]
+    write_target_inventory(root, "common", rows)
+
+    first = sh([EX03, "--run-root", root, "-scenario", "common"], BASE)
+    require(first.returncode == 1, "sparse-group first run should create workbook")
+    fill_domain_workbook(
+        root,
+        [
+            {
+                "scenario": "common", "domain_id": "DOM_CPU", "clock_name": "cpu_clk",
+                "membership_type": "seed", "include_descendants": "yes", "apply": "yes",
+                "review_status": "approved", "owner": "sta", "basis": "CPU root domain",
+            },
+            {
+                "scenario": "common", "domain_id": "DOM_AON", "clock_name": "aon_clk",
+                "membership_type": "seed", "include_descendants": "yes", "apply": "yes",
+                "review_status": "approved", "owner": "sta", "basis": "AON domain",
+            },
+        ],
+        [
+            {
+                "scenario": "common", "group_id": "CG_SPARSE_GROUP",
+                "relation_type": "asynchronous", "group_1_domains": "DOM_CPU",
+                "group_3_domains": "DOM_AON", "exclude_descendant_clocks": "cpu_div",
+                "analysis_style": "normal", "apply": "yes", "review_status": "approved",
+                "owner": "sta", "basis": "Exclude generated CPU branch for this relation",
+                "cdc_required": "yes",
+            },
+        ],
+    )
+    result = sh([EX03, "--run-root", root, "-scenario", "common"], BASE)
+    require(result.returncode == 0, "sparse-group generation failed:\n%s\n%s" % (result.stdout, result.stderr))
+    sdc = (root / "03_result" / "common" / "03_soc_clock_groups.sdc").read_text(encoding="utf-8")
+    report = (root / "03_result" / "reports" / "clock_group_check_report_common.txt").read_text(encoding="utf-8")
+    require("cpu_div" not in sdc, "domain descendant was not excluded from the rule")
+    require("excluded clock is not a descendant" not in report, "valid domain descendant exclusion was warned")
+
+    coverage = load_workbook(str(root / "03_result" / "reports" / "clock_group_coverage_report_common.xlsx"))
+    pair_ws = coverage["pair_relation_map"]
+    pair_header, pair_mapping = sheet_header_map(pair_ws, "clock_a")
+    require(pair_ws.cell(pair_header + 1, pair_mapping["group_a"]).value == "group_1", "group_1 provenance changed")
+    require(pair_ws.cell(pair_header + 1, pair_mapping["group_b"]).value == "group_3", "sparse group_3 was renumbered")
+    participation_ws = coverage["clock_participation"]
+    participation_header, participation_mapping = sheet_header_map(participation_ws, "clock_name")
+    aon_label = ""
+    for row_idx in range(participation_header + 1, participation_ws.max_row + 1):
+        if participation_ws.cell(row_idx, participation_mapping["clock_name"]).value == "aon_clk":
+            aon_label = participation_ws.cell(row_idx, participation_mapping["groups"]).value or ""
+            break
+    require(":group_3:" in aon_label, "clock participation lost the original group_3 number")
+
+
 def run_partial_blocked_case():
     root = WORK / "partial_blocked"
     clean_dir(root)
@@ -529,12 +584,13 @@ def main():
     clean_dir(WORK)
     run_bit_closure_case()
     run_target_domain_relation_case()
+    run_sparse_group_domain_exclusion_case()
     run_partial_blocked_case()
     run_scenario_conflict_case()
     run_scenario_success_case()
     run_merged_basis_gate_case()
     print("03 complex regression: PASS")
-    print("  cases: bit_closure, target_domain, partial_blocked, scenario_conflict, scenario_success, merged_basis_gate")
+    print("  cases: bit_closure, target_domain, sparse_group_domain_exclusion, partial_blocked, scenario_conflict, scenario_success, merged_basis_gate")
     return 0
 
 

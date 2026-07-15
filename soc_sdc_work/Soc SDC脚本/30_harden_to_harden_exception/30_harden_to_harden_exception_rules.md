@@ -1,8 +1,22 @@
 # 30_harden_to_harden_exception.sdc 规则草案
 
-本文定义 `common/30_harden_to_harden_exception.sdc` 的职责、分类方法、输入来源、表单字段和生成检查规则。
+本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。目标迁移后，candidate/form 写入 `30_middle/`，最终 SDC/report 写入 `30_result/`。
+
+本文定义 `30_result/common/30_harden_to_harden_exception.sdc` 及 scenario overlay 的职责、分类方法、输入来源、表单字段和生成检查规则。
 
 30 是高风险约束文件。它不负责普通接口 timing budget，也不负责补齐漏约束；它只表达 harden/subsys 之间确有架构依据、协议依据或 mode 依据的 path-level exception / override。
+
+target 运行入口：
+
+```bash
+python3 30_extract_harden_to_harden_exception.py \
+  --run-root <run_root> \
+  --scenario <scenario> \
+  [--stage <stage> --corner <corner>] \
+  [--no-update-pending]
+```
+
+`--scenario` 始终必填。`--stage` / `--corner` 在生成数值型 view-specific override 时必填。
 
 ## 1. 目标
 
@@ -14,7 +28,7 @@
 - 改变默认 STA 分析语义的 path exception / override 归 30。
 - top pad 外部 IO timing environment 归 04。
 - clock relationship 归 03。
-- 结构性 feedthrough 先归 10。
+- 与 `fti_*` / `fto_*` boundary 相邻的 direct edge 先由 10 分类；若为 exception-only，再 `route_to_30`。
 
 30 第一版支持的 SDC 命令建议限制在：
 
@@ -65,7 +79,7 @@ no port timing != async path
 
 30 不是逐条搬运 harden SDC exception。
 
-脚本应先根据 00 `connection_inventory.csv` 或 20 channel inventory 建立 harden-to-harden candidate，再把 harden SDC、20 channel、03 clock relationship 和人工协议标签归并到同一个 candidate 上，最后由表单 review 决定是否生成。
+脚本应先根据 00 `connection_inventory.csv` 或 10/20 direct-edge inventory 建立 harden-to-harden candidate，再把 harden SDC、10/20 normal timing 状态、03 clock relationship 和人工协议标签归并到同一个 candidate 上，最后由表单 review 决定是否生成。
 
 推荐分类顺序：
 
@@ -76,8 +90,8 @@ no port timing != async path
 2. clock creation / clock relationship
    -> 01 / 03
 
-3. structural feedthrough
-   -> 10
+3. feedthrough-related direct edge 的普通 timing/disposition
+   -> 10；exception-only 则由 10 route_to_30
 
 4. 有普通 interface timing budget 语义
    -> 20
@@ -89,20 +103,27 @@ no port timing != async path
    -> needs_review，不生成
 ```
 
-### 2.3 30 不替代 20
+### 2.3 30 不替代 10/20 normal timing
 
-如果某个 channel 已经在 20 中生成普通 interface budget，则 30 不能在同一 check 维度上覆盖它，除非表单明确说明 30 是为了覆盖 20 的某个特殊子路径，并且 20 对应 channel 已经拆分或禁用。
+如果某个 direct edge/channel 已经在 10 或 20 中生成普通 interface budget，则 30 不能在同一 check 维度上覆盖它，除非表单明确说明 30 是为了覆盖某个特殊子路径，并且对应 10/20 budget 已经拆分或禁用。
+
+20 和 30 的关系分为两层：
+
+- port-level pending owner：一个 canonical port 只由一个 stage 最终消账。原始 harden SDC 已显示为 exception-only 的 endpoint 不由 20 消账，留给 30。
+- path-level constraint owner：同一个已由 10/20 归类的 port 上可以存在更窄的 30 exception path。此时 30 只记录和生成 path exception，不重复删除 port，也不改写 10/20 的 port owner。
+
+因此不要求 30 先于 20 生成 intent inventory。20 按已知 harden SDC evidence 和集成分类处理普通 timing；30 后续处理 exception。两者的最终一致性以 path/check 维度 overlap 检查为准，不以“30 是否也删除了 port”为准。
 
 常见错误：
 
 ```tcl
-set_max_delay 1.2 -datapath_only -from A -to B   ;# 20 normal budget
+set_max_delay 1.2 -datapath_only -from A -to B   ;# 10/20 normal budget
 set_false_path                 -from A -to B   ;# 30 又切掉同一路径
 ```
 
-这种组合会让 20 budget 失效或语义自相矛盾，应作为 error 阻断。
+这种组合会让 10/20 normal budget 失效或语义自相矛盾，应作为 error 阻断。
 
-但不同 check 维度可以共存，例如 active 20 max 与 30 min_delay_override 可以同时给同一路径定义上限和下限；这类组合必须有 `basis` 说明 min/hold floor 的来源。
+但不同 check 维度可以共存，例如 active normal max 与 30 min_delay_override 可以同时给同一路径定义上限和下限；这类组合必须有 `basis` 说明 min/hold floor 的来源。
 
 ### 2.4 30 不替代 03
 
@@ -157,10 +178,10 @@ common 30 只放所有 mode/scenario 都成立的 exception。
 但 30 中的 `set_max_delay` / `set_min_delay` override 是数值约束，可能随 stage/corner/view 变化。第一版表单保留 `stage` / `corner` 字段：
 
 ```text
-common/30_harden_to_harden_exception.sdc
-common/30_harden_to_harden_exception_<stage>_<corner>.sdc    # 如存在 view-specific override
-scenarios/<scenario>_exceptions.sdc
-scenarios/<scenario>_exceptions_<stage>_<corner>.sdc         # 如存在 scenario + view-specific override
+30_result/common/30_harden_to_harden_exception.sdc
+30_result/common/30_harden_to_harden_exception_<stage>_<corner>.sdc
+30_result/scenarios/<scenario>_exceptions.sdc
+30_result/scenarios/<scenario>_exceptions_<stage>_<corner>.sdc
 ```
 
 不能把多个 corner 的 `set_max_delay` / `set_min_delay` override 平铺进同一个 SDC。
@@ -193,7 +214,9 @@ set_max_delay  5.0 -from [get_clocks clk_a] -to [get_clocks clk_b]
 
 30 必须基于 00 edge 表中的 SoC 真实连接关系生成，不能只根据某个 harden SDC 中的 port 名字孤立生成 exception。原始集成表单只作为 00 edge 的来源追溯，不作为 30 重新展开 bus/range 的机器输入。
 
-30 继承 `00_harden_port_inventory` 的 canonical bit key。candidate/rule 的机器 endpoint 必须能解析到具体 bit endpoint：scalar 写 `port`，vector bit 写 `port[index]`。direct path 的 src/dst bit 配对必须来自 00 `connection_inventory.csv` 或 20 channel inventory。若 exception 覆盖 bus 的一部分 bit，必须展开到对应 bit candidate/rule；若确认为 whole-bus exception，也必须在 coverage/removed log 中列出被消账的每个 bit，不能只删除整 bus。
+30 必须按 `scenario_scope = common 或当前 --scenario` 过滤 00 edge。foreign-scenario edge 不得进入 candidate、rule、SDC 或销账。
+
+30 继承 `00_harden_port_inventory` 的 canonical bit key。candidate/rule 的机器 endpoint 必须能解析到具体 bit endpoint：scalar 写 `port`，vector bit 写 `port[index]`。direct path 的 src/dst bit 配对必须来自 00 `connection_inventory.csv` 或 10/20 edge inventory。若 exception 覆盖 bus 的一部分 bit，必须展开到对应 bit candidate/rule；若确认为 whole-bus exception，也必须在 coverage/removed log 中列出被消账的每个 bit，不能只删除整 bus。
 
 ### 3.2 harden/subsys SDC
 
@@ -221,6 +244,17 @@ set_min_delay
 
 harden 内部 full signoff exception 不应直接提升到 SoC 30。如果命令引用 harden 内部 cell/pin，而 SoC top 视角不可见，脚本只能记录为 evidence，不生成 SoC 30。
 
+#### 3.2.1 Harden SDC 缺失时
+
+30 必须允许部分 harden SDC 为 `missing`，并继续从 00 connection inventory、10 feedthrough edge inventory、20 channel inventory 和已到位 SDC 建立其它 candidate。
+
+- missing SDC 不能被解释为 `no_port_timing`、“无 exception”或 `not_applicable`；受影响 channel 的 `timing_contract_status` / `harden_clock_context_status` 应标记 `incomplete_missing_sdc`。
+- 依赖 harden SDC 提取的 exception candidate/rule 保持 pending，不生成、不消账。
+- 人工新增的 30 rule 若有完整协议/架构依据，且明确标记其判断不依赖缺失 harden SDC，可以按正常 approved 门槛生成。
+- report/coverage 必须区分 `missing SDC, evidence unavailable` 和 `available SDC scanned, evidence not found`。
+
+partial mode 下其它 available channel 继续生成；开启 `--require-complete-harden-sdc` 后 missing 才全局阻断。
+
 提升 harden boundary exception 前，还必须确认 clock context 一致：
 
 - harden SDC 中 exception 依据的 source/capture clock，在 SoC 01/03 视角下有等价映射。
@@ -229,20 +263,21 @@ harden 内部 full signoff exception 不应直接提升到 SoC 30。如果命令
 
 `harden_clock_context_status` 为 `mismatch` 或 `unknown` 时，`extracted_harden_exception` 不得自动提升为 approved 30 rule。
 
-### 3.3 20 channel inventory / budget 表
+### 3.3 10/20 normal timing inventory / budget 表
 
-30 应读取或引用 20 的 channel inventory / interface budget 结果：
+30 应读取或引用当前 scenario 的 10 feedthrough edge inventory 和 20 channel inventory / interface budget 结果：
 
-- 判断该 channel 是否已有普通 20 budget。
-- 识别 20 中被标记为 `exception_path` 或 `clock_relation=asynchronous/logically_exclusive/physically_exclusive` 的 channel。
-- 避免 20 budget 与 30 exception 在同一 assembled view 中冲突。
+- 判断该 direct edge/channel 是否已有普通 10/20 budget。
+- 识别 10/20 中的 `route_to_30`、exception evidence 或 `clock_relation=asynchronous/logically_exclusive/physically_exclusive` 状态。
+- 避免 10/20 normal budget 与 30 exception 在同一 assembled view 中冲突。
 
-这里的 active 20 budget 必须按 20 的 `interface_budget` 表生成状态判断，而不是只看 channel 是否存在。
+active normal budget 必须按 10/20 的实际生成状态判断，而不是只看 inventory 行是否存在。
 
 第一版定义：
 
 ```text
-active 20 budget =
+active normal budget =
+  owner_stage 属于 10 或 20
   与当前 scenario/stage/corner assembled view 匹配
   + apply = yes
   + review_status = approved
@@ -251,33 +286,43 @@ active 20 budget =
   + 对应 converted_max / converted_min 非空并会实际生成 SDC
 ```
 
-仅存在于 `channel_inventory`、pending/rejected 的 20 行、或不 emit max/min 的记录，不应被当成 active 20 budget。
+仅存在于 10/20 inventory、pending/rejected/route_to_30 行、或不 emit max/min 的记录，不应被当成 active normal budget。
 
-20/30 overlap 需要按 check 维度判断，不能一刀切：
+10/20 normal budget 与 30 overlap 需要按 check 维度判断，不能一刀切：
 
 ```text
-active 20 max + 30 false_path(setup/both) -> error
-active 20 min + 30 false_path(hold/both)  -> error
-active 20 max + 30 max_delay_override     -> error 或显式裁决
-active 20 min + 30 min_delay_override     -> error 或显式裁决
-active 20 max + 30 min_delay_override     -> 可允许，但必须有 basis 说明 min/hold 来源
-active 20 min + 30 max_delay_override     -> 可允许，但必须有 basis 说明 max/setup 来源
+active normal max + 30 false_path(setup/both) -> error
+active normal min + 30 false_path(hold/both)  -> error
+active normal max + 30 max_delay_override     -> error 或显式裁决
+active normal min + 30 min_delay_override     -> error 或显式裁决
+active normal max + 30 min_delay_override     -> 可允许，但必须有 basis 说明 min/hold 来源
+active normal min + 30 max_delay_override     -> 可允许，但必须有 basis 说明 max/setup 来源
 ```
 
 也就是说，同类型或语义重叠才阻断；max 上限和 min 下限本身可以在同一路径上合法共存。
 
-若 20 尚未生成表单，30 脚本也可以独立从 00 `connection_inventory.csv` 建立 candidate channel，但不得回到原始集成表单重新展开 bus/range；最终 report 应提示缺少 20 对照信息。
+若 10 或 20 尚未生成 inventory/form，30 可以独立从 00 `connection_inventory.csv` 建立 candidate-only workbook/CSV，但不得生成正式 30 SDC，也不得销账。feedthrough-related candidate 还必须等待 10 `route_to_30` 结果。正式生成前，10/20 inventory 必须存在、scenario/digest 匹配，并完成 normal owner/overlap 检查。
 
 ### 3.4 03 clock relationship
 
-30 应参考 03 的 clock relationship：
+30 应从 `03_middle/relation_map/<scenario>.csv` 参考当前 assembled view 的 clock relationship：
+
+relation map 中的 clock name 必须来自同一 `01_middle/assembled/<scenario>/clock_inventory.csv`。30 不得将 common-only clock inventory 与 scenario relation map 混用；digest 或 scenario 不一致时必须阻断。
 
 - asynchronous / logically_exclusive / physically_exclusive clock pair 默认不应再生成普通同步 max/min override。
 - 如果 max/min override 是 CDC/handshake skew 或传播上限约束，并带 `-datapath_only` 与明确 CDC/协议依据，它可以和 03 asynchronous 配套存在。
 - 如果 entire domain relationship 已由 03 表达，30 path-level false path 通常冗余。
 - 如果 30 只作用于 domain 内的特定子路径，必须在 `basis` 中说明为什么不用 03。
 
-第一版可以先通过表单字段 `clock_relation` 人工填入；后续脚本再自动读取 03 assembled view。
+relation map 只用于检查 30 命令是否与 clock-domain 语义一致，不用于自动生成 exception，也不用于判定 pending owner。例如：
+
+- pair 已 asynchronous 时，再打 broad false path 通常冗余。
+- pair 已 asynchronous 时，带协议/CDC 依据的 `set_max_delay -datapath_only` / `set_min_delay -datapath_only` 可能是合理配套。
+- pair 仍 default synchronous 时，只生成 datapath-only max/min 不会自动关闭常规 setup/hold，需要 review clock relation 是否缺失。
+
+当前 legacy 实现仍依赖表单 `clock_relation` 人工填入，尚未实现 relation-map CSV 自动注入。
+
+若 relation-map meta 为 partial，且 rule 的 src/dst clock 因 missing harden SDC 不在当前 pair map 中，30 必须把 clock relation 视为 `unknown/incomplete`，不得将 pair 缺行解释为 default synchronous。依赖 CDC/async clock relation 的 rule 保持 pending，除非存在明确且不依赖缺失 SDC 的 approved 依据。
 
 ### 3.5 人工协议/架构信息
 
@@ -337,23 +382,23 @@ u_a/data_o -> u_b/data_i
 
 ### 4.4 与 10_feedthrough.sdc
 
-如果路径是结构性 feedthrough，例如 harden input 到 harden output 纯穿通，应优先归 10。
-
-如果 feedthrough 上还需要 false path 或 max/min override，应先确认 10 的结构建模，再决定是否需要 30 追加 exception。不能用 30 掩盖 feedthrough 归属不清。
-
-经过 feedthrough harden 的路径不是简单 endpoint pair，而是多跳路径，例如：
+10 处理与 feedthrough boundary 相邻的普通 timing/disposition；30 只接收 10 明确 `route_to_30` 的 exception-only direct edge。例如：
 
 ```text
-u_a/data_o -> u_ft/in -> u_ft/out -> u_b/data_i
+u_a/data_o      -> u_ft/fti_data   # 一条 direct edge
+u_ft/fto_data   -> u_b/data_i      # 另一条 direct edge
 ```
 
-30 处理这类路径前，必须先确认 10 已经对 `u_ft/in -> u_ft/out` 穿通段建模，并在 30 表单中引用对应 `related_10_feedthrough_id`。30 的 exception 应显式锚定穿通段，通常通过 `through_collection` 指向 feedthrough input/output pin，不能只用隐式 `u_a -> u_b` endpoint pair 让脚本猜测路径经过哪里。
+30 必须按 direct edge 分别建模，不得构造跨越 `[harden internal]` 的 `u_a/data_o -> u_b/data_i` synthetic path。`u_ft/fti_data -> u_ft/fto_data` 是 harden 内部路径，其 exception 由 harden owner 处理，SoC 30 不生成。
 
-10 的 feedthrough 识别优先基于项目约定的 `fti_` / `fto_` port 命名，包括多 hop feedthrough 中的 `fti_<index>_` / `fto_<index>_` 规则。
+feedthrough-related rule 必须填写 bit-level `related_10_feedthrough_edge_id`，并满足：
 
-若经过 vector feedthrough，`related_10_feedthrough_id` 必须引用 10 产生的 bit-level id，例如 `FT_u_dpg_0_mmn2gms_req_data_bit7`；不能用整 bus id 覆盖多个 bit。
+- id 存在于当前 scenario 的 10 `feedthrough_edge_inventory.csv`。
+- 对应 00 `connection_id`、src/dst endpoint 与 30 rule 完全一致。
+- 10 行的 `channel_disposition = route_to_30`。
+- vector/range 按 00 canonical bit edge 分别引用，不能用一个 id 覆盖多个 bit。
 
-若 10 尚未建模或 feedthrough segment 不明确，该 30 candidate 必须保持 `needs_review`，不得生成。
+`through_collection` 仍可用于 SoC top 可见的 glue logic 或其它明确对象，但不得用它把 `fti` 和 `fto` 锚成一条穿越 harden 内部的 path。若 10 尚未分类该 direct edge，30 candidate 保持 `needs_review`，不得生成。
 
 ### 4.5 与 scenario pre-setup
 
@@ -530,8 +575,9 @@ has_src_output_delay
 has_dst_input_delay
 related_20_channel_id
 related_20_status
-related_10_feedthrough_id
+related_10_feedthrough_edge_id
 harden_clock_context_status
+sdc_evidence_status
 source_sdc_file
 source_line
 source_command
@@ -558,7 +604,7 @@ exception_type
 path_category
 channel_id
 related_20_channel_id
-related_10_feedthrough_id
+related_10_feedthrough_edge_id
 src_bit_index
 src_endpoint
 dst_bit_index
@@ -571,6 +617,7 @@ dst_clock
 clock_relation
 timing_contract_status
 harden_clock_context_status
+sdc_evidence_status
 check_type
 max_value
 min_value
@@ -590,6 +637,7 @@ cdc_rdc_ref
 sta_waiver_ref
 protocol_ref
 basis
+sdc_independent_basis
 risk_level
 expiry_or_review_date
 note
@@ -602,12 +650,13 @@ note
 - `exception_type`：决定生成哪类 SDC 命令。
 - `path_category`：记录路径语义，辅助检查。
 - `related_20_channel_id`：若该 path 与 20 channel 对应，必须填入，便于检查冲突。
-- `related_10_feedthrough_id`：若 path 经过 10 feedthrough segment，必须填入 10 `feedthrough_inventory.csv` 中对应的 `feedthrough_id`。若经过多个 feedthrough segment，可以按 path 顺序填写逗号分隔的 id 列表。
+- `related_10_feedthrough_edge_id`：仅用于 feedthrough-related direct edge，必须填入当前 scenario 10 `feedthrough_edge_inventory.csv` 中对应的 bit-level id；一个 30 rule 不得用 id 列表拼接多条 direct edge。
 - `exception_candidate.src_port` / `exception_candidate.dst_port` 使用 00 canonical bit key；`exception_rule.src_endpoint` / `exception_rule.dst_endpoint` 必须能回溯到同一组 canonical bit key。`src_bit_index` / `dst_bit_index` 便于 report 聚合，scalar 留空。
 - `from_collection` / `to_collection` / `through_collection`：允许 reviewer 对 endpoint 做更细粒度裁剪。若为空，默认使用 `src_endpoint` / `dst_endpoint`。若 collection 使用 bus/range/wildcard，必须能展开回具体 canonical bit endpoint。
 - `clock_relation`：记录该 path 两端 clock 在 03/review 中的 canonical 关系：`synchronous` / `asynchronous` / `logically_exclusive` / `physically_exclusive` / `unknown`。
 - `timing_contract_status`：记录 harden port timing 证据状态。
 - `harden_clock_context_status`：若规则来自 harden SDC exception，记录 harden 视角 clock 与 SoC 视角 clock 是否等价，例如 `matched` / `remapped_equivalent` / `mismatch` / `unknown`。
+- `sdc_evidence_status`：记录相关 source/destination harden SDC 证据是 `complete` 还是 `incomplete_missing_sdc`。
 - `check_type`：用于 `false_path` / `multicycle_path` 的检查粒度，建议枚举 `setup` / `hold` / `both`。缺省按 `both` 处理。
 - `setup_cycles` / `hold_cycles`：用于 `set_multicycle_path`。
 - `mcp_reference`：用于 `set_multicycle_path` 的 edge reference，建议枚举 `start` / `end` / `same_clock_default`。跨 clock multicycle 必须明确，不应依赖工具默认。
@@ -616,6 +665,7 @@ note
 - `case_condition`：若 exception 依赖 scenario case，应记录对应 mode/case 条件。
 - `cdc_rdc_ref` / `sta_waiver_ref` / `protocol_ref`：外部依据引用。
 - `basis`：必填，说明为什么这条 path 可以作为 exception。
+- `sdc_independent_basis`：当 `sdc_evidence_status=incomplete_missing_sdc` 但人工 rule 仍要求生成时必填，说明该结论为什么不依赖缺失 SDC。
 - `risk_level`：`low` / `medium` / `high`，辅助 review。
 - `expiry_or_review_date`：临时 waiver 或 early-stage exception 的复审日期。
 
@@ -623,28 +673,39 @@ note
 
 ### 7.1 输出文件
 
+每次 target 运行都必须输出：
+
+```text
+30_middle/30_harden_to_harden_exception.xlsx
+30_middle/scenario/<scenario>/exception_candidates.csv
+30_middle/scenario/<scenario>/removed_log/30_harden_to_harden_exception.removed
+30_result/reports/harden_to_harden_exception_check_report_<scenario>.txt
+```
+
+`exception_candidates.csv` 一行对应一个 current-scenario bit-level candidate，至少记录 schema/scenario、00 `connection_id`、10/20 owner reference、src/dst canonical endpoint、candidate type、clock relation、harden SDC evidence/completeness、review/apply 状态和输入 digest。CSV 与 workbook candidate sheet 必须来自同一个 in-memory resolved view。
+
 common view-independent exception：
 
 ```text
-common/30_harden_to_harden_exception.sdc
+30_result/common/30_harden_to_harden_exception.sdc
 ```
 
 common view-specific max/min override：
 
 ```text
-common/30_harden_to_harden_exception_<stage>_<corner>.sdc
+30_result/common/30_harden_to_harden_exception_<stage>_<corner>.sdc
 ```
 
 scenario view-independent exception：
 
 ```text
-scenarios/<scenario>_exceptions.sdc
+30_result/scenarios/<scenario>_exceptions.sdc
 ```
 
 scenario view-specific max/min override：
 
 ```text
-scenarios/<scenario>_exceptions_<stage>_<corner>.sdc
+30_result/scenarios/<scenario>_exceptions_<stage>_<corner>.sdc
 ```
 
 第一版如果没有数值型 view-specific override，可以只生成 view-independent 文件。
@@ -704,7 +765,7 @@ set_false_path \
 - `basis` 必须说明为什么 path 不需要 STA timing check。
 - `path_category` 不能是 `unknown`。
 - 不能仅因 `timing_contract_status = no_port_timing` 生成。
-- 若同 path 同 check 维度已有 active 20 budget，必须先关闭/拆分 20 或给出裁决依据。
+- 若同 path 同 check 维度已有 active 10/20 normal budget，必须先关闭/拆分对应 budget 或给出裁决依据。
 - `check_type` 控制切除粒度：`both` 生成普通 false path，`setup` 只切 setup 类检查，`hold` 只切 hold 类检查。缺省按 `both` 处理。
 - `through_collection` 优先使用 SoC 可见的 pin/port。`get_nets` 或 net pattern 在综合/PnR 后名称不稳定，只有确无 pin/port 锚点时才允许使用，并必须在 report 中 warning。
 
@@ -812,9 +873,11 @@ basis 非空
 owner 非空
 不是 pad-related
 不是 clock creation / clock relationship
-不是 feedthrough
-不是普通 20 interface budget
+不是 harden 内部 `fti -> fto` path
+若为 feedthrough-related direct edge，related_10_feedthrough_edge_id 有效且 10 disposition = route_to_30
+不是普通 10/20 interface budget
 若 related_20_channel_id 存在，必须确认 20 不会生成冲突 budget
+若 related_10_feedthrough_edge_id 存在，必须确认 10 disposition = route_to_30 且不会生成 active budget
 若 exception_type = multicycle_path，cycle 字段与 check_type 匹配
 若 multicycle_path 跨 clock，mcp_reference 与 cross_clock_mcp_review 完整
 若 exception_type = max/min override，对应 value 完整且 view 维度清楚
@@ -824,6 +887,21 @@ owner 非空
 ```
 
 `pending` / `needs_review` / `rejected` 行不生成。
+
+30 生成 approved path exception 后的 pending 处理：
+
+target pending/log 固定为：
+
+```text
+00_middle/scenario/<scenario>/pending/
+30_middle/scenario/<scenario>/removed_log/30_harden_to_harden_exception.removed
+```
+
+- endpoint 仍在 pending，且它的所有已知 SoC 约束意图都属于 exception-only：由 30 删除并记录 port owner。
+- endpoint 已被 01/04/10/20 等早期 stage 合法消账：30 仍可生成更窄 path exception，但不新增第二份 port removal record；report 记录 previous port owner 和当前 path exception id。
+- endpoint 不在 pending 且无任何 previous owner 记录：error，防止状态丢失。
+
+target 模式未使用 `--no-update-pending` 时，pending 缺失必须阻断。`--no-update-pending` 只用于 candidate/diagnostic 运行，必须写入 report，且不得宣称 accounting closure 完成。
 
 ## 10. 检查规则
 
@@ -837,15 +915,18 @@ owner 非空
 - `owner` 为空。
 - `path_category = unknown` 却要求生成。
 - 仅以 `no_port_timing` / `missing_timing_candidate` 作为依据生成 exception。
+- 仅因 harden SDC 缺失而把 channel 当作 `no_port_timing`、无 exception 或 `not_applicable`。
+- rule 依赖缺失 harden SDC 中的 timing/exception/clock-context 证据，却要求 `apply=yes`，且没有明确的 SDC-independent protocol/architecture basis。
 - endpoint 无法解析到 SoC 可见对象。
 - endpoint 无法映射到 00 canonical bit key，或用整 bus/range 直接消账而未展开对应 bit。
 - partial-bit exception 的 endpoint/rule 未列出具体 bit，或 whole-bus exception 未在 removed log 中逐 bit 记录。
 - `from_collection` / `to_collection` / `through_collection` 直接引用 `[get_clocks ...]`，即 clock-level exception 进入 30。
 - 目标 path 是 top pad related，却进入 30。
 - 目标 path 是 clock creation / clock relationship，却进入 30。
-- 纯 feedthrough segment 未经 10 建模、或没有额外 exception basis，却进入 30。
-- path 经过 feedthrough segment，但没有对应 bit-level `related_10_feedthrough_id`、所填 id 不存在于 10 `feedthrough_inventory.csv`，或没有明确 `through_collection` 锚定穿通段。
-- 同一 assembled view 中，同一 path 同时存在 active 20 budget 和 30 exception，且二者 check 维度重叠，例如 20 max 与 30 false_path(setup/both)、20 max 与 30 max_delay_override、20 min 与 30 min_delay_override，且无显式拆分、禁用 20 或裁决依据。
+- harden 内部 `fti -> fto` path 进入 SoC 30，或 rule 跨该内部路径拼接两条外部 direct edge。
+- feedthrough-related direct edge 缺少 bit-level `related_10_feedthrough_edge_id`、所填 id 不存在于当前 scenario 10 inventory、id 对应的 `connection_id`/endpoint 与 rule 不一致，或 10 disposition 不是 `route_to_30`。
+- `through_collection` 被用来锚定/穿越同一 harden 的 `fti` 与 `fto`，从而把内部段纳入 SoC exception。
+- 同一 assembled view 中，同一 path 同时存在 active 10/20 normal budget 和 30 exception，且二者 check 维度重叠，例如 normal max 与 30 false_path(setup/both)、normal max 与 30 max_delay_override、normal min 与 30 min_delay_override，且无显式拆分、禁用 normal budget 或裁决依据。
 - 同一 assembled view 中，同一 path 同时出现 `false_path` 与 `multicycle_path`。
 - 同一 assembled view 中，同一 path 同时出现 `false_path` 与 max/min override。
 - 同一 assembled view 中，同一 path 出现多条冲突 max/min override。
@@ -868,7 +949,7 @@ owner 非空
 
 以下情况应 warning，要求 reviewer 关注：
 
-- harden-to-harden channel 没有 port timing，也没有 20 budget，也没有 30 decision。
+- harden-to-harden channel 没有 port timing，也没有 10/20 normal budget/disposition，也没有 30 decision。
 - harden SDC 提取到 exception，但无法映射到集成表单 channel。
 - harden SDC 提取到 port-level exception，但同 port 又存在普通 input/output delay。
 - exception 覆盖 bus 的一部分 bit，需确认是否有意；确认后仍必须按 canonical bit endpoint 生成和消账。
@@ -880,11 +961,11 @@ owner 非空
 - 03 已经声明两端 clock asynchronous/logically_exclusive/physically_exclusive，30 又生成 `set_max_delay -datapath_only` / `set_min_delay -datapath_only`：这是可能合理的 CDC/handshake skew 约束，不应按冗余处理，但需要 `basis` / CDC 依据完整。
 - 03 未声明 asynchronous/logically_exclusive/physically_exclusive，但 30 basis 声称 async/CDC，或 30 使用 CDC max/min override，需要确认 03 是否也要更新；否则常规 setup/hold 仍可能存在。
 - CDC/异步窗口只生成 `max_delay_override` 或只生成 `min_delay_override`，未采用 `max_min_delay_override` 成对约束，需要确认另一侧窗口为何不适用。
-- active 20 max 与 30 min_delay_override、或 active 20 min 与 30 max_delay_override 共存；这是可能合法的上下界组合，但需要 `basis` 说明补充约束来源。
+- active 10/20 normal max 与 30 min_delay_override、或 active normal min 与 30 max_delay_override 共存；这是可能合法的上下界组合，但需要 `basis` 说明补充约束来源。
 - 同 clock / related clock 的功能性 max/min override 使用了 `datapath_only = yes`，需要确认是否有意剥离 clock latency/skew。
 - multicycle 的 `hold_cycles` 不等于项目默认策略，需要确认。
 - `path_category = reset` 进入 30，需要确认 recovery/removal / RDC signoff 覆盖。
-- max/min override 数值与 20 budget 候选差异很大。
+- max/min override 数值与 10/20 normal budget 候选差异很大。
 - source SDC digest 与上次提取不一致。
 - 临时 waiver 接近 `expiry_or_review_date`。
 
@@ -896,7 +977,7 @@ owner 非空
 - 所有 no-port-timing channel 清单及处理状态。
 - 所有提取到的 harden exception 清单及是否生成。
 - 所有 active 30 rule 清单，按 scenario/stage/corner/exception_type 分组。
-- 所有 20 与 30 overlap 或潜在冲突清单。
+- 所有 10/20 normal budget 与 30 overlap 或潜在冲突清单。
 - 所有 03 与 30 overlap 清单，并区分 false path 冗余、max/min CDC 配套和潜在冲突。
 - 所有 pending / needs_review / rejected candidate 及未生成原因。
 - 所有 source SDC stale candidate。
@@ -1021,7 +1102,7 @@ set_max_delay 12.0 -datapath_only \
 
 - `basis` 说明 timeout / protocol 来源。
 - `clock_relation` 与 03/CDC review 一致；若两端 clock 异步，通常需要 03 asynchronous/logically_exclusive/physically_exclusive 先去掉常规 setup/hold，再由此处的 `set_max_delay -datapath_only` 约束传播上限。
-- 该 channel 没有 active 20 普通 budget 冲突。
+- 该 channel 没有 active 10/20 normal budget 冲突。
 - `stage/corner` 维度已确认。
 
 ## 12. 第一版脚本机制建议
@@ -1031,23 +1112,27 @@ set_max_delay 12.0 -datapath_only \
 输入：
 
 ```text
-info_all.xlsx
-子 xlsx
-harden/subsys SDC
-00_harden_port_inventory/connection_inventory.csv
-01 clock_inventory.csv
-20_harden_x_if.xlsx 或 20 channel inventory
-03 clock group report / 人工 clock_relation 字段
-30_harden_to_harden_exception.xlsx
+00_middle/connection_inventory.csv
+00_middle/scenario/<scenario>/harden_sdc_manifest.csv
+00_middle/scenario/<scenario>/pending/                    # unless --no-update-pending
+01_middle/assembled/<scenario>/clock_inventory.csv
+01_middle/assembled/<scenario>/clock_inventory.meta
+10_middle/scenario/<scenario>/feedthrough_edge_inventory.csv
+20_middle/scenario/<scenario>/channel_inventory.csv
+03_middle/relation_map/<scenario>.csv
+03_middle/relation_map/<scenario>.meta
+30_middle/30_harden_to_harden_exception.xlsx
 ```
+
+上述 `*_middle` 路径是 target runtime 契约。legacy cwd 可继续使用 `00_harden_port_inventory/connection_inventory.csv`、cwd 01 inventory、20 workbook 和人工 `clock_relation`，但不得与 target pending/middle 混用。
 
 流程：
 
 1. 根据 00 `connection_inventory.csv` 建立 harden-to-harden candidate/channel inventory。
 2. 提取 harden SDC 中的 port timing，标记 `has_src_output_delay` / `has_dst_input_delay`。
 3. 提取 harden SDC 中可映射到 boundary port 的 exception 命令，作为 `extracted_harden_exception` candidate。
-4. 对没有普通 port timing、也没有 20 budget 的 channel，生成 `missing_timing_candidate`。
-5. 合并 20 channel/budget 状态，标记可能冲突或应转 30 的 channel。
+4. 对没有普通 port timing、也没有 10/20 normal budget 的 channel，生成 `missing_timing_candidate`。
+5. 合并 10 feedthrough edge 与 20 channel/budget 状态，标记可能冲突或已 `route_to_30` 的 channel。
 6. 合并 03 clock relation 信息：对 false path 标记可能冗余，对 CDC/handshake max/min override 标记是否有 asynchronous/logically_exclusive/physically_exclusive 配套。
 7. 同步 workbook：新增 candidate 用黄色标记，stale candidate 用红色/灰色标记。
 8. 只对 `exception_rule` 中 `apply=yes + review_status=approved` 的行生成 SDC。
@@ -1065,6 +1150,6 @@ harden/subsys SDC
 - 自动解析复杂 Tcl 变量/过程生成的 exception。
 - 自动判断 CDC/RDC 正确性。
 - 自动从 03 推断所有 path-level exception。
-- 自动解决 20 与 30 冲突。
+- 自动解决 10/20 normal budget 与 30 冲突。
 
 这些都必须通过表单和 reviewer 显式确认。

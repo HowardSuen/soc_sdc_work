@@ -1,159 +1,98 @@
 # SoC SDC Shared Script Runtime Rules
 
-> 状态：**Target Runtime Contract（目标运行契约）**。当前各 stage Python 脚本仍以 legacy cwd/相对路径模式为主；本文中的 `--run-root`、flat script layout、`<stage>_middle` / `<stage>_result` 和固定 downstream path 在对应 stage 完成迁移并通过 regression 前，不得当作已实现功能对外使用。
+> 状态：**Target Runtime Contract（目标运行契约）**。现有 Python 尚未全部迁移；stage 完成实现和 regression 前，不得把目标能力误写成当前已支持。
 
-本文定义 00~30 所有 SoC SDC 脚本共同遵守的运行、作者标记和目录契约。各 stage 规则只定义业务语义；若 stage 文档中的旧路径示例与本文冲突，以本文的 target layout 为准。
+本文是 00~30 的 CLI、路径、scenario、输入和销账权威规则。stage 文档与本文冲突时以本文为准。
 
-## 1. 适用范围
+## 1. 流程和 Scenario
 
-适用于：
-
-```text
-00_harden_port_inventory
-01_soc_clocks
-02_soc_clock_timing
-03_soc_clock_groups
-04_soc_io_pads
-10_feedthrough
-20_harden_x_if
-30_harden_to_harden_exception
-```
-
-当前脚本尚未全部迁移到该目录结构；本文定义后续统一迁移的目标契约。迁移完成前，legacy regression 可以继续使用各 stage 原目录，但不得再新增另一套路径约定。
-
-## 1.1 Harden SDC 渐进交付模型
-
-SoC 集成互联表单通常早于全部 harden DC output SDC 交付完成。因此所有需要读取 harden SDC 的 stage 默认支持 **partial-availability mode**：
-
-- SoC 集成表单中的 harden instance、port、scenario mapping 和 connection 仍必须完整。
-- 某些 harden SDC 尚未交付或映射路径尚不存在时，脚本必须记录为 `missing`，但继续处理其它 `available` harden。
-- 缺失是显式状态，不允许通过 glob、近似文件名或回退到其它 scenario SDC 静默补齐。
-- 多个候选、同一 `(inst_name, scenario)` 有冲突映射、或一份已读取 SDC 解析失败，仍是 error；只有“文件尚未到位”可以按 partial 处理。
-- 受 missing SDC 影响的候选、clock、channel 或 exception evidence 必须显式标记 `missing_sdc` / `incomplete_evidence`，不能因缺少证据而被推断为“无 clock”、“无 exception”或“无需约束”。
-- 缺失 SDC 对应的 pending canonical port 默认保留；只有不依赖该 SDC 的独立证据/人工 approved rule 满足对应 stage 生成门槛时，才能生成或消账。
-- 所有 SDC/report/inventory header 必须记录 `Run completeness: complete|partial`、available/missing harden 数量和 missing instance 列表。
-
-统一可选 strict 开关为：
+完整流程：
 
 ```text
---require-complete-harden-sdc
+00 -> 01 -> 02 -> 03 -> 04 -> 10 -> 20 -> 30
 ```
 
-默认不开启，用于项目进行中的渐进解析。在 SoC SDC 正式交付、signoff 冻结或 CI completeness gate 中开启；任一 required harden SDC 为 `missing` 时整体阻断。
-
-每个需读取 harden SDC 的 stage regression 至少覆盖：
-
-- 全部 SDC available：`Run completeness: complete`。
-- 部分 SDC missing：available harden 仍产出正确结果，missing 对象标记 incomplete 并保留 pending。
-- 部分 SDC missing + `--require-complete-harden-sdc`：阻断。
-- missing SDC 不会被误判为“无 clock”、“无 exception”、`no_soc_budget_required` 或 `not_applicable`。
-- missing SDC 后续到位时，更新 manifest 状态并从干净 pending 重新运行受影响 stage，使 blocked/pending 记录恢复正常 review 流程；前后产物通过独立 run root 做 diff。
-
-## 2. 作者标记
-
-### 2.1 运行时输出
-
-每个 stage 脚本启动后必须在 stdout 打印一次：
+每个 stage 都显式接收当前 scenario：
 
 ```text
-Author: Howard
+--scenario common|func|scan|mbist|gpio_in|gpio_out
 ```
 
-生成的 SDC header、check report header 和 coverage/report metadata 也应记录：
+允许兼容 `-scenario`，但 report/SDC/workbook/inventory 中统一写 canonical scenario。
+
+同一个 `run_root` 可以保存多个 scenario 的 middle/result。规则：
+
+- 00 必须先为目标 scenario 初始化 manifest 和 pending。
+- stage 命令行 scenario 必须与所读 manifest/pending/meta 中的 scenario 一致。
+- scenario 状态存入独立子目录，禁止跨 scenario 读取 pending 或 removed log。
+- 初始化一个 scenario 不得删除或覆盖其它 scenario 的状态。
+- common 产物可以复用，但 scenario effective view 必须重新装配和检查。
+
+## 2. 00 是集成信息机器真源
+
+只有 00 直接解析 SoC 集成表单：
 
 ```text
-Author: Howard
-Stage: <stage_id>
-Script: <script_name>
+inputs/info_all.xlsx
+inputs/port_*.xlsx
+inputs/ports_*.xlsx
 ```
 
-### 2.2 源码拼装
-
-源码中不直接保存一个连续、单点定义的 `Howard` literal。统一 author helper 应满足：
-
-- 从多个分散、非连续的 getter/字符片段中取得字符。
-- 可以使用脚本私有的随机选择，从多个等价片段来源中选择后拼装。
-- 无论随机分支如何选择，最终结果必须恒定为 `Howard`；作者打印不能随运行变化。
-- 不能调用网络、环境变量或外部文件获取作者名，避免离线内网运行失败。
-- 不能修改 Python 全局 random seed 或影响业务逻辑、输出排序和 regression 可重复性；若使用随机选择，应使用 helper 私有 RNG。
-- 必须兼容内网 Python 3.6.8。
-
-该机制只是轻量 provenance/提高简单搜索替换的成本，不是加密签名或不可篡改保证。需要追溯时，report 可额外记录脚本文件 SHA-256；作者打印本身不能替代版本管理和代码 review。
-
-### 2.3 回归要求
-
-每个 stage regression 至少检查：
-
-- stdout 中恰好出现可识别的 `Author: Howard`。
-- 生成 SDC/report header 中作者值正确。
-- 多次运行或不同随机分支下作者值恒定。
-- author helper 不改变业务输出和排序。
-
-## 3. Flat Script Layout
-
-未来所有 stage Python 脚本统一放在同一个工具目录，不再依赖脚本所在 stage 子目录推导输入输出：
-
-```text
-<tool_root>/
-  00_harden_port_inventory.py
-  01_extract_soc_clocks.py
-  02_extract_soc_clock_timing.py
-  03_extract_soc_clock_groups.py
-  04_extract_soc_io_pads.py
-  10_extract_feedthrough.py
-  20_extract_harden_x_if.py
-  30_extract_harden_to_harden_exception.py
-```
-
-所有脚本必须接受统一 `--run-root <path>`。未指定时默认使用当前工作目录；不得使用脚本文件所在目录作为隐式 run root。
-
-## 4. Run Root Layout
-
-统一运行目录：
-
-```text
-<run_root>/
-  inputs/
-  00_middle/
-  00_result/
-  01_middle/
-  01_result/
-  02_middle/
-  02_result/
-  03_middle/
-  03_result/
-  04_middle/
-  04_result/
-  10_middle/
-  10_result/
-  20_middle/
-  20_result/
-  30_middle/
-  30_result/
-```
-
-语义：
-
-- `<stage>_middle/`：机器可读 inventory、candidate/form、manifest、sync state、pending/removed-log 等 downstream 或重跑会读取的中间产物。
-- `<stage>_result/`：该 stage 对用户/flow 交付的 SDC、check report、coverage report 和摘要。
-- `inputs/`：SoC 集成表单、port 表单、按 scenario 选择的 harden DC output SDC、manual overlay 等外部输入。
-- regression 临时文件不得写进 result；统一放在 regression 自己的 work root。
-
-每个 stage 必须自行创建所需目录。写文件时先写临时文件再原子替换，避免下游读到半成品。
-
-## 5. Stage Artifact Contract
-
-### 5.1 00
+00 必须生成：
 
 ```text
 00_middle/connection_inventory.csv
 00_middle/scenario/<scenario>/harden_sdc_manifest.csv
 00_middle/scenario/<scenario>/pending/<inst>.ports
-00_middle/scenario/<scenario>/disposition/
-00_result/reports/inventory_report.txt
+00_middle/scenario/<scenario>/removed_log/00_disposition.removed
+00_result/reports/inventory_report_<scenario>.txt
 ```
 
-`harden_sdc_manifest.csv` 是所有需读取 harden SDC 的 stage 的唯一文件选择接口，最少字段为：
+`connection_inventory.csv` 是 01/04/10/20/30 的 required direct-edge machine input。它必须完成：
+
+```text
+canonical scalar/bit port expansion
+direct bit-level edge expansion
+stable connection_id
+src/dst endpoint key
+direction/range validation
+scenario_scope
+pad/clock/feedthrough/constant/NC classification hints
+source workbook/sheet/row traceability
+```
+
+每行只能表示一条 `source bit -> destination bit` direct edge。fanout 每个 sink 独立成行。下游不得重新展开 bus/range、重算 `connection_id`，也不得在缺少 exact edge 时回退 whole-bus 或按名称猜测。
+
+`scenario_scope` 为 `common`、单个具体 scenario 或稳定排序的 scenario list。下游统一选择：
+
+```text
+effective edges = scenario_scope 包含 common 或当前 scenario 的行
+```
+
+## 3. Target 与 Legacy 布局
+
+target `--run-root` 模式固定使用 `*_middle` / `*_result` 路径。
+
+legacy cwd 模式允许使用：
+
+```text
+00_harden_port_inventory/connection_inventory.csv
+00_harden_port_inventory/harden_sdc_manifest.csv
+00_harden_port_inventory/pending/
+00_harden_port_inventory/removed_log/
+```
+
+legacy cwd 一次只承载一个 scenario。target 与 legacy 不得在同一次 flow 中交叉读取或同时修改两套 pending。stage 文档中的 legacy 路径只能放在明确标记的兼容章节，不能作为 target 默认值。
+
+## 4. Harden SDC Manifest 和 Partial Availability
+
+00 为当前 scenario 生成：
+
+```text
+00_middle/scenario/<scenario>/harden_sdc_manifest.csv
+```
+
+最少字段：
 
 ```text
 scenario
@@ -164,38 +103,99 @@ availability_status
 note
 ```
 
-`availability_status` 使用 `available` / `missing` / `not_required`。`available` 必须提供明确 `sdc_path`；`missing` 可保留预期路径，路径尚未确定时可留空；`not_required` 的路径应为空。`note` 可选，但 `(inst_name, scenario)` manifest 行不能缺失。
-
-manifest 只负责“明确选哪个文件”和“当前是否交付”，不强制保存 `file_digest`、`mapping_source` 或 meta。脚本直接读取 `sdc_path` 当前内容。项目采用“输入更新后从干净状态完整重跑，并对比前后产物”的确认模型。SHA-256 可以写入 debug bundle 方便排查，但不作为正常运行 gate，也不进入正式 SDC 造成无意义 diff。
-
-### 5.2 01
+`availability_status`：
 
 ```text
+available
+missing
+not_required
+```
+
+规则：
+
+- 每个当前 scenario required harden 恰好一行。
+- `available` 路径必须唯一、存在且可读。
+- `missing` 表示尚未交付，不表示无 clock、无 timing 或无 exception。
+- `not_required` 必须有明确依据。
+- 01/04/10/20/30 通过 manifest 读取 available harden SDC。
+- 默认 partial mode 继续处理 available harden；missing 相关 evidence 标记 incomplete。
+- missing 相关 port 默认保留 pending；只有 stage 规则允许且具有 approved SDC-independent terminal basis 时才可例外销账。
+- strict/signoff 模式使用 `--require-complete-harden-sdc`，required missing 时阻断。
+
+## 5. Port Accounting 默认开启
+
+00 默认生成当前 scenario pending。01/04/10/20/30 默认更新 pending 并写 removed log；02/03 永不销账。
+
+诊断运行可显式关闭：
+
+```text
+00: --no-port-accounting
+01/04/10/20/30: --no-update-pending
+```
+
+显式关闭时必须在 report/SDC header 记录 `Port accounting: disabled by explicit option`，且不得宣称 port closure 完成。
+
+target pending：
+
+```text
+00_middle/scenario/<scenario>/pending/<inst>.ports
+```
+
+target removed log：
+
+```text
+00_middle/scenario/<scenario>/removed_log/00_disposition.removed
+01_middle/scenario/<scenario>/removed_log/01_soc_clocks.removed
+04_middle/scenario/<scenario>/removed_log/04_soc_io_pads.removed
+10_middle/scenario/<scenario>/removed_log/10_feedthrough.removed
+20_middle/scenario/<scenario>/removed_log/20_harden_x_if.removed
+30_middle/scenario/<scenario>/removed_log/30_harden_to_harden_exception.removed
+```
+
+规则：
+
+- pending 和 removed log 使用 exact canonical scalar/bit key。
+- 不得使用 bus range、wildcard 或 pattern 删除。
+- target accounting 开启时，pending 缺失或损坏必须阻断。
+- previous-owner 检查只读取当前 scenario 的固定早期 removed log。
+- 一个 canonical port 只能有一个 port-level removal owner。
+- 30 可以在已有早期 port owner 后生成更窄 path exception，但不能重复删除 port。
+- accounting 状态不得反向改变 constraint classification 或 SDC 生成语义。
+
+## 6. Common/Scenario 装配模型
+
+review workbook 可以包含 `scenario=common` 和具体 scenario 行。当前 scenario view 使用：
+
+```text
+active rows = common rows + current scenario rows
+```
+
+不同 stage 的输出模型：
+
+- 01：生成 common clock SDC、scenario clock overlay，并生成 `assembled/<scenario>` clock inventory/meta。
+- 02：生成 resolved effective 单文件；具体 scenario 行优先于 common fallback，装配时只 source 当前 resolved 02 文件。
+- 03/04/10/20/30：保留 common + scenario overlay 文件；脚本必须检查 assembled view 冲突，不能依靠 source priority 静默覆盖。
+
+`scenario=common` 时只生成/使用 common view。其它 scenario 行不参与当前运行。
+
+项目维护的 scenario pre-setup，例如 `scenarios/<scenario>_pre.sdc`，负责 `set_case_analysis` 等 mode 设置，不由 00~30 自动生成。03/04/30 若依赖 case 条件，必须在规则/basis 中记录。
+
+## 7. Stage Artifact Contract
+
+### 7.1 01
+
+```text
+01_result/common/01_soc_clocks.sdc
+01_result/scenarios/<scenario>_clocks.sdc
 01_middle/common/clock_inventory.csv
-01_middle/common/clock_inventory.meta
 01_middle/scenario/<scenario>/clock_inventory.csv
-01_middle/scenario/<scenario>/clock_inventory.meta
 01_middle/assembled/<scenario>/clock_inventory.csv
 01_middle/assembled/<scenario>/clock_inventory.meta
 01_middle/scenario/<scenario>/removed_log/01_soc_clocks.removed
-01_result/common/01_soc_clocks.sdc
-01_result/scenarios/<scenario>_clocks.sdc
-01_result/reports/clock_check_report.txt
+01_result/reports/clock_check_report_<scenario>.txt
 ```
 
-`common` inventory 记录 common 01 SDC 的有效 clock；`scenario/<scenario>` inventory 只记录该 scenario overlay 新增或明确改写的 clock。`assembled/<scenario>` 是 downstream 唯一允许读取的 effective clock universe：
-
-```text
-scenario = common:
-  assembled = common
-
-scenario != common:
-  assembled = common + scenario overlay
-```
-
-`assembled/<scenario>/clock_inventory.meta` 至少记录 common/scenario 最终 SDC path/digest、assembled clock set digest 和 scenario。02/03/04/20/30 不允许读取 auto-only 临时 inventory，也不允许自行合并 common/scenario clock。当前 legacy 01 尚未生成这些分层产物；在迁移完成前只能将 `common`/func-only 用法视为已实现范围。
-
-### 5.3 02
+### 7.2 02
 
 ```text
 02_middle/02_soc_clock_timing_budget_<stage>.xlsx
@@ -205,7 +205,7 @@ scenario != common:
 02_result/reports/
 ```
 
-### 5.4 03
+### 7.3 03
 
 ```text
 03_middle/03_soc_clock_groups.xlsx
@@ -216,104 +216,118 @@ scenario != common:
 03_result/reports/
 ```
 
-`relation_map/<scenario>.csv` 必须是当前 assembled clock universe 的完整无序 clock-pair map，包括未命中显式 clock-group rule 而仍按默认 synchronous 分析的 pair。最少字段为 `schema_version,scenario,clock_a,clock_b,relation_type,relation_source,source_rule_ids,clock_universe_digest,assembled_view_digest`。`relation_source` 区分 `explicit_rule` 与 `default_synchronous`。`<scenario>.meta` 记录 01 assembled inventory digest、03 form digest、common/scenario SDC digest 和 CSV digest。
-
-### 5.5 04
+### 7.4 04
 
 ```text
 04_middle/04_soc_io_pads.xlsx
 04_middle/scenario/<scenario>/removed_log/04_soc_io_pads.removed
 04_result/common/04_soc_io_pads.sdc
 04_result/common/04_soc_io_pads_<stage>_<corner>.sdc
-04_result/scenarios/
+04_result/scenarios/<scenario>_io_pads.sdc
+04_result/scenarios/<scenario>_io_pads_<stage>_<corner>.sdc
 04_result/reports/
 ```
 
-### 5.6 10
+### 7.5 10
 
 ```text
-10_middle/feedthrough_inventory.csv
-10_middle/scenario/common/removed_log/10_feedthrough.removed
+10_middle/10_feedthrough.xlsx
+10_middle/scenario/<scenario>/feedthrough_edge_inventory.csv
+10_middle/scenario/<scenario>/removed_log/10_feedthrough.removed
 10_result/common/10_feedthrough.sdc
-10_result/reports/feedthrough_check_report_common.txt
+10_result/common/10_feedthrough_<stage>_<corner>.sdc
+10_result/scenarios/<scenario>_feedthrough.sdc
+10_result/scenarios/<scenario>_feedthrough_<stage>_<corner>.sdc
+10_result/reports/
 ```
 
-### 5.7 20
+### 7.6 20
 
 ```text
 20_middle/20_harden_x_if.xlsx
-20_middle/channel_inventory.csv
+20_middle/scenario/<scenario>/channel_inventory.csv
+20_middle/scenario/<scenario>/channel_inventory.meta
 20_middle/scenario/<scenario>/removed_log/20_harden_x_if.removed
 20_result/common/20_harden_x_if.sdc
 20_result/common/20_harden_x_if_<stage>_<corner>.sdc
-20_result/scenarios/
+20_result/scenarios/<scenario>_harden_x_if.sdc                    # budget_output only
+20_result/scenarios/<scenario>_harden_x_if_<stage>_<corner>.sdc   # budget_output only
 20_result/reports/
 ```
 
-### 5.8 30
+### 7.7 30
 
 ```text
 30_middle/30_harden_to_harden_exception.xlsx
-30_middle/exception_candidates.csv
+30_middle/scenario/<scenario>/exception_candidates.csv
 30_middle/scenario/<scenario>/removed_log/30_harden_to_harden_exception.removed
 30_result/common/30_harden_to_harden_exception.sdc
 30_result/common/30_harden_to_harden_exception_<stage>_<corner>.sdc
-30_result/scenarios/
+30_result/scenarios/<scenario>_exceptions.sdc
+30_result/scenarios/<scenario>_exceptions_<stage>_<corner>.sdc
 30_result/reports/
 ```
 
-## 6. Fixed Downstream Reads
-
-默认依赖路径固定为：
+## 8. Fixed Downstream Reads
 
 ```text
-01 <- 00_middle/connection_inventory.csv
-01 <- 00_middle/scenario/<scenario>/harden_sdc_manifest.csv
-01 <- 00_middle/scenario/<scenario>/pending/
+01 <- 00 connection inventory
+01 <- current-scenario harden SDC manifest
 
-02 <- 01_middle/assembled/<scenario>/clock_inventory.csv
-02 <- 01_middle/assembled/<scenario>/clock_inventory.meta
+02 <- 01 assembled current-scenario clock inventory + meta
 
-03 <- 01_middle/assembled/<scenario>/clock_inventory.csv
-03 <- 01_middle/assembled/<scenario>/clock_inventory.meta
+03 <- 01 assembled current-scenario clock inventory + meta
 
-04 <- 00_middle/connection_inventory.csv
-04 <- 00_middle/scenario/<scenario>/harden_sdc_manifest.csv
-04 <- 01_middle/assembled/<scenario>/clock_inventory.csv
-04 <- 00_middle/scenario/<scenario>/pending/
+04 <- 00 connection inventory
+04 <- current-scenario harden SDC manifest
+04 <- 01 assembled clock inventory + meta
 
-10 <- 00_middle/connection_inventory.csv
-10 <- 00_middle/scenario/common/pending/
+10 <- 00 connection inventory
+10 <- current-scenario harden SDC manifest
+10 <- 01 assembled clock inventory + meta              [optional diagnostic]
+10 <- 03 current-scenario relation map + meta           [optional diagnostic]
 
-20 <- 00_middle/connection_inventory.csv
-20 <- 00_middle/scenario/<scenario>/harden_sdc_manifest.csv
-20 <- 01_middle/assembled/<scenario>/clock_inventory.csv
-20 <- 03_middle/relation_map/<scenario>.csv
-20 <- 10_middle/feedthrough_inventory.csv
+20 <- 00 connection inventory
+20 <- current-scenario harden SDC manifest
+20 <- 01 assembled clock inventory + meta
+20 <- 10 current-scenario feedthrough edge inventory
+20 <- 03 current-scenario relation map + meta           [required only for budget_output/clock-derived basis]
 
-30 <- 00_middle/connection_inventory.csv
-30 <- 00_middle/scenario/<scenario>/harden_sdc_manifest.csv
-30 <- 01_middle/assembled/<scenario>/clock_inventory.csv
-30 <- 03_middle/relation_map/<scenario>.csv
-30 <- 10_middle/feedthrough_inventory.csv
-30 <- 20_middle/channel_inventory.csv
+30 <- 00 connection inventory
+30 <- current-scenario harden SDC manifest
+30 <- 01 assembled clock inventory + meta
+30 <- 03 current-scenario relation map + meta
+30 <- 10 current-scenario feedthrough edge inventory
+30 <- 20 current-scenario channel inventory
 ```
 
-规则：
+30 在缺少 20 inventory 时可以生成 candidate-only report/workbook，但不得生成正式 30 SDC。feedthrough-related candidate 在缺少 10 `route_to_30` 结果时同样不得生成。
 
-- downstream 不得用 `glob("*.csv")`、扫描 cwd 或猜测最近文件来选择 upstream artifact。
-- 默认路径按 `--run-root` 解析；允许 CLI 显式 override，但 report 必须打印 resolved absolute path。
-- upstream 必需文件缺失或 scenario/stage/corner 不匹配时必须阻断，不允许静默 fallback。需要 stale 检查的已生成 machine artifact 可继续使用其自身 meta/digest 契约；harden SDC manifest 不使用 digest gate。
-- 上一条的“upstream 文件缺失”不包括 manifest 中已显式记录的 `availability_status=missing` harden SDC：该情况按 partial-availability mode 继续。manifest 本身缺失、available 行路径不存在、或开启 `--require-complete-harden-sdc` 后仍有 missing 才阻断。
-- stage result 可以被 flow source；stage middle 只供脚本/审核消费，不能直接作为 SDC source。
-- 20/30 读取 03 relation map 只用于约束语义一致性检查：防止在 async/exclusive pair 上误生成普通同步 budget，并识别 30 false-path 冗余或 CDC max/min 配套。clock relation 不决定 pending owner，也不能自动把 channel 提升为 30 exception。
-- 10 v1 只在 common 结构视图中运行。其 `validation_status=matched` 的 common structural removed log 必须重放到所有已初始化的 scenario pending 视图；`needs_review` 或未来 scenario-specific feedthrough 不得重放。
+## 9. Report Metadata
 
-## 7. Migration Rule
+每个 stage stdout、SDC、inventory/workbook 和 report 至少记录：
 
-脚本迁移到 flat layout 时应按 stage 分批完成：
+```text
+Author: Howard
+Scenario: <command-line scenario>
+Run completeness: complete|partial
+Port accounting: enabled|disabled by explicit option
+Connection inventory: <resolved path>
+Harden SDC manifest: <resolved path, when used>
+```
 
-1. 先增加 `--run-root` 和新目录写入能力。
-2. regression 同时验证新路径和 legacy 输入兼容期。
-3. downstream 全部切换到固定路径后，删除 legacy cwd glob/fallback。
-4. 最后更新打包脚本，只打包 flat Python scripts；规则、测试和文档继续不进入内网脚本包。
+## 10. Packaging 和 Migration
+
+脚本/共享 parser 必须离线、确定性、兼容 Python 3.6.8。
+
+内网包只包含 flat Python scripts/shared parser 和必要输入/表单模板；不包含 rules、tests、examples、result、cache 或 macOS metadata。
+
+迁移完成条件：
+
+1. 00 正式生成 bit-level connection inventory、scenario manifest 和默认 pending。
+2. 01/04/10/20/30 只用 00 machine artifact 获取 port/connection 信息。
+3. 00~30 均接收并校验 scenario CLI。
+4. 所有 target path 使用本文固定路径，不混用 legacy cwd。
+5. accounting enabled/disabled、partial SDC 和至少两个 scenario 完成 regression。
+6. 03/10/20/30 machine interface digest/scenario 检查通过。
+7. 全部完成后重新生成内网包；旧包作废。

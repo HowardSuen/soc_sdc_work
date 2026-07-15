@@ -244,6 +244,7 @@ class DomainMemberRow:
 class ClockDomain:
     domain_id: str
     members: List[str] = field(default_factory=list)
+    closure_members: Set[str] = field(default_factory=set)
     blocked_instances: Set[str] = field(default_factory=set)
     source_rows: List[int] = field(default_factory=list)
 
@@ -1149,6 +1150,7 @@ def validate_and_build_domains(
                 )
             members = [clock for clock in members if clock != row.clock_name]
         domain.members = members
+        domain.closure_members = closure_pool
         if not domain.members and not domain.blocked_instances:
             report.error(f"domain {domain_id} has no effective clock members")
 
@@ -1342,6 +1344,7 @@ def expand_rule_groups(
                 continue
             if domain.blocked_instances:
                 rule.blocked_instances.update(domain.blocked_instances)
+            descendant_pool.update(domain.closure_members)
             for member in domain.members:
                 if member not in effective:
                     effective.append(member)
@@ -1405,7 +1408,8 @@ def expand_rule_groups(
             )
 
     seen_effective: Dict[str, int] = {}
-    for group_idx, group in enumerate(rule.effective_groups, start=1):
+    for list_idx, group in enumerate(rule.effective_groups):
+        group_idx = rule.group_indices[list_idx]
         for clock in group:
             previous_group = seen_effective.get(clock)
             if previous_group is not None and previous_group != group_idx:
@@ -1430,7 +1434,8 @@ def build_pair_maps(
     for rule in rules:
         if rule.blocked_instances:
             continue
-        for group_idx, group in enumerate(rule.effective_groups, start=1):
+        for list_idx, group in enumerate(rule.effective_groups):
+            group_idx = rule.group_indices[list_idx]
             label = f"{rule.group_id}:group_{group_idx}:{rule.relation_type}:{rule.scenario}"
             for clock in group:
                 participation[clock].append(label)
@@ -1445,8 +1450,8 @@ def build_pair_maps(
                     relation_type=rule.relation_type,
                     group_id=rule.group_id,
                     scenario=rule.scenario,
-                    group_a=f"group_{idx_a + 1}",
-                    group_b=f"group_{idx_b + 1}",
+                    group_a=f"group_{rule.group_indices[idx_a]}",
+                    group_b=f"group_{rule.group_indices[idx_b]}",
                 )
                 for clock_a in group_a:
                     for clock_b in group_b:

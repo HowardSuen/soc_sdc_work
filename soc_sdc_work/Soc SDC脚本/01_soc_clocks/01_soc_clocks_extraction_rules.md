@@ -2,16 +2,16 @@
 
 本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。目标迁移后，final inventory 写入 `01_middle/`，最终 SDC/report 写入 `01_result/`。
 
-本文档记录 01 clock 提取/生成规则。当前脚本实现 **func/common 单一模式**，兼容 legacy cwd 运行，并支持通过 `--run-root` 生成 target layout 的 common 与 `assembled/common` 产物；scan/mbist/gpio 等非 common scenario overlay 及对应 assembled inventory 尚未实现。
+本文档记录 01 clock 提取/生成规则。target runtime 显式输入 scenario，并生成 common/scenario/assembled 产物。当前 Python 仍只完整实现 func/common 与 legacy cwd；其它 scenario overlay 属于实现 backlog，不改变本文 target 契约。
 
 ## 1. 目标
 
-脚本目标是根据 SoC 集成表单和各 harden 的 DC output SDC，生成：
+target 模式根据 00 bit-level connection inventory、当前 scenario harden SDC manifest 和各 available harden SDC 生成：
 
-- `common/01_soc_clocks.sdc`
-- `clock_inventory.csv`
-- `clock_check_report.txt`
-- `00_harden_port_inventory/removed_log/01_soc_clocks.removed`（当执行目录存在 `00_harden_port_inventory/pending` 时）
+- common/scenario `01_soc_clocks.sdc`
+- common/scenario/assembled `clock_inventory.csv` 和 meta
+- current-scenario `clock_check_report`
+- current-scenario `01_soc_clocks.removed`（除非显式 `--no-update-pending`）
 
 其中 `01_soc_clocks.sdc` 只放 SoC 级 clock 声明，不放 clock timing budget、clock group、false path、multicycle、IO delay、mode case analysis 或 exception。
 
@@ -24,11 +24,13 @@ target runtime 中的多 scenario 产物为：
 01_middle/scenario/<scenario>/clock_inventory.csv
 01_middle/assembled/<scenario>/clock_inventory.csv
 01_middle/assembled/<scenario>/clock_inventory.meta
+01_middle/scenario/<scenario>/removed_log/01_soc_clocks.removed
+01_result/reports/clock_check_report_<scenario>.txt
 ```
 
-`assembled/<scenario>` 按 common + 当前 scenario overlay 组合，是 02/03/04/20/30 唯一允许读取的 clock universe。
+`assembled/<scenario>` 按 common + 当前 scenario overlay 组合，是 02/03/04/10/20/30 唯一允许读取的 clock universe。
 
-所有 **SoC-visible clock object** 都归属 `01_soc_clocks.sdc`。第一版脚本从 harden DC output SDC 和集成表单生成 top clock、harden output clock；如果执行目录存在 `virtual_clocks.csv`，也会从该文件生成 SoC 级 virtual clock。virtual clock 不应放到 `04_soc_io_pads.sdc`。
+所有 **SoC-visible clock object** 都归属 `01_soc_clocks.sdc`。target 模式从 harden DC output SDC 和 00 connection inventory 生成 top clock、harden output clock；如果存在 `virtual_clocks.csv`，也会生成 SoC 级 virtual clock。virtual clock 不应放到 `04_soc_io_pads.sdc`。
 
 harden-origin clock 的 ownership 规则：
 
@@ -43,7 +45,16 @@ harden-origin clock 的 ownership 规则：
 
 ## 2. 输入
 
-### 2.1 `info_all.xlsx`
+### 2.1 00 instance/connection machine artifact
+
+target 模式不直接解析 `info_all.xlsx` / owner port workbook。instance/module 来自当前 scenario manifest，port、range、connection 和 source trace 来自：
+
+```text
+00_middle/connection_inventory.csv
+00_middle/scenario/<scenario>/harden_sdc_manifest.csv
+```
+
+以下 `info_all.xlsx` / owner workbook 说明只适用于 legacy cwd：
 
 记录 SoC 下 harden/module 的基本实例信息，例如：
 
@@ -55,7 +66,7 @@ harden-origin clock 的 ownership 规则：
 
 脚本根据该表获取 SoC 中有多少个 harden、每个 harden 的 module 名和 instance 名。
 
-约定：
+legacy 约定：
 
 - `info_all.xlsx` 放在脚本执行目录。
 - 所有 owner 子 xlsx 和 harden SDC 也放在脚本执行目录。
@@ -64,7 +75,7 @@ harden-origin clock 的 ownership 规则：
 - `module_name` 只用于匹配同一种 harden 的 SDC；生成 clock name 和 SoC pin path 必须使用 `inst_name`。
 - owner 子 xlsx 的 sheet name 应与 `inst_name` 精确一致。脚本可提供大小写/首尾空格不敏感的兜底匹配，但必须 warning；完全无法对应任何 `inst_name` 的孤儿 sheet 也必须 warning。
 
-### 2.2 owner 子 xlsx
+### 2.2 Legacy owner 子 xlsx
 
 每个 owner 子 xlsx 中，一个 sheet 对应一个 harden instance。脚本读取以下连接信息：
 
@@ -89,7 +100,7 @@ harden-origin clock 的 ownership 规则：
 
 owner 子 xlsx 中的 port/range 必须与 `00_harden_port_inventory` 的 canonical bit key 规则对齐。scalar port 直接使用 `port`；vector port 在机器处理中展开为 `port[index]`。例如 `output [1:0] clk_o` 若两个 bit 都是 clock source，应作为 `clk_o[0]`、`clk_o[1]` 两个独立 target 处理、进入 clock inventory，并分别从 pending 中删除。
 
-`From Whom` 是 input clock 来源的兜底来源。若执行目录下存在 00 `connection_inventory.csv`，并且其中有当前 input bit 的 exact edge，脚本优先使用该 edge 的 source bit；只有缺少 exact edge 时才回退到 owner 子 xlsx 的 `From Whom`。
+target 模式只使用 00 exact edge 解析 input clock 来源。缺少 edge、重复 driver 或 scenario 不匹配时必须 error/保持 unresolved，不能回退 `From Whom`。legacy cwd 在明确缺少 00 inventory 时可以临时回退 `From Whom`，但必须 warning，且不得作为 target regression 的成功路径。
 
 ### 2.3 harden DC output SDC
 
@@ -170,7 +181,13 @@ create_clock -name v_pcie_ref_clk -period 10.000
 
 ### 2.5 00 `connection_inventory.csv`
 
-可选输入文件，默认路径：
+target required 路径：
+
+```text
+00_middle/connection_inventory.csv
+```
+
+legacy cwd 路径：
 
 ```text
 00_harden_port_inventory/connection_inventory.csv
@@ -190,13 +207,13 @@ create_clock -name v_pcie_ref_clk -period 10.000
   > unresolved / warning
 ```
 
-第一版只在文件存在时读取；若文件不存在，脚本保持旧行为，继续使用 owner 子 xlsx 的 `From Whom`。
+target 模式必须按 `scenario_scope = common 或当前 --scenario` 过滤 edge。required inventory 缺失、schema 不支持、exact bit edge 缺失或 destination 多 driver 时必须阻断；不能继续使用 owner `From Whom` 猜测。
 
 ### 2.6 `01_soc_clocks_manual.sdc`
 
 可选手工 overlay，用于补充无法从 harden output boundary declaration 自动提取、但 SoC 层级必须显式创建的 clock。典型场景是 harden DC output SDC 只在内部逻辑 pin 上声明 clock，没有在 output port 上交付对应 `create_clock` / `create_generated_clock`，而 SoC 集成表单确认该 output port 会作为 SoC-visible clock source。
 
-手工 clock 不应直接编辑生成后的 `common/01_soc_clocks.sdc`，避免下次生成被覆盖。统一写入：
+手工 clock 不应直接编辑生成后的 `01_result/common/01_soc_clocks.sdc`，避免下次生成被覆盖。统一写入：
 
 ```text
 01_soc_clocks_manual.sdc
@@ -208,7 +225,7 @@ create_clock -name v_pcie_ref_clk -period 10.000
 自动提取的 top/output clocks
 + virtual_clocks.csv 生成的 SoC virtual clocks
 + 01_soc_clocks_manual.sdc
-= common/01_soc_clocks.sdc
+= 01_result/common/01_soc_clocks.sdc
 ```
 
 manual overlay 只允许 SoC-visible `create_clock` / `create_generated_clock`。target 必须是明确的 SoC top port 或 harden instance output pin，例如：
@@ -511,7 +528,7 @@ u_harden_c_clk_o, u_harden_c/clk_i, u_harden_a/clk_pll
 
 ## 8. 输出文件
 
-### 8.1 `common/01_soc_clocks.sdc`
+### 8.1 `01_result/common/01_soc_clocks.sdc`
 
 生成 SoC 级 func clock 声明。
 
@@ -524,10 +541,22 @@ python3 "/path/to/soc_sdc_work/Soc SDC脚本/01_soc_clocks/01_extract_soc_clocks
 target layout 入口：
 
 ```bash
-python3 "/path/to/01_extract_soc_clocks.py" --run-root "/path/to/run_root"
+python3 "/path/to/01_extract_soc_clocks.py" \
+  --run-root "/path/to/run_root" \
+  --scenario <scenario>
 ```
 
-默认从执行目录读取：
+target 默认读取：
+
+```text
+00_middle/connection_inventory.csv
+00_middle/scenario/<scenario>/harden_sdc_manifest.csv
+00_middle/scenario/<scenario>/pending/                    # unless --no-update-pending
+inputs/virtual_clocks.csv                                  # optional
+inputs/01_soc_clocks_manual.sdc                            # optional
+```
+
+legacy cwd 默认读取：
 
 ```text
 info_all.xlsx
@@ -535,10 +564,10 @@ port_*.xlsx
 *.sdc
 virtual_clocks.csv   # optional
 01_soc_clocks_manual.sdc   # optional manual SoC-visible clock overlay
-00_harden_port_inventory/connection_inventory.csv   # optional
+00_harden_port_inventory/connection_inventory.csv
 ```
 
-默认输出：
+target 输出见 §1；legacy cwd 默认输出：
 
 ```text
 common/01_soc_clocks.sdc
@@ -548,11 +577,18 @@ clock_check_report.txt
 
 `01_soc_clocks.sdc` 的输出顺序应尽量按 clock 依赖拓扑排序：被 `-source [get_clocks ...]`、`-source [get_ports ...]` 上溯到的已 emitted clock，或 `root_source` 对应的已 emitted clock，应先于依赖它的 generated/forwarded clock 输出。无法解析的依赖保持原稳定顺序；检测到排序环时 warning 并保留剩余原顺序。
 
-最终 `common/01_soc_clocks.sdc` 是 SoC-visible clock object 的权威真源。01 必须在 auto + virtual + manual 装配完成后，对最终 SDC 做回读/reconcile，再生成 `clock_inventory.csv`。不能先生成 auto-only inventory，再把 manual SDC 追加到最终文件。
+最终 `01_result/common/01_soc_clocks.sdc` 和当前 scenario overlay 共同定义该 scenario 的 SoC-visible clock object。01 必须在 auto + virtual + manual 装配完成后，对 assembled SDC 做回读/reconcile，再生成 assembled `clock_inventory.csv`。不能先生成 auto-only inventory，再追加 manual/scenario SDC。
 
-若执行目录存在 `00_harden_port_inventory/pending`，01 只按 exact canonical bit key 删除 clock port，并在 `removed_log/01_soc_clocks.removed` 记录同一个 key。对于 vector clock，不能用 `clk_o` 或 `clk_o[1:0]` 删除 `clk_o[0]` / `clk_o[1]`；必须逐 bit 删除。
+target 默认要求并更新：
 
-如果执行目录下存在 `00_harden_port_inventory/pending`，脚本还会按 00 规则消费已由 01 覆盖的 harden clock port，并写：
+```text
+00_middle/scenario/<scenario>/pending/
+01_middle/scenario/<scenario>/removed_log/01_soc_clocks.removed
+```
+
+01 只按 exact canonical bit key 删除 clock port。对于 vector clock，不能用 `clk_o` 或 `clk_o[1:0]` 删除 `clk_o[0]` / `clk_o[1]`；必须逐 bit 删除。
+
+legacy cwd 写入：
 
 ```text
 00_harden_port_inventory/removed_log/01_soc_clocks.removed
@@ -561,12 +597,12 @@ clock_check_report.txt
 相关参数：
 
 ```bash
---connection-inventory 00_harden_port_inventory/connection_inventory.csv
---pending-root 00_harden_port_inventory
+--connection-inventory <override-path>
+--pending-root <override-path>
 --no-update-pending
 ```
 
-默认只有在 `<pending-root>/pending` 已存在时才更新 pending；若该目录不存在，01 仍按旧 flow 只生成 clock SDC/inventory/report。`--connection-inventory` 指向的文件若不存在，01 不报错，改用 owner 子 xlsx 的 `From Whom` 解析 input clock 来源。
+target 模式未使用 `--no-update-pending` 时，pending 缺失必须阻断。`--no-update-pending` 只用于诊断运行，必须写入 report，且不得宣称 accounting closure 完成。legacy cwd 可以通过显式 override 选择 legacy 00 root，但不能与 target pending 混用。
 
 ### 8.2 `clock_inventory.csv`
 
@@ -599,7 +635,7 @@ note
 
 - `source_type` 至少区分 `auto_harden_output` / `auto_top` / `virtual_spec` / `manual_overlay`。
 - `source_file` 记录原始 harden SDC、`virtual_clocks.csv` 或 `01_soc_clocks_manual.sdc`。
-- `final_sdc_digest` 记录生成该 inventory 时最终 `common/01_soc_clocks.sdc` 的 digest；02/03 用它检查 stale inventory。
+- `final_sdc_digest` 记录生成该 inventory 时最终 common/scenario assembled SDC digest；02/03 用它检查 stale inventory。
 - inventory 中 active clock name/target/source 集合必须与最终 01 SDC 一致。最终 SDC 中存在 inventory 未记录的 clock，或 inventory 存在最终 SDC 已删除的 clock，均为 error。
 
 ### 8.3 `clock_check_report.txt`
@@ -642,7 +678,7 @@ u_fab0 input fab_clk_i covered_by=01_soc_clocks reason=upstream_clock_sink clock
 u_periph input ref2_i covered_by=01_soc_clocks reason=top_clock clock=top_aux_clk_pad action=emit_top_clock from_whom=top.aux_clk_pad source=periph.sdc:2
 ```
 
-pending 消账必须是幂等的。若 01 试图删除的 port 已不在 pending 中，但 `00_harden_port_inventory/removed_log/*.removed` 中已有对应 `previous_removed` 记录，则不应报错；只有既不在 pending、也无 previous_removed 记录时才是流程错误。01 重写自己的 removed log 时应保留既有记录，只追加新的删除项。
+pending 消账必须幂等。target 模式只扫描当前 scenario 的 fixed early-stage removed log；legacy cwd 扫描 `00_harden_port_inventory/removed_log/*.removed`。port 已不在 pending 且有合法 previous owner 时不重复删除；既不在 pending、也无 previous owner 时为流程错误。
 
 ### 8.5 离线 Debug
 

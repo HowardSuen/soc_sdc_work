@@ -42,3 +42,18 @@ run/assembled/common_prects_ss_125.sdc
 - UART `set_input_transition` 和 `set_load` 使用 `stage=all/corner=all`，需要项目确认是否所有 view 共用。
 
 这些 warning 不阻断生成；最终 report 的 error 数为 0。
+
+## 01 -> 10 串联扩展
+
+`run_demo_01_to_10.py` 在同一个 target run root 上增加一组 bit-level feedthrough direct edge：
+
+```text
+u_harden_a/data_o[0] -> u_harden_b/fti_payload[3]
+u_harden_b/fto_payload[3] -> u_harden_a/data_i[0]
+```
+
+它依次运行 01、02、03、04、10，自动完成各 review gate，并检查 10 只生成 ingress/egress direct-edge max/min，不生成 harden 内部 `fti -> fto` 或 synthetic end-to-end path：
+
+```bash
+python3 run_demo_01_to_10.py
+```

@@ -14,6 +14,9 @@ Current scope:
 import argparse
 import csv
 import hashlib
+import json
+import math
+import os
 import re
 import sys
 from collections import defaultdict
@@ -147,6 +150,7 @@ TIMING_CONTRACT_STATUSES = {
     "no_port_timing",
     "clock_relative_only",
     "interconnect_budget",
+    "incomplete_missing_sdc",
     "unknown",
 }
 SOURCE_TYPES = {
@@ -177,7 +181,8 @@ MCP_REFERENCES = {"", "start", "end", "same_clock_default"}
 CROSS_CLOCK_MCP_REVIEW = {"", "approved", "not_applicable", "pending", "reviewed", "yes"}
 DATAPATH_VALUES = {"", "yes", "no"}
 TOOL_SURFACES = {"", "sta", "dc", "both"}
-CLOCK_CONTEXT_STATUSES = {"", "matched", "remapped_equivalent", "mismatch", "unknown", "not_applicable"}
+CLOCK_CONTEXT_STATUSES = {"", "matched", "remapped_equivalent", "mismatch", "unknown", "not_applicable", "incomplete_missing_sdc"}
+SDC_EVIDENCE_STATUSES = {"", "complete", "incomplete_missing_sdc", "not_required"}
 RISK_LEVELS = {"", "low", "medium", "high"}
 CDC_WINDOW_CATEGORIES = {"handshake", "cdc_sync", "status", "control", "data"}
 MODE_SPECIFIC_TOKENS = ("scan", "mbist", "bist", "test", "gpio", "jtag", "bypass", "lp_", "low_power")
@@ -202,6 +207,9 @@ PORT_RANGE_RE = re.compile(r"^(.+)\[(\d+)\s*:\s*(\d+)\]$")
 PORT_EXACT_BIT_RE = re.compile(r"^(.+)\[(\d+)\]$")
 
 EXCEPTION_CANDIDATE_HEADERS = [
+    "author",
+    "run_completeness",
+    "port_accounting",
     "candidate_id",
     "scenario",
     "stage",
@@ -227,13 +235,15 @@ EXCEPTION_CANDIDATE_HEADERS = [
     "has_dst_input_delay",
     "related_20_channel_id",
     "related_20_status",
-    "related_10_feedthrough_id",
+    "related_10_feedthrough_edge_id",
     "harden_clock_context_status",
+    "sdc_evidence_status",
     "source_sdc_file",
     "source_line",
     "source_command",
     "source_digest",
     "extraction_time",
+    "candidate_status",
     "candidate_reason",
     "recommended_action",
     "note",
@@ -251,7 +261,7 @@ EXCEPTION_RULE_HEADERS = [
     "path_category",
     "channel_id",
     "related_20_channel_id",
-    "related_10_feedthrough_id",
+    "related_10_feedthrough_edge_id",
     "src_bit_index",
     "src_endpoint",
     "dst_bit_index",
@@ -283,6 +293,7 @@ EXCEPTION_RULE_HEADERS = [
     "sta_waiver_ref",
     "protocol_ref",
     "basis",
+    "sdc_independent_basis",
     "risk_level",
     "expiry_or_review_date",
     "note",
@@ -330,6 +341,8 @@ class InstInfo:
     file_path: str = ""
     sdc_hint: str = ""
     sdc_path: Optional[Path] = None
+    sdc_status: str = "missing"
+    sdc_note: str = ""
     inputs: Dict[str, PortInfo] = field(default_factory=dict)
     outputs: Dict[str, PortInfo] = field(default_factory=dict)
     inouts: Dict[str, PortInfo] = field(default_factory=dict)
@@ -352,6 +365,7 @@ class PortKey:
 class ConnectionEdge:
     connection_id: str
     connection_type: str
+    scenario_scope: str
     src_instance: str
     src_direction: str
     src_port: str
@@ -376,19 +390,30 @@ class ConnectionIndex:
 
 
 @dataclass
-class FeedthroughRecord:
-    feedthrough_id: str
+class FeedthroughEdgeRecord:
+    feedthrough_edge_id: str
+    connection_id: str
     scenario: str
-    feedthrough_instance: str
-    hop_index: str
-    base: str
-    fti_port: str
-    fto_port: str
-    fti_endpoint: str
-    fto_endpoint: str
-    bit_index: str
-    chain_id: str
-    hop_order: str
+    run_completeness: str
+    stage: str
+    corner: str
+    src_instance: str
+    src_direction: str
+    src_port: str
+    src_bit_index: str
+    src_endpoint_key: str
+    src_soc_object: str
+    dst_instance: str
+    dst_direction: str
+    dst_port: str
+    dst_bit_index: str
+    dst_endpoint_key: str
+    dst_soc_object: str
+    channel_disposition: str
+    emit_max: str
+    emit_min: str
+    review_status: str
+    apply: str
     validation_status: str
 
 
@@ -412,7 +437,7 @@ class ChannelRecord:
     dst_port: str
     dst_bit_index: str
     dst_endpoint: str
-    related_10_feedthrough_id: str = ""
+    related_10_feedthrough_edge_id: str = ""
     through_collection: str = ""
     is_pad_related: str = "no"
     is_clock_related: str = "no"
@@ -464,6 +489,61 @@ class Active20Budget:
 
 
 @dataclass
+class TwentyChannelState:
+    channel_id: str
+    connection_id: str
+    src_endpoint: str
+    dst_endpoint: str
+    scenario: str
+    owner_stage: str
+    channel_disposition: str
+    apply: str
+    review_status: str
+    budget_type: str
+    source_row: int
+
+
+@dataclass
+class RunCompleteness:
+    status: str
+    available_instances: List[str] = field(default_factory=list)
+    missing_instances: List[str] = field(default_factory=list)
+    not_required_instances: List[str] = field(default_factory=list)
+    manifest_path: str = ""
+
+    @property
+    def available_count(self) -> int:
+        return len(self.available_instances)
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_instances)
+
+    @property
+    def not_required_count(self) -> int:
+        return len(self.not_required_instances)
+
+
+@dataclass
+class RelationContext:
+    relations: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    active_clocks: Set[str] = field(default_factory=set)
+    aliases: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    scenario: str = ""
+    run_completeness: str = "unknown"
+    clock_universe_digest: str = ""
+    assembled_view_digest: str = ""
+
+
+@dataclass
+class PendingPlan:
+    pending_updates: Dict[Path, str] = field(default_factory=dict)
+    removed_log_path: Optional[Path] = None
+    removed_log_text: str = ""
+    removed_count: int = 0
+
+
+@dataclass
 class CandidateSeed:
     values: Dict[str, str]
     related_evidence: List[ExceptionEvidence] = field(default_factory=list)
@@ -499,6 +579,64 @@ class Report:
         self.lines.append("ERROR: " + msg)
 
 
+def _author_part_a() -> str:
+    return chr(72) + chr(111)
+
+
+def _author_part_b() -> str:
+    return chr(119) + chr(97)
+
+
+def _author_part_c() -> str:
+    return chr(114) + chr(100)
+
+
+def author_name() -> str:
+    return _author_part_a() + _author_part_b() + _author_part_c()
+
+
+def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
+    path = Path(value).expanduser() if value else Path(default)
+    return path if path.is_absolute() else base / path
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
+    try:
+        tmp.write_text(text, encoding=encoding)
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def atomic_write_csv(path: Path, headers: Sequence[str], rows: Sequence[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
+    try:
+        with tmp.open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.DictWriter(file_obj, fieldnames=list(headers), extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({header: clean_cell(row.get(header)) for header in headers})
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def atomic_save_workbook(workbook: Workbook, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(".%s.tmp.%s%s" % (path.stem, os.getpid(), path.suffix))
+    try:
+        workbook.save(str(tmp))
+        os.replace(str(tmp), str(path))
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def clean_cell(value) -> str:
     if value is None:
         return ""
@@ -525,6 +663,113 @@ def canonical_clock_relation(value) -> str:
     if underscored in CLOCK_RELATION_CANONICAL:
         return underscored
     return ""
+
+
+def read_json_object(path: Path, report: Report, label: str) -> Dict[str, object]:
+    if not path.is_file():
+        report.error("%s not found: %s" % (label, path))
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        report.error("failed to read %s %s: %s" % (label, path, exc))
+        return {}
+    if not isinstance(value, dict):
+        report.error("%s %s must contain a JSON object" % (label, path))
+        return {}
+    return value
+
+
+def read_clock_relation_context(
+    clock_path: Path,
+    clock_meta_path: Path,
+    relation_path: Path,
+    relation_meta_path: Path,
+    scenario: str,
+    report: Report,
+) -> RelationContext:
+    context = RelationContext(scenario=scenario)
+    clock_meta = read_json_object(clock_meta_path, report, "assembled clock inventory meta")
+    relation_meta = read_json_object(relation_meta_path, report, "relation map meta")
+    clock_scenario = clean_cell(clock_meta.get("scenario"))
+    relation_scenario = clean_cell(relation_meta.get("scenario"))
+    if clock_scenario and clock_scenario != scenario:
+        report.error("%s: scenario=%s does not match requested %s" % (clock_meta_path, clock_scenario, scenario))
+    if relation_scenario and relation_scenario != scenario:
+        report.error("%s: scenario=%s does not match requested %s" % (relation_meta_path, relation_scenario, scenario))
+    clock_digest = clean_cell(clock_meta.get("clock_universe_digest"))
+    relation_clock_digest = clean_cell(relation_meta.get("clock_universe_digest"))
+    if clock_digest and relation_clock_digest and clock_digest != relation_clock_digest:
+        report.error("clock universe digest mismatch between %s and %s" % (clock_meta_path, relation_meta_path))
+    context.clock_universe_digest = clock_digest or relation_clock_digest
+    context.assembled_view_digest = clean_cell(relation_meta.get("assembled_view_digest"))
+    relation_completeness = normalize_key(relation_meta.get("run_completeness"))
+    clock_completeness = normalize_key(clock_meta.get("run_completeness"))
+    if relation_completeness and clock_completeness and relation_completeness != clock_completeness:
+        report.error("run_completeness mismatch between %s and %s" % (clock_meta_path, relation_meta_path))
+    context.run_completeness = relation_completeness or clock_completeness or "unknown"
+
+    if not clock_path.is_file():
+        report.error("assembled clock inventory not found: %s" % clock_path)
+    else:
+        with clock_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            fields = set(reader.fieldnames or [])
+            if "clock_name" not in fields:
+                report.error("%s: missing clock_name column" % clock_path)
+            for row_idx, row in enumerate(reader, start=2):
+                name = clean_cell(row.get("clock_name"))
+                if not name:
+                    continue
+                action = normalize_key(row.get("final_action"))
+                if "final_action" in fields and action not in {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}:
+                    continue
+                if name in context.active_clocks:
+                    report.error("%s row %d: duplicate active clock_name %s" % (clock_path.name, row_idx, name))
+                    continue
+                context.active_clocks.add(name)
+                inst_name = clean_cell(row.get("inst_name"))
+                for alias in {name, clean_cell(row.get("original_clock_name"))}:
+                    if alias:
+                        key = (inst_name, alias)
+                        previous = context.aliases.get(key)
+                        if previous and previous != name:
+                            report.error("%s row %d: clock alias %s/%s is ambiguous" % (clock_path.name, row_idx, inst_name, alias))
+                        context.aliases[key] = name
+
+    if not relation_path.is_file():
+        report.error("clock relation map not found: %s" % relation_path)
+    else:
+        with relation_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            fields = set(reader.fieldnames or [])
+            required = {"scenario", "clock_a", "clock_b", "relation_type", "clock_universe_digest", "assembled_view_digest"}
+            if not required.issubset(fields):
+                report.error("%s: relation map missing column(s): %s" % (relation_path, ",".join(sorted(required - fields))))
+            for row_idx, row in enumerate(reader, start=2):
+                row_scenario = clean_cell(row.get("scenario"))
+                if row_scenario != scenario:
+                    report.error("%s row %d: scenario=%s does not match requested %s" % (relation_path.name, row_idx, row_scenario or "<empty>", scenario))
+                    continue
+                row_clock_digest = clean_cell(row.get("clock_universe_digest"))
+                row_view_digest = clean_cell(row.get("assembled_view_digest"))
+                if context.clock_universe_digest and row_clock_digest != context.clock_universe_digest:
+                    report.error("%s row %d: clock_universe_digest mismatch" % (relation_path.name, row_idx))
+                if context.assembled_view_digest and row_view_digest != context.assembled_view_digest:
+                    report.error("%s row %d: assembled_view_digest mismatch" % (relation_path.name, row_idx))
+                clock_a = clean_cell(row.get("clock_a"))
+                clock_b = clean_cell(row.get("clock_b"))
+                relation = canonical_clock_relation(row.get("relation_type"))
+                if not clock_a or not clock_b or not relation:
+                    report.error("%s row %d: invalid clock pair/relation" % (relation_path.name, row_idx))
+                    continue
+                key = tuple(sorted((clock_a, clock_b)))
+                previous = context.relations.get(key)
+                if previous and previous != relation:
+                    report.error("%s row %d: conflicting relation for %s/%s" % (relation_path.name, row_idx, clock_a, clock_b))
+                context.relations[key] = relation
+    report.info("loaded %d active clocks and %d relation pairs for scenario %s" % (len(context.active_clocks), len(context.relations), scenario))
+    return context
 
 
 def normalize_col(name: str) -> str:
@@ -570,6 +815,14 @@ def digest_file(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def full_digest_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def safe_filename_token(value: str) -> str:
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
     token = "".join(char if char in allowed else "_" for char in clean_cell(value))
@@ -600,6 +853,13 @@ def parse_number(value) -> Optional[float]:
         return float(text)
     except ValueError:
         return None
+
+
+def parse_finite_number(value) -> Optional[float]:
+    number = parse_number(value)
+    if number is None or not math.isfinite(number):
+        return None
+    return number
 
 
 def join_unique(values: Iterable[str], sep: str = "; ") -> str:
@@ -734,6 +994,111 @@ def read_info_all(path: Path, report: Report) -> Dict[str, InstInfo]:
     return instances
 
 
+def read_harden_sdc_manifest(
+    path: Path,
+    run_root: Path,
+    scenario: str,
+    require_complete: bool,
+    instances: Dict[str, InstInfo],
+    report: Report,
+) -> RunCompleteness:
+    errors_before = report.error_count
+    if not path.is_file():
+        report.error("%s: HARDEN_SDC_MANIFEST_MISSING" % path)
+        return RunCompleteness(status="invalid", manifest_path=str(path))
+
+    required = {"scenario", "inst_name", "module_name", "availability_status"}
+    entries: Dict[str, Dict[str, str]] = {}
+    source_rows: Dict[str, int] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fields = set(reader.fieldnames or [])
+        missing_fields = sorted(required - fields)
+        if missing_fields:
+            report.error("%s: HARDEN_SDC_MANIFEST_SCHEMA_ERROR missing %s" % (path, ",".join(missing_fields)))
+        if "sdc_path" not in fields and "resolved_sdc_path" not in fields:
+            report.error("%s: HARDEN_SDC_MANIFEST_SCHEMA_ERROR missing sdc_path" % path)
+        for row_idx, row in enumerate(reader, start=2):
+            row_scenario = clean_cell(row.get("scenario"))
+            inst_name = clean_cell(row.get("inst_name"))
+            if not inst_name:
+                report.error("%s row %d: empty inst_name" % (path.name, row_idx))
+                continue
+            if row_scenario != scenario:
+                report.error(
+                    "%s row %d: scenario=%s does not match requested %s"
+                    % (path.name, row_idx, row_scenario or "<empty>", scenario)
+                )
+                continue
+            if inst_name in entries:
+                report.error("%s row %d: duplicate inst_name %s" % (path.name, row_idx, inst_name))
+                continue
+            entries[inst_name] = dict(row)
+            source_rows[inst_name] = row_idx
+
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    for inst_name in sorted(entries):
+        row = entries[inst_name]
+        row_idx = source_rows[inst_name]
+        status = normalize_key(row.get("availability_status"))
+        module_name = clean_cell(row.get("module_name")) or inst_name
+        sdc_value = clean_cell(row.get("sdc_path")) or clean_cell(row.get("resolved_sdc_path"))
+        inst = instances.get(inst_name)
+        if inst is None:
+            inst = InstInfo(module_name=module_name, inst_name=inst_name)
+            instances[inst_name] = inst
+            report.warn("manifest instance %s was absent from info_all; created minimal instance record" % inst_name)
+        elif not inst.module_name:
+            inst.module_name = module_name
+        inst.sdc_status = status
+        inst.sdc_note = clean_cell(row.get("note"))
+
+        if status == "available":
+            if not sdc_value:
+                report.error("%s row %d: available %s has empty sdc_path" % (path.name, row_idx, inst_name))
+                continue
+            resolved = resolve_path(run_root, sdc_value, sdc_value)
+            if not resolved.is_file():
+                report.error("%s row %d: available SDC missing for %s: %s" % (path.name, row_idx, inst_name, resolved))
+                continue
+            inst.sdc_path = resolved.resolve()
+            available.append(inst_name)
+        elif status == "missing":
+            inst.sdc_path = None
+            missing.append(inst_name)
+            report.warn("%s row %d: HARDEN_SDC_MISSING %s: %s" % (path.name, row_idx, inst_name, inst.sdc_note or "<no note>"))
+        elif status == "not_required":
+            if sdc_value:
+                report.error("%s row %d: not_required %s must have empty sdc_path" % (path.name, row_idx, inst_name))
+            inst.sdc_path = None
+            not_required.append(inst_name)
+        else:
+            report.error("%s row %d: invalid availability_status %s for %s" % (path.name, row_idx, status or "<empty>", inst_name))
+
+    for inst_name in sorted(set(instances) - set(entries)):
+        report.error("%s: instance %s missing from harden SDC manifest" % (path.name, inst_name))
+
+    status = "partial" if missing else "complete"
+    if report.error_count > errors_before:
+        status = "invalid"
+    if require_complete and missing:
+        report.error("HARDEN_SDC_COMPLETENESS_REQUIRED: " + ",".join(missing))
+    completeness = RunCompleteness(
+        status=status,
+        available_instances=available,
+        missing_instances=missing,
+        not_required_instances=not_required,
+        manifest_path=str(path.resolve()),
+    )
+    report.info(
+        "harden SDC completeness=%s available=%d missing=%d not_required=%d"
+        % (status, completeness.available_count, completeness.missing_count, completeness.not_required_count)
+    )
+    return completeness
+
+
 def parse_port_sheet(df: pd.DataFrame) -> Dict[str, Dict[str, PortInfo]]:
     input_col = get_col(df, ["Input"])
     input_width_col = get_col(df, ["Input Width"])
@@ -862,10 +1227,13 @@ def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report)
                 unique.append(path)
         if len(unique) == 1:
             inst.sdc_path = unique[0]
+            inst.sdc_status = "available"
         elif len(unique) > 1:
             inst.sdc_path = unique[0]
+            inst.sdc_status = "available"
             report.warn("multiple SDC candidates for %s: %s; using %s" % (inst.inst_name, ", ".join(path.name for path in unique), inst.sdc_path.name))
         else:
+            inst.sdc_status = "missing"
             report.warn("no SDC found for %s; tried: %s" % (inst.inst_name, ", ".join(candidates)))
 
 
@@ -880,7 +1248,12 @@ def collect_current_sdc_digests(instances: Dict[str, InstInfo]) -> Dict[str, str
     return digests
 
 
-def read_connection_inventory(path: Path, report: Report) -> ConnectionIndex:
+def scenario_scope_matches(value: str, scenario: str) -> bool:
+    scopes = [part for part in re.split(r"[\s,;|]+", normalize_key(value) or "common") if part]
+    return "common" in scopes or scenario in scopes
+
+
+def read_connection_inventory(path: Path, scenario: str, report: Report, require_scenario_scope: bool = False) -> ConnectionIndex:
     index = ConnectionIndex()
     if not path.is_file():
         report.error("connection inventory not found: %s" % path)
@@ -892,7 +1265,15 @@ def read_connection_inventory(path: Path, report: Report) -> ConnectionIndex:
         if not reader.fieldnames:
             report.error("%s: connection_inventory.csv has no header" % path)
             return index
+        if "scenario_scope" not in set(reader.fieldnames):
+            if require_scenario_scope:
+                report.error("%s: target connection inventory requires scenario_scope" % path)
+            else:
+                report.warn("%s: missing scenario_scope column; treating all rows as common" % path)
         for row_idx, row in enumerate(reader, start=2):
+            scenario_scope = clean_cell(row.get("scenario_scope")) or "common"
+            if not scenario_scope_matches(scenario_scope, scenario):
+                continue
             src_inst = clean_cell(row.get("src_instance"))
             src_dir = clean_cell(row.get("src_direction"))
             src_port = clean_cell(row.get("src_port"))
@@ -929,6 +1310,7 @@ def read_connection_inventory(path: Path, report: Report) -> ConnectionIndex:
             edge = ConnectionEdge(
                 connection_id=connection_id,
                 connection_type=clean_cell(row.get("connection_type")),
+                scenario_scope=scenario_scope,
                 src_instance=src_inst,
                 src_direction=src_dir,
                 src_port=src_port,
@@ -951,61 +1333,87 @@ def read_connection_inventory(path: Path, report: Report) -> ConnectionIndex:
     return index
 
 
-def read_feedthrough_inventory(path: Path, report: Report) -> List[FeedthroughRecord]:
+def read_feedthrough_edge_inventory(
+    path: Path,
+    scenario: str,
+    expected_completeness: str,
+    report: Report,
+    require_metadata: bool = False,
+) -> List[FeedthroughEdgeRecord]:
     if not path.is_file():
-        report.info("feedthrough inventory not found: %s; feedthrough exception candidates will require manual review" % path)
+        report.warn("10 feedthrough edge inventory not found: %s; feedthrough-related 30 rules cannot generate" % path)
         return []
-    records: List[FeedthroughRecord] = []
+    records: List[FeedthroughEdgeRecord] = []
     seen: Set[str] = set()
     with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
         reader = csv.DictReader(file_obj)
-        if not reader.fieldnames:
-            report.warn("%s: feedthrough_inventory.csv has no header" % path)
+        fields = set(reader.fieldnames or [])
+        required = {
+            "feedthrough_edge_id", "connection_id", "scenario",
+            "src_instance", "src_port", "dst_instance", "dst_port",
+            "channel_disposition",
+        }
+        if require_metadata:
+            required.add("run_completeness")
+        if not required.issubset(fields):
+            report.error("%s: feedthrough edge inventory missing column(s): %s" % (path, ",".join(sorted(required - fields))))
             return records
         for row_idx, row in enumerate(reader, start=2):
-            ft_id = clean_cell(row.get("feedthrough_id"))
-            inst = clean_cell(row.get("feedthrough_instance"))
-            fti = clean_cell(row.get("fti_port"))
-            fto = clean_cell(row.get("fto_port"))
-            if not (ft_id and inst and fti and fto):
-                report.warn("%s row %d: skipped incomplete feedthrough record" % (path.name, row_idx))
+            row_scenario = normalize_key(row.get("scenario")) or "common"
+            if row_scenario != scenario:
+                report.error("%s row %d: scenario=%s does not match requested %s" % (path.name, row_idx, row_scenario, scenario))
+                continue
+            row_completeness = normalize_key(row.get("run_completeness")) or expected_completeness
+            if require_metadata and row_completeness != expected_completeness:
+                report.error("%s row %d: run_completeness=%s does not match current manifest %s" % (path.name, row_idx, row_completeness or "<empty>", expected_completeness))
+                continue
+            ft_id = clean_cell(row.get("feedthrough_edge_id"))
+            connection_id = clean_cell(row.get("connection_id"))
+            src_port = clean_cell(row.get("src_port"))
+            dst_port = clean_cell(row.get("dst_port"))
+            if not (ft_id and connection_id and src_port and dst_port):
+                report.error("%s row %d: incomplete feedthrough edge record" % (path.name, row_idx))
                 continue
             if ft_id in seen:
-                report.error("%s row %d: duplicate feedthrough_id %s" % (path.name, row_idx, ft_id))
+                report.error("%s row %d: duplicate feedthrough_edge_id %s" % (path.name, row_idx, ft_id))
             seen.add(ft_id)
-            for role, port in (("fti", fti), ("fto", fto)):
+            for role, port in (("src", src_port), ("dst", dst_port)):
                 if port and not is_canonical_port_key(port):
-                    report.error(
-                        "%s row %d: %s_port %s is not a bit-level canonical key; 10 must emit bit feedthrough ids for 30"
-                        % (path.name, row_idx, role, port)
-                    )
+                    report.error("%s row %d: %s_port %s is not a bit-level canonical key" % (path.name, row_idx, role, port))
             records.append(
-                FeedthroughRecord(
-                    feedthrough_id=ft_id,
-                    scenario=normalize_key(row.get("scenario")) or "common",
-                    feedthrough_instance=inst,
-                    hop_index=clean_cell(row.get("hop_index")),
-                    base=clean_cell(row.get("base")),
-                    fti_port=fti,
-                    fto_port=fto,
-                    fti_endpoint=clean_cell(row.get("fti_endpoint")),
-                    fto_endpoint=clean_cell(row.get("fto_endpoint")),
-                    bit_index=clean_cell(row.get("bit_index")),
-                    chain_id=clean_cell(row.get("chain_id")) or clean_cell(row.get("base")),
-                    hop_order=clean_cell(row.get("hop_order")),
+                FeedthroughEdgeRecord(
+                    feedthrough_edge_id=ft_id,
+                    connection_id=connection_id,
+                    scenario=row_scenario,
+                    run_completeness=row_completeness,
+                    stage=normalize_key(row.get("stage")) or "all",
+                    corner=clean_cell(row.get("corner")) or "all",
+                    src_instance=clean_cell(row.get("src_instance")),
+                    src_direction=clean_cell(row.get("src_direction")),
+                    src_port=src_port,
+                    src_bit_index=inferred_bit_index(src_port, clean_cell(row.get("src_bit_index"))),
+                    src_endpoint_key=clean_cell(row.get("src_endpoint_key")),
+                    src_soc_object=clean_cell(row.get("src_soc_object")),
+                    dst_instance=clean_cell(row.get("dst_instance")),
+                    dst_direction=clean_cell(row.get("dst_direction")),
+                    dst_port=dst_port,
+                    dst_bit_index=inferred_bit_index(dst_port, clean_cell(row.get("dst_bit_index"))),
+                    dst_endpoint_key=clean_cell(row.get("dst_endpoint_key")),
+                    dst_soc_object=clean_cell(row.get("dst_soc_object")),
+                    channel_disposition=normalize_key(row.get("channel_disposition")),
+                    emit_max=normalize_key(row.get("emit_max")),
+                    emit_min=normalize_key(row.get("emit_min")),
+                    review_status=normalize_key(row.get("review_status")),
+                    apply=normalize_key(row.get("apply")),
                     validation_status=clean_cell(row.get("validation_status")),
                 )
             )
-    report.info("loaded %d feedthrough segment(s) from %s" % (len(records), path))
+    report.info("loaded %d bit-level feedthrough direct edge(s) from %s" % (len(records), path))
     return records
 
 
 def edge_status_ok(edge: ConnectionEdge) -> bool:
     return normalize_key(edge.validation_status) in MATCHED_STATUSES
-
-
-def feedthrough_status_ok(record: FeedthroughRecord) -> bool:
-    return normalize_key(record.validation_status) in MATCHED_STATUSES
 
 
 def instance_module(instances: Dict[str, InstInfo], inst_name: str) -> str:
@@ -1045,13 +1453,13 @@ def edge_to_channel(
     edge: ConnectionEdge,
     instances: Dict[str, InstInfo],
     force_type: str = "",
-    related_10_ids: str = "",
+    related_10_edge_id: str = "",
     through_collection: str = "",
     note: str = "",
 ) -> ChannelRecord:
     channel_type = force_type or classify_edge_type(edge, instances)
     is_pad_related = "yes" if channel_type in {"top_pad_to_harden", "harden_to_top_pad", "pad_to_pad"} else "no"
-    is_feedthrough_path = "yes" if related_10_ids else "no"
+    is_feedthrough_path = "yes" if related_10_edge_id or is_feedthrough_port(edge.src_port) or is_feedthrough_port(edge.dst_port) else "no"
     messages = []
     if note:
         messages.append(note)
@@ -1076,7 +1484,7 @@ def edge_to_channel(
         dst_port=edge.dst_port,
         dst_bit_index=edge.dst_bit_index,
         dst_endpoint=endpoint_from_soc_object(edge.dst_instance, edge.dst_port, edge.dst_soc_object, edge.dst_endpoint_key),
-        related_10_feedthrough_id=related_10_ids,
+        related_10_feedthrough_edge_id=related_10_edge_id,
         through_collection=through_collection,
         is_pad_related=is_pad_related,
         is_clock_related="yes" if channel_type == "clock_connection" else "no",
@@ -1085,79 +1493,10 @@ def edge_to_channel(
     )
 
 
-def endpoint_for_ft(record: FeedthroughRecord, port: str) -> str:
-    if port == record.fti_port and record.fti_endpoint:
-        return record.fti_endpoint
-    if port == record.fto_port and record.fto_endpoint:
-        return record.fto_endpoint
-    return get_collection("get_pins", [record.feedthrough_instance + "/" + port])
-
-
-def through_collection_for_chain(records: Sequence[FeedthroughRecord]) -> str:
-    parts: List[str] = []
-    for record in sorted(records, key=feedthrough_sort_key):
-        parts.append(endpoint_for_ft(record, record.fti_port))
-        parts.append(endpoint_for_ft(record, record.fto_port))
-    unique: List[str] = []
-    for item in parts:
-        if item and item not in unique:
-            unique.append(item)
-    return " ; ".join(unique)
-
-
-def feedthrough_sort_key(record: FeedthroughRecord) -> Tuple[int, str]:
-    token = record.hop_order or record.hop_index or "0"
-    return (int(token) if token.isdigit() else 0, record.feedthrough_id)
-
-
-def synthetic_edge_from_feedthrough_chain(
-    records: Sequence[FeedthroughRecord],
-    connections: ConnectionIndex,
-    report: Report,
-) -> Optional[Tuple[ConnectionEdge, str, str]]:
-    ordered = sorted(records, key=feedthrough_sort_key)
-    first = ordered[0]
-    last = ordered[-1]
-    incoming = connections.by_dst.get((first.feedthrough_instance, first.fti_port), [])
-    outgoing = connections.by_src.get((last.feedthrough_instance, last.fto_port), [])
-    label = "%s/%s" % (first.chain_id or first.base, first.bit_index or "scalar")
-    if len(incoming) != 1 or len(outgoing) != 1:
-        report.warn(
-            "%s: cannot stitch 30 feedthrough path; incoming_edges=%d outgoing_edges=%d"
-            % (label, len(incoming), len(outgoing))
-        )
-        return None
-    if not all(feedthrough_status_ok(record) for record in ordered):
-        report.warn("%s: feedthrough chain has non-matched segment; 30 stitched candidate skipped" % label)
-        return None
-    ft_ids = [record.feedthrough_id for record in ordered]
-    src = incoming[0]
-    dst = outgoing[0]
-    edge = ConnectionEdge(
-        connection_id=";".join([src.connection_id] + ft_ids + [dst.connection_id]),
-        connection_type="harden_to_harden",
-        src_instance=src.src_instance,
-        src_direction=src.src_direction,
-        src_port=src.src_port,
-        src_bit_index=src.src_bit_index,
-        src_endpoint_key=src.src_endpoint_key,
-        src_soc_object=src.src_soc_object,
-        dst_instance=dst.dst_instance,
-        dst_direction=dst.dst_direction,
-        dst_port=dst.dst_port,
-        dst_bit_index=dst.dst_bit_index,
-        dst_endpoint_key=dst.dst_endpoint_key,
-        dst_soc_object=dst.dst_soc_object,
-        validation_status="matched",
-        note="via feedthrough " + ",".join(ft_ids),
-    )
-    return edge, ",".join(ft_ids), through_collection_for_chain(ordered)
-
-
 def build_channels_from_inventories(
     instances: Dict[str, InstInfo],
     connections: ConnectionIndex,
-    feedthroughs: Sequence[FeedthroughRecord],
+    feedthroughs: Sequence[FeedthroughEdgeRecord],
     report: Report,
 ) -> List[ChannelRecord]:
     channels: List[ChannelRecord] = []
@@ -1170,21 +1509,43 @@ def build_channels_from_inventories(
         seen.add(record.channel_id)
         channels.append(record)
 
+    feedthrough_by_connection: Dict[str, FeedthroughEdgeRecord] = {}
+    for record in feedthroughs:
+        if record.connection_id in feedthrough_by_connection:
+            report.error("10 inventory has duplicate connection_id %s" % record.connection_id)
+            continue
+        feedthrough_by_connection[record.connection_id] = record
+
     for edge in connections.edges:
-        channel = edge_to_channel(edge, instances)
+        record = feedthrough_by_connection.get(edge.connection_id)
+        related_id = ""
+        note = edge.note
+        force_type = ""
+        if record:
+            expected = (edge.src_instance, edge.src_port, edge.dst_instance, edge.dst_port)
+            actual = (record.src_instance, record.src_port, record.dst_instance, record.dst_port)
+            if actual != expected:
+                report.error(
+                    "10 edge %s endpoint mismatch for connection_id %s: 00=%s/%s -> %s/%s, 10=%s/%s -> %s/%s"
+                    % ((record.feedthrough_edge_id, edge.connection_id) + expected + actual)
+                )
+            else:
+                related_id = record.feedthrough_edge_id
+                note = join_unique([note, "10 disposition=" + (record.channel_disposition or "<blank>")])
+            force_type = "harden_to_harden"
+        elif is_feedthrough_port(edge.src_port) or is_feedthrough_port(edge.dst_port):
+            force_type = "harden_to_harden"
+            note = join_unique([note, "feedthrough direct edge missing 10 routing result"])
+        channel = edge_to_channel(edge, instances, force_type=force_type, related_10_edge_id=related_id, note=note)
         add(channel)
 
-    groups: Dict[Tuple[str, str], List[FeedthroughRecord]] = defaultdict(list)
+    connection_ids = {edge.connection_id for edge in connections.edges}
     for record in feedthroughs:
-        groups[(record.chain_id or record.base, record.bit_index)].append(record)
-    for _, records in sorted(groups.items()):
-        stitched = synthetic_edge_from_feedthrough_chain(records, connections, report)
-        if not stitched:
-            continue
-        edge, ft_ids, through = stitched
-        add(edge_to_channel(edge, instances, force_type="harden_to_harden", related_10_ids=ft_ids, through_collection=through, note=edge.note))
+        if record.connection_id not in connection_ids:
+            report.error("10 edge %s references unknown 00 connection_id %s" % (record.feedthrough_edge_id, record.connection_id))
 
-    report.info("built %d 30 candidate channel(s) from 00/10 inventories" % len(channels))
+    channels.sort(key=lambda item: (item.connection_id, item.channel_id))
+    report.info("built %d direct-edge 30 candidate channel(s) from 00/10 inventories" % len(channels))
     return channels
 
 
@@ -1679,7 +2040,20 @@ def evidence_endpoint_collection(evidence: Optional[ExceptionEvidence], channel:
     return endpoint
 
 
-def timing_contract_for_channel(channel: ChannelRecord, delays: Sequence[DelayEvidence]) -> Tuple[str, str, str, str, str]:
+def resolve_local_clock(inst_name: str, clock_name: str, context: RelationContext) -> str:
+    name = clean_cell(clock_name)
+    if not name:
+        return ""
+    if name in context.active_clocks:
+        return name
+    return context.aliases.get((inst_name, name), "")
+
+
+def timing_contract_for_channel(
+    channel: ChannelRecord,
+    delays: Sequence[DelayEvidence],
+    relation_context: RelationContext,
+) -> Tuple[str, str, str, str, str]:
     src_delays = []
     dst_delays = []
     src_clocks = []
@@ -1689,12 +2063,12 @@ def timing_contract_for_channel(channel: ChannelRecord, delays: Sequence[DelayEv
             if delay.port_name in {channel.src_port, port_base(channel.src_port)}:
                 src_delays.append(delay)
                 if delay.clock_name:
-                    src_clocks.append(delay.clock_name)
+                    src_clocks.append(resolve_local_clock(delay.inst_name, delay.clock_name, relation_context) or delay.clock_name)
         if delay.inst_name == channel.dst_instance and delay.constraint_type == "input_delay":
             if delay.port_name in {channel.dst_port, port_base(channel.dst_port)}:
                 dst_delays.append(delay)
                 if delay.clock_name:
-                    dst_clocks.append(delay.clock_name)
+                    dst_clocks.append(resolve_local_clock(delay.inst_name, delay.clock_name, relation_context) or delay.clock_name)
     has_src = "yes" if src_delays else "no"
     has_dst = "yes" if dst_delays else "no"
     if src_delays and dst_delays:
@@ -1706,6 +2080,38 @@ def timing_contract_for_channel(channel: ChannelRecord, delays: Sequence[DelayEv
     else:
         status = "no_port_timing"
     return status, has_src, has_dst, join_unique(src_clocks), join_unique(dst_clocks)
+
+
+def sdc_evidence_status_for_channel(channel: ChannelRecord, instances: Dict[str, InstInfo]) -> str:
+    statuses = []
+    for inst_name in (channel.src_instance, channel.dst_instance):
+        if normalize_key(inst_name) in {"top", "fabric", "unknown", "constant", "const"}:
+            statuses.append("not_required")
+        else:
+            inst = instances.get(inst_name)
+            statuses.append(inst.sdc_status if inst else "missing")
+    if "missing" in statuses:
+        return "incomplete_missing_sdc"
+    if all(status == "not_required" for status in statuses):
+        return "not_required"
+    return "complete"
+
+
+def resolved_clock_relation(src_clock: str, dst_clock: str, context: RelationContext, report: Report, channel_id: str) -> str:
+    src_names = [item.strip() for item in clean_cell(src_clock).split(";") if item.strip()]
+    dst_names = [item.strip() for item in clean_cell(dst_clock).split(";") if item.strip()]
+    if len(src_names) != 1 or len(dst_names) != 1:
+        return "unknown"
+    if src_names[0] == dst_names[0]:
+        return "synchronous"
+    key = tuple(sorted((src_names[0], dst_names[0])))
+    relation = context.relations.get(key)
+    if relation:
+        return relation
+    if context.run_completeness == "partial":
+        return "unknown"
+    report.error("relation map missing clock pair %s/%s for channel %s" % (src_names[0], dst_names[0], channel_id))
+    return "unknown"
 
 
 def row_header_map(ws) -> Dict[str, int]:
@@ -1779,11 +2185,96 @@ def read_20_active_budgets(path: Path, scenario: str, stage: str, corner: str, r
     return active
 
 
+def read_20_channel_inventory_csv(
+    path: Path,
+    connection_inventory_digest: str,
+    expected_completeness: str,
+    scenario: str,
+    stage: str,
+    corner: str,
+    report: Report,
+) -> Tuple[Dict[str, Active20Budget], Dict[str, TwentyChannelState]]:
+    active: Dict[str, Active20Budget] = {}
+    states: Dict[str, TwentyChannelState] = {}
+    if not path.is_file():
+        report.warn("20 channel inventory not found: %s; run is candidate-only" % path)
+        return active, states
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        fields = set(reader.fieldnames or [])
+        required = {
+            "schema_version", "scenario", "stage", "corner", "connection_inventory_digest", "connection_id", "channel_id",
+            "src_endpoint", "dst_endpoint", "owner_stage", "channel_disposition", "apply", "review_status",
+            "emit_max", "emit_min", "converted_max", "converted_min", "budget_type", "mode", "run_completeness",
+        }
+        if not required.issubset(fields):
+            report.error("%s: 20 channel inventory missing column(s): %s" % (path, ",".join(sorted(required - fields))))
+            return active, states
+        for row_idx, row in enumerate(reader, start=2):
+            row_scenario = normalize_key(row.get("scenario"))
+            if row_scenario != scenario:
+                report.error("%s row %d: scenario=%s does not match requested %s" % (path.name, row_idx, row_scenario or "<empty>", scenario))
+                continue
+            row_digest = clean_cell(row.get("connection_inventory_digest"))
+            if row_digest != connection_inventory_digest:
+                report.error("%s row %d: connection_inventory_digest does not match current 00 inventory" % (path.name, row_idx))
+                continue
+            row_completeness = normalize_key(row.get("run_completeness"))
+            if row_completeness != expected_completeness:
+                report.error("%s row %d: run_completeness=%s does not match current manifest %s" % (path.name, row_idx, row_completeness or "<empty>", expected_completeness))
+                continue
+            channel_id = clean_cell(row.get("channel_id"))
+            connection_id = clean_cell(row.get("connection_id"))
+            if not channel_id or not connection_id:
+                report.error("%s row %d: channel_id/connection_id is required" % (path.name, row_idx))
+                continue
+            if channel_id in states:
+                report.error("%s row %d: duplicate channel_id %s" % (path.name, row_idx, channel_id))
+                continue
+            state = TwentyChannelState(
+                channel_id=channel_id,
+                connection_id=connection_id,
+                src_endpoint=clean_cell(row.get("src_endpoint")),
+                dst_endpoint=clean_cell(row.get("dst_endpoint")),
+                scenario=row_scenario,
+                owner_stage=normalize_key(row.get("owner_stage")),
+                channel_disposition=normalize_key(row.get("channel_disposition")),
+                apply=normalize_key(row.get("apply")),
+                review_status=normalize_key(row.get("review_status")),
+                budget_type=normalize_key(row.get("budget_type")),
+                source_row=row_idx,
+            )
+            states[channel_id] = state
+            if not values_selected_for_assembled(row, scenario, stage, corner):
+                continue
+            if state.owner_stage != "20":
+                continue
+            if state.channel_disposition != "emit_budget":
+                continue
+            if state.apply != "yes" or state.review_status != "approved":
+                continue
+            max_active = normalize_key(row.get("emit_max")) == "yes" and bool(clean_cell(row.get("converted_max")))
+            min_active = normalize_key(row.get("emit_min")) == "yes" and bool(clean_cell(row.get("converted_min")))
+            if not (max_active or min_active):
+                continue
+            item = active.setdefault(channel_id, Active20Budget(channel_id))
+            item.max_active = item.max_active or max_active
+            item.min_active = item.min_active or min_active
+            item.rows.append(str(row_idx))
+    report.info("loaded %d 20 channel state(s), including %d active budget channel(s), from %s" % (len(states), len(active), path))
+    return active, states
+
+
 def create_candidate_and_rule_seeds(
     channels: Sequence[ChannelRecord],
     delays: Sequence[DelayEvidence],
     exceptions: Sequence[ExceptionEvidence],
     active20: Dict[str, Active20Budget],
+    twenty_states: Dict[str, TwentyChannelState],
+    instances: Dict[str, InstInfo],
+    relation_context: RelationContext,
+    completeness: RunCompleteness,
+    port_accounting: str,
     report: Report,
 ) -> Tuple[List[CandidateSeed], List[RuleSeed], List[ExceptionEvidence]]:
     seeds: List[CandidateSeed] = []
@@ -1806,9 +2297,24 @@ def create_candidate_and_rule_seeds(
     for ch in channels:
         if ch.channel_type != "harden_to_harden":
             continue
-        timing_status, has_src, has_dst, src_clock, dst_clock = timing_contract_for_channel(ch, delays)
+        timing_status, has_src, has_dst, src_clock, dst_clock = timing_contract_for_channel(ch, delays, relation_context)
+        sdc_evidence_status = sdc_evidence_status_for_channel(ch, instances)
+        if sdc_evidence_status == "incomplete_missing_sdc":
+            timing_status = "incomplete_missing_sdc"
+            has_src = "unknown" if instances.get(ch.src_instance) and instances[ch.src_instance].sdc_status == "missing" else has_src
+            has_dst = "unknown" if instances.get(ch.dst_instance) and instances[ch.dst_instance].sdc_status == "missing" else has_dst
+        clock_relation = resolved_clock_relation(src_clock, dst_clock, relation_context, report, ch.channel_id)
         active = active20.get(ch.channel_id)
+        twenty_state = twenty_states.get(ch.channel_id)
+        related_20_channel_id = "" if ch.is_feedthrough_path == "yes" else ch.channel_id
         related_20_status = ""
+        if twenty_state:
+            related_20_status = "disposition=%s; apply=%s; review_status=%s; row=%d" % (
+                twenty_state.channel_disposition or "<blank>",
+                twenty_state.apply or "<blank>",
+                twenty_state.review_status or "<blank>",
+                twenty_state.source_row,
+            )
         if active:
             related_20_status = "active_max=%s; active_min=%s; rows=%s" % (
                 "yes" if active.max_active else "no",
@@ -1817,12 +2323,21 @@ def create_candidate_and_rule_seeds(
             )
         base_source_type = "missing_timing_candidate" if timing_status == "no_port_timing" and not active else "manual_entry"
         base_reason = "no ordinary port timing found" if base_source_type == "missing_timing_candidate" else "harden-to-harden channel for review"
+        if twenty_state and twenty_state.channel_disposition == "route_to_30":
+            base_source_type = "from_20_exception_path"
+            base_reason = "20 channel inventory routes this direct edge to 30"
+        if sdc_evidence_status == "incomplete_missing_sdc":
+            base_source_type = "manual_entry"
+            base_reason = "missing harden SDC; timing/exception evidence is incomplete"
         if active:
             base_reason = "ordinary 20 budget is active; 30 only allowed for non-overlapping exception"
         values = {header: "" for header in EXCEPTION_CANDIDATE_HEADERS}
         values.update(
             {
                 "candidate_id": "CAND_" + ch.channel_id,
+                "author": author_name(),
+                "run_completeness": completeness.status,
+                "port_accounting": port_accounting,
                 "scenario": ch.scenario,
                 "stage": ch.stage,
                 "corner": ch.corner,
@@ -1842,13 +2357,15 @@ def create_candidate_and_rule_seeds(
                 "dst_endpoint": ch.dst_endpoint,
                 "src_clock": src_clock,
                 "dst_clock": dst_clock,
-                "clock_relation": "unknown",
+                "clock_relation": clock_relation,
                 "has_src_output_delay": has_src,
                 "has_dst_input_delay": has_dst,
-                "related_20_channel_id": ch.channel_id,
+                "related_20_channel_id": related_20_channel_id,
                 "related_20_status": related_20_status,
-                "related_10_feedthrough_id": ch.related_10_feedthrough_id,
-                "harden_clock_context_status": "not_applicable",
+                "related_10_feedthrough_edge_id": ch.related_10_feedthrough_edge_id,
+                "harden_clock_context_status": "incomplete_missing_sdc" if sdc_evidence_status == "incomplete_missing_sdc" else "not_applicable",
+                "sdc_evidence_status": sdc_evidence_status,
+                "candidate_status": "active",
                 "candidate_reason": base_reason,
                 "recommended_action": "review_exception_basis" if base_source_type == "missing_timing_candidate" else "review_if_30_needed",
                 "note": ch.note,
@@ -1858,6 +2375,11 @@ def create_candidate_and_rule_seeds(
         rule_seeds.append(seed_rule_from_candidate(values, ch, None))
 
         for idx, evidence in enumerate(evidence_by_channel.get(ch.channel_id, []), start=1):
+            if timing_status in {"both_sides_timed", "src_timed_only", "dst_timed_only"}:
+                report.warn(
+                    "channel %s has both harden exception evidence and ordinary input/output delay evidence"
+                    % ch.channel_id
+                )
             e_values = dict(values)
             e_values.update(
                 {
@@ -1878,6 +2400,9 @@ def create_candidate_and_rule_seeds(
             seeds.append(CandidateSeed(e_values, [evidence]))
             rule_seeds.append(seed_rule_from_candidate(e_values, ch, evidence))
 
+    seeds.sort(key=lambda item: clean_cell(item.values.get("candidate_id")))
+    rule_seeds.sort(key=lambda item: clean_cell(item.values.get("exception_id")))
+    evidence_log.sort(key=lambda item: (item.source_sdc_file, int(item.source_line) if item.source_line.isdigit() else 0, item.source_command))
     return seeds, rule_seeds, evidence_log
 
 
@@ -1896,8 +2421,8 @@ def seed_rule_from_candidate(values: Dict[str, str], channel: ChannelRecord, evi
             "exception_type": exception_type,
             "path_category": clean_cell(values.get("path_category")) or "unknown",
             "channel_id": channel.channel_id,
-            "related_20_channel_id": channel.channel_id,
-            "related_10_feedthrough_id": channel.related_10_feedthrough_id,
+            "related_20_channel_id": clean_cell(values.get("related_20_channel_id")),
+            "related_10_feedthrough_edge_id": channel.related_10_feedthrough_edge_id,
             "src_bit_index": channel.src_bit_index,
             "src_endpoint": channel.src_endpoint,
             "dst_bit_index": channel.dst_bit_index,
@@ -1909,7 +2434,8 @@ def seed_rule_from_candidate(values: Dict[str, str], channel: ChannelRecord, evi
             "dst_clock": clean_cell(values.get("dst_clock")),
             "clock_relation": clean_cell(values.get("clock_relation")) or "unknown",
             "timing_contract_status": clean_cell(values.get("timing_contract_status")),
-            "harden_clock_context_status": "unknown" if evidence else "not_applicable",
+            "harden_clock_context_status": "unknown" if evidence else clean_cell(values.get("harden_clock_context_status")) or "not_applicable",
+            "sdc_evidence_status": clean_cell(values.get("sdc_evidence_status")),
             "check_type": evidence.check_type if evidence else "both",
             "max_value": evidence.max_value if evidence else "",
             "min_value": evidence.min_value if evidence else "",
@@ -1999,24 +2525,67 @@ def append_dict(ws, headers: Sequence[str], values: Dict[str, object], fill: Opt
             cell.fill = fill
 
 
-def sync_workbook(path: Path, candidates: Sequence[CandidateSeed], rules: Sequence[RuleSeed], log_items: Sequence[ExceptionEvidence], report: Report) -> None:
+def sync_workbook(
+    path: Path,
+    candidates: Sequence[CandidateSeed],
+    rules: Sequence[RuleSeed],
+    log_items: Sequence[ExceptionEvidence],
+    metadata: Dict[str, object],
+    report: Report,
+) -> None:
     wb, created = create_or_load_workbook(path)
+    ensure_sheet(wb, "run_metadata", ["key", "value"])
     ensure_sheet(wb, "exception_candidate", EXCEPTION_CANDIDATE_HEADERS)
     ensure_sheet(wb, "exception_rule", EXCEPTION_RULE_HEADERS)
     ensure_sheet(wb, "extraction_log", EXTRACTION_LOG_HEADERS)
 
+    ws_meta = wb["run_metadata"]
+    if ws_meta.max_row > 1:
+        ws_meta.delete_rows(2, ws_meta.max_row - 1)
+    for key, value in metadata.items():
+        append_dict(ws_meta, ["key", "value"], {"key": key, "value": clean_cell(value)})
+
     ws_cand = wb["exception_candidate"]
     existing_candidates = {
-        clean_cell(row_values(ws_cand, row_idx, EXCEPTION_CANDIDATE_HEADERS).get("candidate_id"))
+        clean_cell(row_values(ws_cand, row_idx, EXCEPTION_CANDIDATE_HEADERS).get("candidate_id")): row_idx
         for row_idx in range(2, ws_cand.max_row + 1)
         if clean_cell(ws_cand.cell(row=row_idx, column=1).value)
     }
+    candidate_hmap = header_map(ws_cand)
+    active_candidate_ids: Set[str] = set()
+    active_scenarios = {normalize_key(seed.values.get("scenario")) or "common" for seed in candidates}
+    refresh_headers = [header for header in EXCEPTION_CANDIDATE_HEADERS if header != "extraction_time"]
     for seed in candidates:
         candidate_id = clean_cell(seed.values.get("candidate_id"))
+        active_candidate_ids.add(candidate_id)
         if candidate_id not in existing_candidates:
             append_dict(ws_cand, EXCEPTION_CANDIDATE_HEADERS, seed.values, NEW_FILL)
-            existing_candidates.add(candidate_id)
+            existing_candidates[candidate_id] = ws_cand.max_row
             report.sync_changed = True
+        else:
+            row_idx = existing_candidates[candidate_id]
+            for header in refresh_headers:
+                old = clean_cell(ws_cand.cell(row=row_idx, column=candidate_hmap[header]).value)
+                new = clean_cell(seed.values.get(header))
+                if old != new:
+                    ws_cand.cell(row=row_idx, column=candidate_hmap[header], value=new)
+                    if header not in {"author", "port_accounting"}:
+                        report.sync_changed = True
+            ws_cand.cell(row=row_idx, column=candidate_hmap["candidate_status"], value="active")
+
+    for candidate_id, row_idx in existing_candidates.items():
+        values = row_values(ws_cand, row_idx, EXCEPTION_CANDIDATE_HEADERS)
+        if (normalize_key(values.get("scenario")) or "common") not in active_scenarios:
+            continue
+        if candidate_id in active_candidate_ids:
+            continue
+        if normalize_key(values.get("candidate_status")) != "stale":
+            ws_cand.cell(row=row_idx, column=candidate_hmap["candidate_status"], value="stale")
+            ws_cand.cell(row=row_idx, column=candidate_hmap["recommended_action"], value="review_or_remove_stale_candidate")
+            for cell in ws_cand[row_idx]:
+                cell.fill = ERROR_FILL
+            report.sync_changed = True
+        report.warn("stale 30 candidate no longer present in current evidence: %s" % candidate_id)
 
     ws_rule = wb["exception_rule"]
     existing_rules = {
@@ -2057,7 +2626,7 @@ def sync_workbook(path: Path, candidates: Sequence[CandidateSeed], rules: Sequen
     add_validations(wb)
     for ws in wb.worksheets:
         style_sheet(ws)
-    wb.save(path)
+    atomic_save_workbook(wb, path)
     if created or report.sync_changed:
         report.sync_changed = True
         report.info("synchronized workbook %s; review new rows before generation" % path.name)
@@ -2086,6 +2655,7 @@ def add_validations(wb: Workbook) -> None:
     add_list("clock_relation", sorted(CLOCK_RELATION_CANONICAL))
     add_list("timing_contract_status", sorted(TIMING_CONTRACT_STATUSES - {""}))
     add_list("harden_clock_context_status", sorted(CLOCK_CONTEXT_STATUSES - {""}))
+    add_list("sdc_evidence_status", sorted(SDC_EVIDENCE_STATUSES - {""}))
     add_list("check_type", sorted(CHECK_TYPES - {""}))
     add_list("mcp_reference", sorted(MCP_REFERENCES - {""}))
     add_list("cross_clock_mcp_review", sorted(CROSS_CLOCK_MCP_REVIEW - {""}))
@@ -2107,6 +2677,18 @@ def read_rule_rows(path: Path) -> List[FormRow]:
             continue
         rows.append(FormRow(row_idx=row_idx, values=values))
     return rows
+
+
+def read_candidate_rows(path: Path) -> List[Dict[str, object]]:
+    wb = load_workbook(path, data_only=False)
+    if "exception_candidate" not in wb.sheetnames:
+        raise RuntimeError("%s missing exception_candidate sheet" % path)
+    ws = wb["exception_candidate"]
+    return [
+        row_values(ws, row_idx, EXCEPTION_CANDIDATE_HEADERS)
+        for row_idx in range(2, ws.max_row + 1)
+        if clean_cell(ws.cell(row=row_idx, column=1).value)
+    ]
 
 
 def row_scenario(row: FormRow) -> str:
@@ -2162,6 +2744,10 @@ def collection_has_get_nets(value: str) -> bool:
     return bool(re.search(r"\[\s*get_nets\b", text))
 
 
+def source_command_has_internal_pin(value: str) -> bool:
+    return bool(re.search(r"\[\s*get_pins\b", clean_cell(value)))
+
+
 def collection_has_pattern(value: str) -> bool:
     text = clean_cell(value)
     return "*" in text or "?" in text
@@ -2186,12 +2772,34 @@ def endpoint_present(row: FormRow) -> Tuple[str, str]:
     return src, dst
 
 
+def endpoint_collection_is_visible(value: str) -> bool:
+    parsed = parse_collection(value)
+    if not parsed:
+        return False
+    kind, objects = parsed
+    return kind in {"get_pins", "get_ports"} and len(objects) == 1 and not collection_has_pattern(value)
+
+
+def row_matches_channel(values: Dict[str, object], channel: ChannelRecord) -> bool:
+    return (
+        clean_cell(values.get("src_endpoint")) == channel.src_endpoint
+        and clean_cell(values.get("dst_endpoint")) == channel.dst_endpoint
+        and clean_cell(values.get("src_bit_index")) == channel.src_bit_index
+        and clean_cell(values.get("dst_bit_index")) == channel.dst_bit_index
+    )
+
+
 def check_source_digest(row: FormRow, current_digests: Dict[str, str], report: Report) -> None:
     sources = [part.strip() for part in clean_cell(row.values.get("source_sdc_file")).split(";") if part.strip()]
     digests = [part.strip() for part in clean_cell(row.values.get("source_digest")).split(";") if part.strip()]
     for idx, source in enumerate(sources):
         stored = digests[idx] if idx < len(digests) else ""
         current = current_digests.get(source)
+        if stored and not current:
+            report.warn(
+                "exception_rule row %d %s: source SDC %s is unavailable; row may be stale"
+                % (row.row_idx, clean_cell(row.values.get("exception_id")), source)
+            )
         if current and stored and current != stored:
             report.warn(
                 "exception_rule row %d %s: source_digest mismatch for %s; row may be stale"
@@ -2232,15 +2840,18 @@ def validate_rows(
     rows: Sequence[FormRow],
     channels: Sequence[ChannelRecord],
     active20: Dict[str, Active20Budget],
-    feedthroughs: Sequence[FeedthroughRecord],
+    twenty_states: Dict[str, TwentyChannelState],
+    feedthroughs: Sequence[FeedthroughEdgeRecord],
+    relation_context: RelationContext,
     scenario: str,
     stage: str,
     corner: str,
     current_digests: Dict[str, str],
+    require_owner_state: bool,
     report: Report,
 ) -> None:
     channel_by_id = {ch.channel_id: ch for ch in channels}
-    ft_ids = {ft.feedthrough_id for ft in feedthroughs}
+    ft_by_id = {ft.feedthrough_edge_id: ft for ft in feedthroughs}
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
     by_path: Dict[Tuple[str, str, str], List[FormRow]] = defaultdict(list)
 
@@ -2261,6 +2872,7 @@ def validate_rows(
         datapath_only = normalize_key(values.get("datapath_only"))
         timing_status = normalize_key(values.get("timing_contract_status"))
         clock_context = normalize_key(values.get("harden_clock_context_status"))
+        sdc_evidence_status = normalize_key(values.get("sdc_evidence_status"))
         src, dst = endpoint_present(row)
         through = clean_cell(values.get("through_collection"))
 
@@ -2290,6 +2902,8 @@ def validate_rows(
             report.error("exception_rule row %d %s: invalid timing_contract_status %s" % (row.row_idx, exception_id, timing_status))
         if clock_context and clock_context not in CLOCK_CONTEXT_STATUSES:
             report.error("exception_rule row %d %s: invalid harden_clock_context_status %s" % (row.row_idx, exception_id, clock_context))
+        if sdc_evidence_status and sdc_evidence_status not in SDC_EVIDENCE_STATUSES:
+            report.error("exception_rule row %d %s: invalid sdc_evidence_status %s" % (row.row_idx, exception_id, sdc_evidence_status))
 
         if apply_value == "yes" and review_status != "approved":
             report.error("exception_rule row %d %s: apply=yes requires review_status=approved" % (row.row_idx, exception_id))
@@ -2305,8 +2919,34 @@ def validate_rows(
                 report.error("exception_rule row %d %s: path_category must be reviewed before emit" % (row.row_idx, exception_id))
             if source_type == "missing_timing_candidate" and timing_status == "no_port_timing":
                 report.error("exception_rule row %d %s: no_port_timing/missing_timing_candidate alone cannot generate 30" % (row.row_idx, exception_id))
+            if sdc_evidence_status == "incomplete_missing_sdc" and not clean_cell(values.get("sdc_independent_basis")):
+                report.error("exception_rule row %d %s: incomplete harden SDC evidence requires sdc_independent_basis" % (row.row_idx, exception_id))
             if not (src or dst):
                 report.error("exception_rule row %d %s: from/to endpoint is required" % (row.row_idx, exception_id))
+            if not channel:
+                report.error("exception_rule row %d %s: channel_id must map to the current scenario 00 direct-edge inventory" % (row.row_idx, exception_id))
+            elif not row_matches_channel(values, channel):
+                report.error("exception_rule row %d %s: machine endpoint/bit fields do not match the referenced 00 channel" % (row.row_idx, exception_id))
+            if channel and channel.is_feedthrough_path != "yes" and require_owner_state:
+                related_20_id = clean_cell(values.get("related_20_channel_id"))
+                if related_20_id != channel.channel_id:
+                    report.error("exception_rule row %d %s: non-feedthrough rule must reference its current 20 channel_id" % (row.row_idx, exception_id))
+                state = twenty_states.get(channel.channel_id)
+                if not state:
+                    report.error("exception_rule row %d %s: current 20 channel state is missing" % (row.row_idx, exception_id))
+                else:
+                    if state.connection_id != channel.connection_id or state.src_endpoint != channel.src_endpoint or state.dst_endpoint != channel.dst_endpoint:
+                        report.error("exception_rule row %d %s: 20 channel state does not match the current 00 direct edge" % (row.row_idx, exception_id))
+                    if state.owner_stage != "20":
+                        report.error("exception_rule row %d %s: 20 channel owner_stage must be 20" % (row.row_idx, exception_id))
+                    if state.apply != "yes" or state.review_status != "approved":
+                        report.error("exception_rule row %d %s: 20 channel owner decision must be apply=yes and approved" % (row.row_idx, exception_id))
+                    if state.channel_disposition in {"", "pending", "not_applicable"}:
+                        report.error("exception_rule row %d %s: 20 channel disposition is not a completed owner decision" % (row.row_idx, exception_id))
+            if src and not endpoint_collection_is_visible(src):
+                report.error("exception_rule row %d %s: from endpoint must resolve to one explicit get_pins/get_ports object" % (row.row_idx, exception_id))
+            if dst and not endpoint_collection_is_visible(dst):
+                report.error("exception_rule row %d %s: to endpoint must resolve to one explicit get_pins/get_ports object" % (row.row_idx, exception_id))
             if src and collection_has_get_clocks(src) or dst and collection_has_get_clocks(dst) or through and collection_has_get_clocks(through):
                 report.error("exception_rule row %d %s: 30 must be object-level; get_clocks collection is not allowed" % (row.row_idx, exception_id))
             if collection_has_range_or_bus(src) or collection_has_range_or_bus(dst) or collection_has_range_or_bus(through):
@@ -2315,15 +2955,34 @@ def validate_rows(
                 report.error("exception_rule row %d %s: pad-related path belongs to 04, not 30" % (row.row_idx, exception_id))
             if channel and channel.is_clock_related == "yes":
                 report.error("exception_rule row %d %s: clock relationship belongs to 03, not 30" % (row.row_idx, exception_id))
-            if channel and channel.related_10_feedthrough_id and not clean_cell(values.get("related_10_feedthrough_id")):
-                report.error("exception_rule row %d %s: path passes feedthrough but related_10_feedthrough_id is blank" % (row.row_idx, exception_id))
-            related_ft_ids = [part.strip() for part in clean_cell(values.get("related_10_feedthrough_id")).split(",") if part.strip()]
-            if related_ft_ids:
-                for ft_id in related_ft_ids:
-                    if ft_id not in ft_ids:
-                        report.error("exception_rule row %d %s: related_10_feedthrough_id %s not found in feedthrough_inventory" % (row.row_idx, exception_id, ft_id))
-                if not through:
-                    report.error("exception_rule row %d %s: feedthrough exception requires through_collection anchor" % (row.row_idx, exception_id))
+            if channel and channel.src_instance == channel.dst_instance and is_feedthrough_port(channel.src_port) and is_feedthrough_port(channel.dst_port):
+                report.error("exception_rule row %d %s: harden-internal fti->fto path must not enter SoC 30" % (row.row_idx, exception_id))
+            related_ft_id = clean_cell(values.get("related_10_feedthrough_edge_id"))
+            if channel and channel.is_feedthrough_path == "yes" and not related_ft_id:
+                report.error("exception_rule row %d %s: feedthrough direct edge requires related_10_feedthrough_edge_id" % (row.row_idx, exception_id))
+            if "," in related_ft_id or ";" in related_ft_id:
+                report.error("exception_rule row %d %s: one 30 rule may reference only one bit-level feedthrough edge id" % (row.row_idx, exception_id))
+            if related_ft_id:
+                ft = ft_by_id.get(related_ft_id)
+                if not ft:
+                    report.error("exception_rule row %d %s: related_10_feedthrough_edge_id %s not found in 10 inventory" % (row.row_idx, exception_id, related_ft_id))
+                elif not channel:
+                    report.error("exception_rule row %d %s: feedthrough rule channel_id is not present in 00 inventory" % (row.row_idx, exception_id))
+                else:
+                    if ft.connection_id != channel.connection_id:
+                        report.error("exception_rule row %d %s: 10 edge connection_id does not match 00 channel" % (row.row_idx, exception_id))
+                    if (ft.src_instance, ft.src_port, ft.dst_instance, ft.dst_port) != (channel.src_instance, channel.src_port, channel.dst_instance, channel.dst_port):
+                        report.error("exception_rule row %d %s: 10 edge endpoints do not match 00 channel" % (row.row_idx, exception_id))
+                    if ft.channel_disposition != "route_to_30":
+                        report.error("exception_rule row %d %s: 10 edge disposition must be route_to_30, got %s" % (row.row_idx, exception_id, ft.channel_disposition or "<blank>"))
+                    if ft.apply != "yes" or ft.review_status != "approved":
+                        report.error("exception_rule row %d %s: 10 route_to_30 decision must be apply=yes and approved" % (row.row_idx, exception_id))
+                    if ft.emit_max == "yes" or ft.emit_min == "yes":
+                        report.error("exception_rule row %d %s: 10 edge still has an active normal budget" % (row.row_idx, exception_id))
+                    if ft.validation_status and normalize_key(ft.validation_status) not in MATCHED_STATUSES:
+                        report.error("exception_rule row %d %s: 10 edge validation_status is not matched" % (row.row_idx, exception_id))
+            if through and "fti_" in through and "fto_" in through:
+                report.error("exception_rule row %d %s: through_collection must not stitch fti to fto through harden internal timing" % (row.row_idx, exception_id))
             if etype in {"false_path", "multicycle_path"} and datapath_only == "yes":
                 report.error("exception_rule row %d %s: datapath_only only applies to set_max_delay/set_min_delay" % (row.row_idx, exception_id))
             if etype == "max_delay_override" and not clean_cell(values.get("max_value")):
@@ -2332,6 +2991,18 @@ def validate_rows(
                 report.error("exception_rule row %d %s: min_delay_override requires min_value" % (row.row_idx, exception_id))
             if etype == "max_min_delay_override" and (not clean_cell(values.get("max_value")) or not clean_cell(values.get("min_value"))):
                 report.error("exception_rule row %d %s: max_min_delay_override requires both max_value and min_value" % (row.row_idx, exception_id))
+            if etype in {"max_delay_override", "max_min_delay_override"} and parse_finite_number(values.get("max_value")) is None:
+                report.error("exception_rule row %d %s: max_value must be a finite number" % (row.row_idx, exception_id))
+            if etype in {"min_delay_override", "max_min_delay_override"} and parse_finite_number(values.get("min_value")) is None:
+                report.error("exception_rule row %d %s: min_value must be a finite number" % (row.row_idx, exception_id))
+            if etype == "max_min_delay_override":
+                max_value = parse_finite_number(values.get("max_value"))
+                min_value = parse_finite_number(values.get("min_value"))
+                if max_value is not None and min_value is not None and min_value > max_value:
+                    report.error("exception_rule row %d %s: min_value must not exceed max_value" % (row.row_idx, exception_id))
+            if etype in {"max_delay_override", "min_delay_override", "max_min_delay_override"}:
+                if (row_stage(row) == "all") != (row_corner(row) == "all"):
+                    report.error("exception_rule row %d %s: numeric override stage/corner must both be all or both be view-specific" % (row.row_idx, exception_id))
             if etype == "multicycle_path":
                 validate_multicycle_row(row, exception_id, check_type, report)
             if etype in {"max_delay_override", "min_delay_override", "max_min_delay_override"}:
@@ -2341,13 +3012,35 @@ def validate_rows(
                     report.error("exception_rule row %d %s: reset false_path requires recovery/removal/RDC/waiver basis" % (row.row_idx, exception_id))
             if source_type == "extracted_harden_exception" and clock_context not in {"matched", "remapped_equivalent"}:
                 report.error("exception_rule row %d %s: extracted harden exception requires matched/remapped_equivalent clock context" % (row.row_idx, exception_id))
-            expiry = parse_review_date(clean_cell(values.get("expiry_or_review_date")))
+            if source_type == "extracted_harden_exception" and source_command_has_internal_pin(values.get("source_command")):
+                report.error("exception_rule row %d %s: harden-internal get_pins exception may be evidence only and cannot be promoted verbatim" % (row.row_idx, exception_id))
+            expected_relation = resolved_clock_relation(
+                clean_cell(values.get("src_clock")), clean_cell(values.get("dst_clock")), relation_context, report, channel_id or exception_id
+            )
+            if expected_relation != "unknown" and clock_relation != expected_relation:
+                report.error("exception_rule row %d %s: clock_relation=%s does not match 03 relation map %s" % (row.row_idx, exception_id, clock_relation, expected_relation))
+            if relation_context.run_completeness == "partial" and expected_relation == "unknown" and clock_relation != "unknown":
+                report.error("exception_rule row %d %s: partial relation map cannot infer a missing clock pair as %s" % (row.row_idx, exception_id, clock_relation))
+            if row_scenario(row) == "common":
+                mode_text = " ".join(clean_cell(values.get(field)) for field in ("case_condition", "basis", "note")).lower()
+                if any(token in mode_text for token in MODE_SPECIFIC_TOKENS):
+                    report.error("exception_rule row %d %s: mode-specific exception must be placed in a scenario overlay" % (row.row_idx, exception_id))
+            expiry_text = clean_cell(values.get("expiry_or_review_date"))
+            expiry = parse_review_date(expiry_text)
+            if expiry_text and expiry is None:
+                report.error("exception_rule row %d %s: expiry_or_review_date has an invalid date format" % (row.row_idx, exception_id))
             if expiry is not None and expiry < today_date():
                 report.error("exception_rule row %d %s: expiry_or_review_date %s is expired" % (row.row_idx, exception_id, expiry.isoformat()))
-            if tool_surface in {"dc", "both"} and etype in {"max_delay_override", "min_delay_override", "max_min_delay_override"} and datapath_only == "yes":
-                basis = normalize_key(values.get("basis")) + " " + normalize_key(values.get("note"))
-                if "dc" not in basis and "synthesis" not in basis and "tool" not in basis:
-                    report.error("exception_rule row %d %s: DC/both datapath_only use requires tool support basis" % (row.row_idx, exception_id))
+            if expiry is not None and 0 <= (expiry - today_date()).days <= 30:
+                report.warn("exception_rule row %d %s: expiry_or_review_date is within 30 days" % (row.row_idx, exception_id))
+            if tool_surface in {"dc", "both"}:
+                support_text = " ".join(normalize_key(values.get(field)) for field in ("basis", "note", "sta_waiver_ref"))
+                if not any(token in support_text for token in ("dc support", "dc supported", "synthesis support", "tool support", "综合支持")):
+                    report.error("exception_rule row %d %s: DC/both exception requires explicit target-tool support basis" % (row.row_idx, exception_id))
+            mode_text = " ".join(clean_cell(values.get(field)) for field in ("case_condition", "basis", "note")).lower()
+            has_mode_dependency = any(token in mode_text for token in MODE_SPECIFIC_TOKENS)
+            if row_scenario(row) != "common" and has_mode_dependency and not clean_cell(values.get("case_condition")):
+                report.error("exception_rule row %d %s: mode-dependent scenario rule requires case_condition" % (row.row_idx, exception_id))
             if not commands_for_row(row):
                 report.error("exception_rule row %d %s: approved row cannot generate any SDC command" % (row.row_idx, exception_id))
             check_source_digest(row, current_digests, report)
@@ -2379,15 +3072,30 @@ def validate_multicycle_row(row: FormRow, exception_id: str, check_type: str, re
     elif check_type == "hold":
         if not hold:
             report.error("exception_rule row %d %s: multicycle check_type=hold requires hold_cycles" % (row.row_idx, exception_id))
+    for label, value, allow_zero in (("setup_cycles", setup, False), ("hold_cycles", hold, True)):
+        if not value:
+            continue
+        number = parse_finite_number(value)
+        if number is None or not number.is_integer() or number < (0 if allow_zero else 1):
+            report.error("exception_rule row %d %s: %s must be a valid integer cycle count" % (row.row_idx, exception_id, label))
     src_clk = clean_cell(values.get("src_clock"))
     dst_clk = clean_cell(values.get("dst_clock"))
-    if src_clk and dst_clk and src_clk != dst_clk:
-        if normalize_key(values.get("mcp_reference")) not in {"start", "end"}:
+    reference = normalize_key(values.get("mcp_reference"))
+    if not src_clk or not dst_clk:
+        report.error("exception_rule row %d %s: multicycle path requires explicit src_clock and dst_clock" % (row.row_idx, exception_id))
+    elif src_clk != dst_clk:
+        if reference not in {"start", "end"}:
             report.error("exception_rule row %d %s: cross-clock multicycle requires mcp_reference=start/end" % (row.row_idx, exception_id))
         if normalize_key(values.get("cross_clock_mcp_review")) not in {"approved", "reviewed", "yes"}:
             report.error("exception_rule row %d %s: cross-clock multicycle requires cross_clock_mcp_review=approved" % (row.row_idx, exception_id))
+    elif reference != "same_clock_default":
+        report.error("exception_rule row %d %s: same-clock multicycle requires mcp_reference=same_clock_default" % (row.row_idx, exception_id))
     if check_type == "setup":
         report.warn("exception_rule row %d %s: setup-only multicycle must justify missing hold MCP" % (row.row_idx, exception_id))
+    setup_number = parse_finite_number(setup)
+    hold_number = parse_finite_number(hold)
+    if setup_number is not None and hold_number is not None and hold_number != setup_number - 1:
+        report.warn("exception_rule row %d %s: hold_cycles differs from the common setup_cycles-1 strategy" % (row.row_idx, exception_id))
 
 
 def validate_datapath_strategy(row: FormRow, exception_id: str, clock_relation: str, path_category: str, datapath_only: str, report: Report) -> None:
@@ -2395,6 +3103,12 @@ def validate_datapath_strategy(row: FormRow, exception_id: str, clock_relation: 
     if clock_relation in ASYNC_RELATIONS and path_category in CDC_WINDOW_CATEGORIES:
         if datapath_only != "yes":
             report.error("exception_rule row %d %s: CDC/async max/min override requires datapath_only=yes" % (row.row_idx, exception_id))
+        evidence_text = " ".join(
+            normalize_key(row.values.get(field))
+            for field in ("basis", "cdc_rdc_ref", "sta_waiver_ref", "protocol_ref", "note")
+        )
+        if not any(token in evidence_text for token in ("report_timing", "exception report", "priority", "verified", "validated", "遮蔽", "等效约束")):
+            report.error("exception_rule row %d %s: async max/min requires tool-effectiveness evidence for 03/30 exception priority" % (row.row_idx, exception_id))
         if etype in {"max_delay_override", "min_delay_override"}:
             report.warn("exception_rule row %d %s: CDC window usually needs max_min_delay_override pair; justify single-sided override" % (row.row_idx, exception_id))
     elif clock_relation in {"synchronous", "unknown", ""} and datapath_only == "yes":
@@ -2409,10 +3123,12 @@ def warn_row_shape(row: FormRow, clock_relation: str, report: Report) -> None:
     etype = row_exception_type(row)
     if bool(src) != bool(dst):
         report.warn("exception_rule row %d %s: single-sided endpoint may be broader than intended" % (row.row_idx, exception_id))
+    if clean_cell(values.get("src_bit_index")) or clean_cell(values.get("dst_bit_index")):
+        report.warn("exception_rule row %d %s: bit-level exception may cover only part of a bus; confirm intent" % (row.row_idx, exception_id))
     if collection_has_get_nets(through) or collection_has_pattern(through):
         report.warn("exception_rule row %d %s: through_collection uses nets/pattern; verify object matching across stages" % (row.row_idx, exception_id))
     text = " ".join(clean_cell(values.get(field)) for field in ("exception_id", "channel_id", "from_collection", "to_collection", "through_collection", "case_condition", "note"))
-    if row_scenario(row) == "common" and any(token in normalize_key(text) for token in MODE_SPECIFIC_TOKENS):
+    if row_scenario(row) == "common" and any(token in normalize_key(text) for token in MODE_SPECIFIC_TOKENS + ("reset", "debug", "mode")):
         report.warn("exception_rule row %d %s: common exception looks mode-specific; confirm scenario placement" % (row.row_idx, exception_id))
     if clock_relation in ASYNC_RELATIONS and etype == "false_path":
         report.warn("exception_rule row %d %s: false_path may be redundant with 03 async/exclusive relation" % (row.row_idx, exception_id))
@@ -2564,11 +3280,20 @@ def commands_for_row(row: FormRow) -> List[str]:
     return commands
 
 
-def generate_sdc(rows: Sequence[FormRow], scenario: str, stage: str, corner: str) -> List[str]:
-    selected = [row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)]
+def generate_sdc(rows: Sequence[FormRow], scenario: str, stage: str, corner: str, completeness: RunCompleteness) -> List[str]:
+    selected = sorted(
+        (row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)),
+        key=lambda row: (clean_cell(row.values.get("exception_id")), row.row_idx),
+    )
     lines = [
         "################################################################################",
         "# Auto-generated SoC harden-to-harden exception constraints for scenario: %s, stage: %s, corner: %s" % (scenario, stage, corner),
+        "# Author: %s" % author_name(),
+        "# Stage: 30_harden_to_harden_exception",
+        "# Script: 30_extract_harden_to_harden_exception.py",
+        "# Run completeness: %s" % completeness.status,
+        "# Port accounting: enabled",
+        "# Available harden SDCs: %d; missing: %d; missing instances: %s" % (completeness.available_count, completeness.missing_count, ",".join(completeness.missing_instances) or "none"),
         "# Source: 30_harden_to_harden_exception.xlsx exception_rule sheet",
         "# Only apply=yes and review_status=approved rows are emitted.",
         "################################################################################",
@@ -2597,7 +3322,17 @@ def generate_sdc(rows: Sequence[FormRow], scenario: str, stage: str, corner: str
     return lines
 
 
-def build_coverage_lines(rows: Sequence[FormRow], channels: Sequence[ChannelRecord], active20: Dict[str, Active20Budget], scenario: str, stage: str, corner: str) -> List[str]:
+def build_coverage_lines(
+    rows: Sequence[FormRow],
+    candidate_rows: Sequence[Dict[str, object]],
+    channels: Sequence[ChannelRecord],
+    active20: Dict[str, Active20Budget],
+    twenty_states: Dict[str, TwentyChannelState],
+    feedthroughs: Sequence[FeedthroughEdgeRecord],
+    scenario: str,
+    stage: str,
+    corner: str,
+) -> List[str]:
     selected = [row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)]
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
     type_counts: Dict[str, int] = defaultdict(int)
@@ -2605,9 +3340,79 @@ def build_coverage_lines(rows: Sequence[FormRow], channels: Sequence[ChannelReco
         type_counts[row_exception_type(row)] += 1
     no_decision = []
     approved_channels = {clean_cell(row.values.get("channel_id")) for row in assembled}
+    candidate_by_channel: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    view_candidates = [
+        candidate for candidate in candidate_rows
+        if (normalize_key(candidate.get("scenario")) or "common") in {"common", scenario}
+    ]
+    for candidate in view_candidates:
+        candidate_by_channel[clean_cell(candidate.get("channel_id"))].append(candidate)
+    ft_by_connection = {item.connection_id: item for item in feedthroughs}
+    classifications: List[Tuple[str, str]] = []
     for ch in channels:
-        if ch.channel_type == "harden_to_harden" and ch.channel_id not in approved_channels and ch.channel_id not in active20:
+        ft_state = ft_by_connection.get(ch.connection_id)
+        twenty_state = twenty_states.get(ch.channel_id)
+        has_10_decision = bool(
+            ft_state
+            and ft_state.apply == "yes"
+            and ft_state.review_status == "approved"
+            and ft_state.channel_disposition not in {"", "pending", "route_to_30"}
+        )
+        has_20_decision = bool(
+            twenty_state
+            and twenty_state.apply == "yes"
+            and twenty_state.review_status == "approved"
+            and twenty_state.channel_disposition not in {"", "pending", "route_to_30"}
+        )
+        if ch.channel_type == "harden_to_harden" and ch.channel_id not in approved_channels and not has_10_decision and not has_20_decision:
             no_decision.append(ch.channel_id)
+        if ch.is_pad_related == "yes":
+            owner = "04"
+        elif ch.is_clock_related == "yes":
+            owner = "clock"
+        elif ch.channel_id in approved_channels:
+            owner = "30"
+        elif ch.connection_id in ft_by_connection:
+            owner = "10" if ft_by_connection[ch.connection_id].channel_disposition != "route_to_30" else "needs_review"
+        elif ch.channel_id in active20:
+            owner = "20"
+        elif ch.channel_id in twenty_states and twenty_states[ch.channel_id].channel_disposition not in {"", "pending", "route_to_30"}:
+            owner = "20"
+        elif any(normalize_key(item.get("timing_contract_status")) == "no_port_timing" for item in candidate_by_channel.get(ch.channel_id, [])):
+            owner = "needs_review"
+        else:
+            owner = "unclassified"
+        classifications.append((ch.channel_id, owner))
+
+    no_port_rows = [item for item in view_candidates if normalize_key(item.get("timing_contract_status")) == "no_port_timing"]
+    incomplete_rows = [item for item in view_candidates if normalize_key(item.get("sdc_evidence_status")) == "incomplete_missing_sdc"]
+    extracted_rows = [item for item in view_candidates if normalize_key(item.get("source_type")) == "extracted_harden_exception"]
+    stale_rows = [item for item in view_candidates if normalize_key(item.get("candidate_status")) == "stale"]
+    inactive_rules = [
+        row for row in rows
+        if row_selected_for_assembled(row, scenario, stage, corner)
+        and not is_apply_approved(row)
+        and normalize_key(row.values.get("review_status")) in {"pending", "needs_review", "rejected"}
+    ]
+    active_groups: Dict[Tuple[str, str, str, str], int] = defaultdict(int)
+    for row in assembled:
+        active_groups[(row_scenario(row), row_stage(row), row_corner(row), row_exception_type(row))] += 1
+    relation_overlaps = [
+        "%s:%s/%s" % (clean_cell(row.values.get("exception_id")), canonical_clock_relation(row.values.get("clock_relation")) or "unknown", row_exception_type(row))
+        for row in assembled
+        if canonical_clock_relation(row.values.get("clock_relation")) in ASYNC_RELATIONS
+    ]
+    normal_overlaps = [
+        "%s:20(max=%s,min=%s):30=%s"
+        % (
+            clean_cell(row.values.get("exception_id")),
+            "yes" if active20[clean_cell(row.values.get("related_20_channel_id")) or clean_cell(row.values.get("channel_id"))].max_active else "no",
+            "yes" if active20[clean_cell(row.values.get("related_20_channel_id")) or clean_cell(row.values.get("channel_id"))].min_active else "no",
+            row_exception_type(row),
+        )
+        for row in assembled
+        if (clean_cell(row.values.get("related_20_channel_id")) or clean_cell(row.values.get("channel_id"))) in active20
+    ]
     lines = [
         "",
         "Coverage:",
@@ -2617,13 +3422,57 @@ def build_coverage_lines(rows: Sequence[FormRow], channels: Sequence[ChannelReco
         "  emitted approved row    : %d" % len(selected),
         "  exception type counts   : %s" % (", ".join("%s=%d" % item for item in sorted(type_counts.items())) or "none"),
         "  no 20/30 decision channel count: %d" % len(no_decision),
+        "  no-port-timing candidate count: %d" % len(no_port_rows),
+        "  incomplete missing-SDC candidate count: %d" % len(incomplete_rows),
+        "  extracted harden exception count: %d" % len(extracted_rows),
+        "  stale candidate count     : %d" % len(stale_rows),
+        "  pending/rejected rule count: %d" % len(inactive_rules),
     ]
+    lines.append("  channel classifications:")
+    lines.extend("    - %s -> %s" % item for item in classifications)
+    if no_port_rows:
+        lines.append("  no-port-timing candidates:")
+        lines.extend("    - %s status=%s evidence=available_SDC_scanned" % (clean_cell(item.get("candidate_id")), clean_cell(item.get("recommended_action")) or "needs_review") for item in no_port_rows)
+    if incomplete_rows:
+        lines.append("  missing SDC, evidence unavailable candidates:")
+        lines.extend("    - " + clean_cell(item.get("candidate_id")) for item in incomplete_rows)
+    if extracted_rows:
+        lines.append("  extracted harden exceptions:")
+        lines.extend("    - %s source=%s:%s" % (clean_cell(item.get("candidate_id")), clean_cell(item.get("source_sdc_file")), clean_cell(item.get("source_line"))) for item in extracted_rows)
+    if active_groups:
+        lines.append("  active 30 rule groups:")
+        lines.extend("    - %s/%s/%s/%s=%d" % (key + (count,)) for key, count in sorted(active_groups.items()))
+    if normal_overlaps:
+        lines.append("  10/20 vs 30 overlaps:")
+        lines.extend("    - " + item for item in normal_overlaps)
+    if relation_overlaps:
+        lines.append("  03 vs 30 overlaps:")
+        lines.extend("    - " + item for item in relation_overlaps)
+    if inactive_rules:
+        lines.append("  pending/needs_review/rejected rules:")
+        lines.extend("    - %s status=%s apply=%s" % (clean_cell(row.values.get("exception_id")), normalize_key(row.values.get("review_status")), normalize_key(row.values.get("apply"))) for row in inactive_rules)
+    if stale_rows:
+        lines.append("  stale candidates:")
+        lines.extend("    - " + clean_cell(item.get("candidate_id")) for item in stale_rows)
     if no_decision:
         lines.append("  no 20/30 decision samples:")
         lines.extend("    - " + item for item in no_decision[:20])
         if len(no_decision) > 20:
             lines.append("    ... %d more" % (len(no_decision) - 20))
     return lines
+
+
+def write_candidates_csv(path: Path, form_path: Path) -> None:
+    wb = load_workbook(form_path, data_only=False, read_only=True)
+    if "exception_candidate" not in wb.sheetnames:
+        raise RuntimeError("%s missing exception_candidate sheet" % form_path)
+    ws = wb["exception_candidate"]
+    rows = [
+        row_values(ws, row_idx, EXCEPTION_CANDIDATE_HEADERS)
+        for row_idx in range(2, ws.max_row + 1)
+        if clean_cell(ws.cell(row=row_idx, column=1).value)
+    ]
+    atomic_write_csv(path, EXCEPTION_CANDIDATE_HEADERS, rows)
 
 
 def write_report(
@@ -2635,11 +3484,23 @@ def write_report(
     form_path: Path,
     output_path: Path,
     coverage_lines: Sequence[str],
+    completeness: RunCompleteness,
+    accounting_complete: bool,
+    port_accounting: str,
 ) -> None:
     lines = [
         "30_harden_to_harden_exception extraction report",
         "================================================",
         "",
+        "Author: " + author_name(),
+        "Stage: 30_harden_to_harden_exception",
+        "Script: 30_extract_harden_to_harden_exception.py",
+        "Run completeness: " + completeness.status,
+        "Available harden SDCs: %d" % completeness.available_count,
+        "Missing harden SDCs: %d" % completeness.missing_count,
+        "Missing harden instances: " + (",".join(completeness.missing_instances) or "none"),
+        "Port accounting: " + port_accounting,
+        "Accounting closure: " + ("complete" if accounting_complete else "incomplete"),
         "Scenario: " + scenario,
         "Stage   : " + stage,
         "Corner  : " + corner,
@@ -2653,7 +3514,7 @@ def write_report(
     ]
     lines.extend(report.lines or ["INFO: no messages"])
     lines.extend(coverage_lines)
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
 def pending_line_key(line: str) -> Optional[Tuple[str, str]]:
@@ -2737,22 +3598,42 @@ def removed_log_line_30(row: FormRow, ch: ChannelRecord, key: PortKey) -> str:
     )
 
 
-def update_pending_for_30(
+def read_removed_key_sources(paths: Sequence[Path]) -> Dict[PortKey, Path]:
+    sources: Dict[PortKey, Path] = {}
+    for directory in paths:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.removed")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                key = removed_line_key(line)
+                if key is not None and key not in sources:
+                    sources[key] = path
+    return sources
+
+
+def prepare_pending_for_30(
     cwd: Path,
-    pending_root: Path,
+    pending_dir: Path,
+    removed_log_path: Path,
+    previous_removed_dirs: Sequence[Path],
     rows: Sequence[FormRow],
     channels: Sequence[ChannelRecord],
     scenario: str,
     stage: str,
     corner: str,
     report: Report,
-) -> None:
-    pending_dir = pending_root / "pending"
+) -> PendingPlan:
+    plan = PendingPlan(removed_log_path=removed_log_path)
     if not pending_dir.exists():
-        return
+        report.error("pending directory not found: %s" % pending_dir)
+        return plan
     if not pending_dir.is_dir():
         report.error("%s: pending path exists but is not a directory" % pending_dir)
-        return
+        return plan
     channel_by_id = {ch.channel_id: ch for ch in channels}
     removals: List[Tuple[FormRow, ChannelRecord, PortKey]] = []
     for row in emitted_rows_for_pending(rows, scenario, stage, corner):
@@ -2765,20 +3646,21 @@ def update_pending_for_30(
             if key is not None:
                 removals.append((row, ch, key))
     if not removals:
-        return
+        return plan
 
-    log_dir = pending_root / "removed_log"
-    previous_removed = read_removed_keys(log_dir)
+    previous_sources = read_removed_key_sources(list(previous_removed_dirs) + [removed_log_path.parent])
     by_inst: Dict[str, List[Tuple[FormRow, ChannelRecord, PortKey]]] = defaultdict(list)
     for item in removals:
         by_inst[item[2].inst_name].append(item)
 
     removed_items: List[Tuple[FormRow, ChannelRecord, PortKey]] = []
+    planned_pending: Dict[Path, str] = {}
     for inst_name, inst_items in sorted(by_inst.items()):
         pending_file = pending_dir / (inst_name + ".ports")
         if not pending_file.is_file():
             for row, ch, key in inst_items:
-                if key in previous_removed:
+                if key in previous_sources:
+                    report.info("30 path %s reuses endpoint previously owned by %s" % (key.port_name, previous_sources[key]))
                     continue
                 report.error("%s: missing pending file for 30 channel endpoint %s/%s" % (pending_file, key.inst_name, key.port_name))
             continue
@@ -2800,23 +3682,31 @@ def update_pending_for_30(
         for row, ch, port_key in inst_items:
             key = (port_key.direction, port_key.port_name)
             if key not in index:
-                if port_key in previous_removed:
+                if port_key in previous_sources:
+                    report.info("30 path %s reuses endpoint previously owned by %s" % (port_key.port_name, previous_sources[port_key]))
                     continue
                 report.error(
                     "%s: 30 wants to remove %s %s, but it is not present in pending and no previous_removed record exists"
                     % (pending_file, port_key.direction, port_key.port_name)
                 )
                 continue
+            if port_key in previous_sources:
+                report.error(
+                    "%s: endpoint %s %s remains pending despite previous owner %s"
+                    % (pending_file, port_key.direction, port_key.port_name, previous_sources[port_key])
+                )
+                continue
             remove_line_indices.add(index[key])
             removed_items.append((row, ch, port_key))
         if remove_line_indices:
             kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
-            pending_file.write_text("\n".join(kept).rstrip() + ("\n" if kept else ""), encoding="utf-8")
+            planned_pending[pending_file] = "\n".join(kept).rstrip() + ("\n" if kept else "")
+
+    if report.error_count:
+        return PendingPlan(removed_log_path=removed_log_path)
 
     if removed_items:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "30_harden_to_harden_exception.removed"
-        existing_lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.is_file() else []
+        existing_lines = removed_log_path.read_text(encoding="utf-8").splitlines() if removed_log_path.is_file() else []
         existing_keys = {key for key in (removed_line_key(line) for line in existing_lines) if key is not None}
         new_lines = []
         for row, ch, key in sorted(removed_items, key=lambda item: (item[2].inst_name, item[2].direction, item[2].port_name)):
@@ -2825,27 +3715,49 @@ def update_pending_for_30(
                 existing_keys.add(key)
         if new_lines:
             log_lines = [line for line in existing_lines if line.strip()] + new_lines
-            log_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+            plan.removed_log_text = "\n".join(log_lines).rstrip() + "\n"
+    plan.pending_updates = planned_pending
+    plan.removed_count = len(removed_items)
+    return plan
+
+
+def apply_pending_plan(cwd: Path, plan: PendingPlan, report: Report) -> None:
+    for path, content in sorted(plan.pending_updates.items(), key=lambda item: str(item[0])):
+        atomic_write_text(path, content)
+    if plan.removed_log_text and plan.removed_log_path is not None:
+        atomic_write_text(plan.removed_log_path, plan.removed_log_text)
+    if plan.removed_count:
+        log_path = plan.removed_log_path or Path("<none>")
         try:
             display_path = log_path.relative_to(cwd)
         except ValueError:
             display_path = log_path
-        report.info("removed %d harden exception endpoint(s) from pending; log=%s" % (len(removed_items), display_path))
+        report.info("removed %d harden exception endpoint(s) from pending; log=%s" % (plan.removed_count, display_path))
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate 30 SoC harden-to-harden exception SDC.")
-    parser.add_argument("-scenario", "--scenario", default="common", choices=sorted(SCENARIOS), help="target scenario")
+    parser.add_argument("--run-root", help="target runtime root")
+    parser.add_argument("-scenario", "--scenario", choices=sorted(SCENARIOS), help="target scenario; required with --run-root")
     parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES), help="target stage/view")
     parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
-    parser.add_argument("--info-all", default="info_all.xlsx", help="integration summary xlsx")
-    parser.add_argument("--form", default="30_harden_to_harden_exception.xlsx", help="30 exception workbook")
-    parser.add_argument("--connection-inventory", default="00_harden_port_inventory/connection_inventory.csv", help="00 bit-to-bit connection inventory")
-    parser.add_argument("--feedthrough-inventory", default="feedthrough_inventory.csv", help="10 feedthrough inventory CSV")
-    parser.add_argument("--twenty-form", default="20_harden_x_if.xlsx", help="20 workbook used for active budget overlap checks")
-    parser.add_argument("--pending-root", default="00_harden_port_inventory", help="00 pending inventory root")
+    parser.add_argument("--info-all", help="integration summary xlsx")
+    parser.add_argument("--ports", help="port workbook")
+    parser.add_argument("--form", help="30 exception workbook")
+    parser.add_argument("--connection-inventory", help="00 bit-to-bit connection inventory")
+    parser.add_argument("--harden-sdc-manifest", help="00 harden SDC manifest")
+    parser.add_argument("--require-complete-harden-sdc", action="store_true")
+    parser.add_argument("--clock-inventory", help="01 assembled clock inventory")
+    parser.add_argument("--clock-inventory-meta", help="01 assembled clock inventory meta")
+    parser.add_argument("--relation-map", help="03 relation map")
+    parser.add_argument("--relation-map-meta", help="03 relation map meta")
+    parser.add_argument("--feedthrough-edge-inventory", "--feedthrough-inventory", dest="feedthrough_inventory", help="10 feedthrough direct-edge inventory")
+    parser.add_argument("--twenty-channel-inventory", help="20 channel inventory CSV")
+    parser.add_argument("--twenty-form", help="legacy 20 workbook used for active budget overlap checks")
+    parser.add_argument("--pending-root", help="target pending directory (legacy: 00 pending inventory root)")
     parser.add_argument("--no-update-pending", action="store_true", help="do not remove emitted exception endpoints from pending")
     parser.add_argument("--force-generate-after-sync", action="store_true", help="generate SDC even if workbook was synchronized")
+    parser.add_argument("--output", help="output SDC path")
     parser.add_argument("--report", help="output report path")
     return parser.parse_args(argv)
 
@@ -2853,52 +3765,205 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     cwd = Path.cwd()
+    target_layout = bool(args.run_root)
+    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
+    if target_layout and not args.scenario:
+        raise RuntimeError("--scenario is required with --run-root")
+    if target_layout and args.force_generate_after_sync:
+        raise RuntimeError("--force-generate-after-sync is not allowed in target mode; review synchronized rows first")
+    args.scenario = args.scenario or "common"
+    port_accounting = "disabled" if args.no_update_pending else "enabled"
     report = Report()
+    print("Author: %s" % author_name())
 
-    info_all = cwd / args.info_all
+    if target_layout:
+        info_all = resolve_path(run_root, args.info_all, "inputs/info_all.xlsx")
+        ports_path = resolve_path(run_root, args.ports, "inputs/ports.xlsx")
+        connection_path = resolve_path(run_root, args.connection_inventory, "00_middle/connection_inventory.csv")
+        manifest_path = resolve_path(run_root, args.harden_sdc_manifest, "00_middle/scenario/%s/harden_sdc_manifest.csv" % args.scenario)
+        clock_path = resolve_path(run_root, args.clock_inventory, "01_middle/assembled/%s/clock_inventory.csv" % args.scenario)
+        clock_meta_path = resolve_path(run_root, args.clock_inventory_meta, "01_middle/assembled/%s/clock_inventory.meta" % args.scenario)
+        relation_path = resolve_path(run_root, args.relation_map, "03_middle/relation_map/%s.csv" % args.scenario)
+        relation_meta_path = resolve_path(run_root, args.relation_map_meta, "03_middle/relation_map/%s.meta" % args.scenario)
+        feedthrough_path = resolve_path(run_root, args.feedthrough_inventory, "10_middle/scenario/%s/feedthrough_edge_inventory.csv" % args.scenario)
+        twenty_path = resolve_path(run_root, args.twenty_channel_inventory, "20_middle/scenario/%s/channel_inventory.csv" % args.scenario)
+        form_path = resolve_path(run_root, args.form, "30_middle/30_harden_to_harden_exception.xlsx")
+        candidate_path = run_root / "30_middle/exception_candidates.csv"
+        output_path = resolve_path(run_root, args.output, str(output_sdc_path(Path("30_result"), args.scenario, args.stage, args.corner)))
+        rpt_path = resolve_path(run_root, args.report, "30_result/reports/harden_to_harden_exception_check_report_%s_%s_%s.txt" % (args.scenario, args.stage, safe_filename_token(args.corner)))
+        pending_dir = resolve_path(run_root, args.pending_root, "00_middle/scenario/%s/pending" % args.scenario)
+        removed_log_path = run_root / "30_middle" / "scenario" / args.scenario / "removed_log" / "30_harden_to_harden_exception.removed"
+        previous_removed_dirs = [
+            run_root / stage / "scenario" / args.scenario / "removed_log"
+            for stage in ("01_middle", "04_middle", "10_middle", "20_middle")
+        ]
+    else:
+        info_all = resolve_path(cwd, args.info_all, "info_all.xlsx")
+        ports_path = resolve_path(cwd, args.ports, "ports.xlsx")
+        connection_path = resolve_path(cwd, args.connection_inventory, "00_harden_port_inventory/connection_inventory.csv")
+        manifest_path = None
+        clock_path = resolve_path(cwd, args.clock_inventory, "../01_soc_clocks/clock_inventory.csv")
+        clock_meta_path = resolve_path(cwd, args.clock_inventory_meta, "../01_soc_clocks/clock_inventory.meta")
+        relation_path = resolve_path(cwd, args.relation_map, "../03_soc_clock_groups/relation_map_common.csv")
+        relation_meta_path = resolve_path(cwd, args.relation_map_meta, "../03_soc_clock_groups/relation_map_common.meta")
+        feedthrough_path = resolve_path(cwd, args.feedthrough_inventory, "feedthrough_inventory.csv")
+        twenty_path = resolve_path(cwd, args.twenty_form, "20_harden_x_if.xlsx")
+        form_path = resolve_path(cwd, args.form, "30_harden_to_harden_exception.xlsx")
+        candidate_path = None
+        output_path = resolve_path(cwd, args.output, str(output_sdc_path(Path("."), args.scenario, args.stage, args.corner)))
+        rpt_path = resolve_path(cwd, args.report, "harden_to_harden_exception_check_report_%s_%s_%s.txt" % (args.scenario, args.stage, safe_filename_token(args.corner)))
+        legacy_pending_root = resolve_path(cwd, args.pending_root, "00_harden_port_inventory")
+        pending_dir = legacy_pending_root / "pending"
+        removed_log_path = legacy_pending_root / "removed_log" / "30_harden_to_harden_exception.removed"
+        previous_removed_dirs = [legacy_pending_root / "removed_log"]
+
+    for label, path in (
+        ("run root", run_root), ("info_all", info_all), ("ports", ports_path),
+        ("connection inventory", connection_path), ("harden SDC manifest", manifest_path),
+        ("clock inventory", clock_path), ("relation map", relation_path),
+        ("10 edge inventory", feedthrough_path), ("20 inventory", twenty_path),
+        ("form", form_path), ("output", output_path), ("report", rpt_path), ("pending directory", pending_dir),
+        ("30 removed log", removed_log_path),
+    ):
+        report.info("resolved %s: %s" % (label, path if path is not None else "<legacy inference>"))
+
     if not info_all.is_file():
         raise RuntimeError("integration file not found: %s" % info_all)
 
     instances = read_info_all(info_all, report)
-    port_paths = default_port_workbooks(cwd, Path(args.info_all).name, Path(args.form).name, report)
+    if target_layout:
+        if not ports_path.is_file():
+            report.error("port workbook not found: %s" % ports_path)
+        port_paths = [ports_path] if ports_path.is_file() else []
+    else:
+        port_paths = default_port_workbooks(cwd, info_all.name, form_path.name, report)
     port_sheets = read_port_workbooks(port_paths, report)
     attach_port_data(instances, port_sheets, report)
-    resolve_sdc_paths(instances, cwd, report)
+    if target_layout:
+        completeness = read_harden_sdc_manifest(
+            manifest_path, run_root, args.scenario, args.require_complete_harden_sdc, instances, report
+        )
+    else:
+        resolve_sdc_paths(instances, cwd, report)
+        completeness = RunCompleteness(
+            status="partial" if any(inst.sdc_status == "missing" for inst in instances.values()) else "complete",
+            available_instances=sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "available"),
+            missing_instances=sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "missing"),
+            manifest_path="<legacy inference>",
+        )
     current_digests = collect_current_sdc_digests(instances)
 
-    connections = read_connection_inventory(cwd / args.connection_inventory, report)
-    feedthroughs = read_feedthrough_inventory(cwd / args.feedthrough_inventory, report)
+    if target_layout:
+        relation_context = read_clock_relation_context(clock_path, clock_meta_path, relation_path, relation_meta_path, args.scenario, report)
+        if relation_context.run_completeness != completeness.status:
+            report.error(
+                "01/03 run_completeness=%s does not match current harden manifest %s"
+                % (relation_context.run_completeness, completeness.status)
+            )
+    else:
+        relation_context = RelationContext(scenario=args.scenario, run_completeness="unknown")
+        report.warn("legacy mode: clock relation map is not authoritative; keep clock_relation under manual review")
+    connections = read_connection_inventory(connection_path, args.scenario, report, require_scenario_scope=target_layout)
+    connection_inventory_digest = full_digest_file(connection_path) if connection_path.is_file() else ""
+    feedthroughs = read_feedthrough_edge_inventory(
+        feedthrough_path, args.scenario, completeness.status, report, require_metadata=target_layout
+    )
     channels = build_channels_from_inventories(instances, connections, feedthroughs, report)
-    active20 = read_20_active_budgets(cwd / args.twenty_form, args.scenario, args.stage, args.corner, report)
+    for channel in channels:
+        channel.scenario = args.scenario
+        channel.stage = "all"
+        channel.corner = "all"
+    if target_layout:
+        active20, twenty_states = read_20_channel_inventory_csv(
+            twenty_path, connection_inventory_digest, completeness.status,
+            args.scenario, args.stage, args.corner, report,
+        )
+    else:
+        active20 = read_20_active_budgets(twenty_path, args.scenario, args.stage, args.corner, report)
+        twenty_states = {}
+    feedthrough_inventory_digest = full_digest_file(feedthrough_path) if feedthrough_path.is_file() else "missing"
+    twenty_inventory_digest = full_digest_file(twenty_path) if twenty_path.is_file() else "missing"
+    report.info("10 feedthrough inventory SHA-256: %s" % feedthrough_inventory_digest)
+    report.info("20 channel inventory SHA-256: %s" % twenty_inventory_digest)
     delays, exceptions = extract_sdc_evidence(instances, report)
-    candidate_seeds, rule_seeds, log_items = create_candidate_and_rule_seeds(channels, delays, exceptions, active20, report)
+    candidate_seeds, rule_seeds, log_items = create_candidate_and_rule_seeds(
+        channels, delays, exceptions, active20, twenty_states, instances, relation_context,
+        completeness, port_accounting, report,
+    )
 
-    form_path = cwd / args.form
-    sync_workbook(form_path, candidate_seeds, rule_seeds, log_items, report)
+    if report.error_count == 0:
+        sync_workbook(
+            form_path, candidate_seeds, rule_seeds, log_items,
+            {
+                "Author": author_name(),
+                "Scenario": args.scenario,
+                "Run completeness": completeness.status,
+                "Port accounting": port_accounting,
+                "Connection inventory": str(connection_path.resolve()),
+                "Harden SDC manifest": str(manifest_path.resolve()) if manifest_path is not None else "<legacy inference>",
+                "10 feedthrough inventory": str(feedthrough_path.resolve()),
+                "10 feedthrough inventory SHA-256": feedthrough_inventory_digest,
+                "20 channel inventory": str(twenty_path.resolve()),
+                "20 channel inventory SHA-256": twenty_inventory_digest,
+                "03 relation map": str(relation_path.resolve()),
+            },
+            report,
+        )
+        if candidate_path:
+            write_candidates_csv(candidate_path, form_path)
+            report.info("wrote candidate inventory %s" % candidate_path)
 
-    rows = read_rule_rows(form_path)
-    validate_rows(rows, channels, active20, feedthroughs, args.scenario, args.stage, args.corner, current_digests, report)
+    rows = read_rule_rows(form_path) if form_path.is_file() else []
+    candidate_rows = read_candidate_rows(form_path) if form_path.is_file() else []
+    if rows and report.error_count == 0:
+        validate_rows(
+            rows, channels, active20, twenty_states, feedthroughs, relation_context,
+            args.scenario, args.stage, args.corner, current_digests, target_layout, report,
+        )
 
-    output_path = output_sdc_path(cwd, args.scenario, args.stage, args.corner)
-    rpt_path = Path(args.report) if args.report else report_path(cwd, args.scenario, args.stage, args.corner)
+    owner_inventories_complete = feedthrough_path.is_file() and twenty_path.is_file()
+    if target_layout and not owner_inventories_complete:
+        report.error("formal 30 generation requires current 10 and 20 owner inventories; candidate artifacts only")
+    if target_layout and not args.no_update_pending and not pending_dir.is_dir():
+        report.error("pending directory not found: %s" % pending_dir)
+    if args.no_update_pending:
+        report.warn("--no-update-pending: diagnostic/candidate-only run; accounting closure is not complete")
+
+    pending_plan = PendingPlan(removed_log_path=removed_log_path)
+    if report.error_count == 0 and (not report.sync_changed or args.force_generate_after_sync) and not args.no_update_pending:
+        pending_plan = prepare_pending_for_30(
+            run_root, pending_dir, removed_log_path, previous_removed_dirs,
+            rows, channels, args.scenario, args.stage, args.corner, report,
+        )
 
     generated = False
     if report.sync_changed and not args.force_generate_after_sync:
         report.warn("workbook changed during sync; review 30_harden_to_harden_exception.xlsx before SDC generation")
+    elif args.no_update_pending:
+        report.warn("formal SDC generation skipped because --no-update-pending is diagnostic-only")
     elif report.error_count == 0:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("\n".join(generate_sdc(rows, args.scenario, args.stage, args.corner)).rstrip() + "\n", encoding="utf-8")
+        atomic_write_text(output_path, "\n".join(generate_sdc(rows, args.scenario, args.stage, args.corner, completeness)).rstrip() + "\n")
         report.info("wrote %s" % output_path)
         generated = True
     else:
         report.warn("SDC generation skipped because errors were reported")
 
-    if generated and not args.no_update_pending and args.pending_root:
-        update_pending_for_30(cwd, cwd / args.pending_root, rows, channels, args.scenario, args.stage, args.corner, report)
+    if generated:
+        apply_pending_plan(run_root, pending_plan, report)
 
-    coverage_lines = build_coverage_lines(rows, channels, active20, args.scenario, args.stage, args.corner)
-    write_report(rpt_path, report, args.scenario, args.stage, args.corner, form_path, output_path, coverage_lines)
+    coverage_lines = build_coverage_lines(
+        rows, candidate_rows, channels, active20, twenty_states, feedthroughs,
+        args.scenario, args.stage, args.corner,
+    )
+    accounting_complete = generated and not args.no_update_pending and report.error_count == 0
+    write_report(
+        rpt_path, report, args.scenario, args.stage, args.corner,
+        form_path, output_path, coverage_lines, completeness, accounting_complete, port_accounting,
+    )
     print("Report: %s" % rpt_path)
+    print("Scenario: %s" % args.scenario)
+    print("Run completeness: %s" % completeness.status)
+    print("Port accounting: %s" % port_accounting)
     print("Warnings: %d  Errors: %d  Sync changed: %s" % (report.warning_count, report.error_count, report.sync_changed))
     if report.error_count:
         return 1

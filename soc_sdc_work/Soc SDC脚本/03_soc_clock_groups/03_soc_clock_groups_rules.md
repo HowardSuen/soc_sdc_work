@@ -20,12 +20,12 @@ set_clock_groups -physically_exclusive
 
 03 依赖当前 `01_middle/assembled/<scenario>/clock_inventory.csv` 定义的 effective clock universe，并通过 assembled meta 检查最终 01 SDC digest 和 clock set 一致性。manual overlay clock 必须进入当前 scenario assembled inventory 后才能被 03 使用。`--run-root` 模式强制使用 assembled inventory/meta；无 `--run-root` 时保留 legacy 相对路径模式用于旧工程迁移和回归。
 
-03 不直接读取或删除 `00_harden_port_inventory/pending/*.ports`。若某个 vector harden clock port 被 01 展开为 per-bit clock object，03 只按 01 inventory 中的实际 `clock_name` 分组；表单不得用整 bus/range 代替这些 clock name。
+03 不读取或删除任何 target/legacy pending。若某个 vector harden clock port 被 01 展开为 per-bit clock object，03 只按 01 inventory 中的实际 `clock_name` 分组；表单不得用整 bus/range 代替这些 clock name。
 
 01 assembled meta 可以是 partial。03 对当前已存在的 clock universe 继续生成 group、coverage 和 relation map，并在 relation-map meta/report 中传递 missing harden 列表和 `Run completeness: partial`。
 
 - active rule 引用的 clock 因 missing harden SDC 暂未进入 01 inventory 时，该 rule 标记 `blocked_by_missing_sdc`，不生成，但不阻断其它无关 rule。
-- 未进入当前 partial clock universe 的未知 clock 不参与 pair map；因此 `relation_map/<scenario>.meta` 必须记录 clock-universe digest 和 completeness，20/30 不得把缺失 clock 对应关系默认为 synchronous。
+- 未进入当前 partial clock universe 的未知 clock 不参与 pair map；因此 `relation_map/<scenario>.meta` 必须记录 clock-universe digest 和 completeness，10/20/30 不得把缺失 clock 对应关系默认为 synchronous。
 - active rule 引用不在 01 inventory 且无法追溯到 missing SDC 的 clock，仍是真实 error。
 
 ### 1.1 默认 STA 姿态
@@ -40,7 +40,7 @@ set_clock_groups -physically_exclusive
 
 ### 1.2 共享 clock relation 枚举
 
-03 是 SoC clock relationship 的权威来源。后续 20/30 若需要记录两端 clock 关系，必须使用同一套 canonical enum：
+03 是 SoC clock relationship 的权威来源。后续 10/20/30 若需要记录两端 clock 关系，必须使用同一套 canonical enum：
 
 ```text
 synchronous
@@ -335,7 +335,7 @@ note              人工备注
 示例：
 
 ```text
-scenario | group_id              | relation_type        | group_1_clocks        | group_2_clocks       | exclude_descendant_clocks | apply | review_status | basis
+scenario | group_id              | relation_type        | group_1_domains       | group_2_domains      | exclude_descendant_clocks | apply | review_status | basis
 common   | CG_ASYNC_CPU_AON_001  | asynchronous         | DOM_CPU                | DOM_AON               |                          | yes   | approved      | CDC spec section 3.2
 common   | CG_EXCL_PLL_MERGED_001| logically_exclusive  | DOM_PLL_FUNC           | DOM_PLL_BYPASS        |                          | yes   | approved      | all-mode merged view, mux select not case-fixed
 ```
@@ -343,6 +343,10 @@ common   | CG_EXCL_PLL_MERGED_001| logically_exclusive  | DOM_PLL_FUNC          
 `group_N_domains` 与 `group_N_clocks` 可以并用，解析后取并集。manual clock 较多的项目应优先维护 domain membership，再让 relation rule 引用 domain ID；`group_N_clocks` 保留给小范围直接成员和旧表单兼容。
 
 group 列不建议固定上限。脚本应识别所有满足 `group_<number>_domains` / `group_<number>_clocks` 命名的列；demo 表单可以先预留 8 或 16 组，但规则本身不限制为 4 组。
+
+允许中间 group 列留空，例如只填 `group_1_*` 和 `group_3_*`；coverage/relation provenance 必须保留原始 group number，不得把 `group_3` 重编号为 `group_2`。
+
+rule-level `exclude_descendant_clocks` 可排除 direct clock closure 或 `group_N_domains` 带入的 domain closure descendant；若对应 clock 只是 explicit domain member 而不是 descendant，仍应 warning。可复用的 domain 固定排除应优先写在 `clock_domain_membership` 的 `exclude_descendant` 行。
 
 对应生成示例：
 
@@ -459,10 +463,10 @@ machine interface:
 
 生成规则：
 
-- 只读取 `clock_group_rules`。
+- 读取 `clock_domain_membership` 解析人工 domain，只由 `clock_group_rules` 中的 active rule 生成 `set_clock_groups`；`clock_group_candidates` 不参与生成。
 - 只生成 `scenario = 当前 -scenario` 的行。
 - 只生成 `apply = yes` 且 `review_status = approved` 的行。
-- `group_1_clocks`、`group_2_clocks` 至少两个 group 非空。
+- 至少两个 numbered group 在合并 `group_N_domains` 与 `group_N_clocks` 后非空。
 - 自动识别所有 `group_<number>_clocks` 列，不把有效 group 数量限制在 4 组。
 - 自动识别所有 `group_<number>_domains` 列，将 resolved domain member 与同组 direct clock 取并集。
 - 每个 group 内至少一个 clock。
@@ -533,8 +537,8 @@ assembled_view_digest
 - `clock_universe_digest` 来自 `01_middle/assembled/<scenario>/clock_inventory.meta`。
 - `assembled_view_digest` 覆盖 scenario、active common/scenario rule、effective group、relation type 和 01 clock-universe digest。
 - `<scenario>.meta` 记录 schema version、resolved input/output absolute path、01 assembled inventory/meta digest、03 workbook semantic digest、workbook file digest、common/scenario 03 SDC digest 和 relation-map CSV digest。
-- 20/30 只能消费该 CSV，不得各自解析 coverage workbook 或重建 clock relation。
-- 20/30 使用 relation map 只做约束语义检查，不用它判定 port ownership，也不自动生成 exception。
+- 10/20/30 只能消费该 CSV，不得各自解析 coverage workbook 或重建 clock relation。
+- 10/20/30 使用 relation map 只做约束语义检查，不用它判定 port ownership，也不自动生成 exception。
 
 ### 7.3 Coverage Report
 
@@ -555,7 +559,7 @@ root_pair_summary
 - `pair_relation_map`：assembled view 中每个被 `set_clock_groups` 覆盖的 clock pair、relation type、来源 rule。
 - `uncovered_cross_root_pairs`：03 genealogy `tree_root` 不同、但未被任何 active clock group 覆盖的 clock pair；这些 pair 在 STA 中仍按默认 synchronous 分析。01 `root_source` 仅作为诊断参考列。
 - `root_pair_summary`：按 `tree_root_a/tree_root_b` 聚合 uncovered pair 数量和样例，避免大 SoC 中 pair 清单过长难以 review。
-- coverage workbook 中的 `pair_relation_map` sheet 是人工 review 视图；`03_middle/relation_map/<scenario>.csv` 才是 20/30 的机器接口。两者应来自同一份 assembled relation map，不得分别计算。
+- coverage workbook 中的 `pair_relation_map` sheet 是人工 review 视图；`03_middle/relation_map/<scenario>.csv` 才是 10/20/30 的机器接口。两者应来自同一份 assembled relation map，不得分别计算。
 
 注意：
 
@@ -582,7 +586,7 @@ root_pair_summary
 - 同一条 rule 中同一个 clock 不应同时出现在多个 group。
 - 同一条 rule 的 effective group 之间不应出现同一个 clock。
 - 若 explicit group 中的 clock 在 01 中存在 generated/forwarded descendants，则这些 descendants 必须进入同一 effective group，或出现在 `exclude_descendant_clocks` 并有明确 `basis` / `note`；否则至少 strong warning，signoff 模式建议 error。
-- `exclude_descendant_clocks` 中的 clock 必须确实是某个 explicit group clock 的 descendant，否则 warning。
+- `exclude_descendant_clocks` 中的 clock 必须确实是某个 direct explicit clock 或引用 domain seed/member closure 中的 descendant，否则 warning。
 - `relation_type = logically_exclusive` 时，auto-added descendants 必须在 report 中单独标记为需要 review；若 suspected mux merge / shared downstream clock 无法自动判定归属，应 warning，并要求人工放入正确 group 或加入 `exclude_descendant_clocks`。
 - common rule 的 `basis` 不能为空。
 - asynchronous rule 建议 `cdc_required = yes`，否则 warning。

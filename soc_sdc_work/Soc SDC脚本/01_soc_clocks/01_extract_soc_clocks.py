@@ -246,6 +246,9 @@ class ConnectionEdge:
     dst_port: str
     connection_type: str = ""
     validation_status: str = ""
+    schema_version: str = ""
+    scenario_scope: str = ""
+    source_row: int = 0
 
 
 @dataclass
@@ -524,16 +527,95 @@ def parse_endpoint_key(value: str) -> Tuple[str, str, str]:
     return "", "", ""
 
 
-def read_connection_inventory(path: Path, report: Report) -> Dict[Tuple[str, str], ConnectionEdge]:
+def scenario_scope_matches(value: str, scenario: str) -> bool:
+    scopes = {
+        item
+        for item in re.split(r"[,;|\s]+", clean_cell(value).lower())
+        if item
+    }
+    return "common" in scopes or scenario.lower() in scopes
+
+
+def read_connection_inventory(
+    path: Path,
+    report: Report,
+    scenario: str = "common",
+    strict_target: bool = False,
+) -> Dict[Tuple[str, str], ConnectionEdge]:
     edges: Dict[Tuple[str, str], ConnectionEdge] = {}
+    seen_connection_ids: Dict[str, int] = {}
     if not path.is_file():
         return edges
     with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
         reader = csv.DictReader(file_obj)
         if not reader.fieldnames:
-            report.warn(f"{path}: connection_inventory.csv has no header")
+            message = f"{path}: CONNECTION_INVENTORY_NO_HEADER"
+            (report.error if strict_target else report.warn)(message)
             return edges
+        if strict_target:
+            required = {
+                "schema_version",
+                "connection_id",
+                "scenario_scope",
+                "connection_type",
+                "src_instance",
+                "src_direction",
+                "src_port",
+                "src_bit_index",
+                "src_endpoint_key",
+                "src_soc_object",
+                "dst_instance",
+                "dst_direction",
+                "dst_port",
+                "dst_bit_index",
+                "dst_endpoint_key",
+                "dst_soc_object",
+                "fanout_index",
+                "range_source_expr",
+                "range_sink_expr",
+                "bit_pair_order",
+                "source_workbook",
+                "source_sheet",
+                "source_row",
+                "validation_status",
+                "owner_hint",
+                "note",
+            }
+            missing_fields = sorted(required - set(reader.fieldnames))
+            if missing_fields:
+                report.error(
+                    f"{path}: CONNECTION_INVENTORY_SCHEMA_UNSUPPORTED: missing field(s): "
+                    + ", ".join(missing_fields)
+                )
         for row_idx, row in enumerate(reader, start=2):
+            schema_version = clean_cell(row.get("schema_version"))
+            connection_id = clean_cell(row.get("connection_id"))
+            if strict_target:
+                if schema_version != "1":
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_SCHEMA_VERSION_UNSUPPORTED: "
+                        f"{schema_version or '<empty>'}"
+                    )
+                    continue
+                if not connection_id:
+                    report.error(f"{path.name} row {row_idx}: CONNECTION_ID_MISSING")
+                    continue
+                if connection_id in seen_connection_ids:
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_ID_DUPLICATE: {connection_id}; "
+                        f"first row={seen_connection_ids[connection_id]}"
+                    )
+                    continue
+                seen_connection_ids[connection_id] = row_idx
+            scenario_scope = clean_cell(row.get("scenario_scope"))
+            if strict_target:
+                if not scenario_scope:
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_SCENARIO_SCOPE_MISSING"
+                    )
+                    continue
+                if not scenario_scope_matches(scenario_scope, scenario):
+                    continue
             dst_inst = clean_cell(row.get("dst_instance"))
             dst_dir = clean_cell(row.get("dst_direction"))
             dst_port = clean_cell(row.get("dst_port"))
@@ -551,11 +633,26 @@ def read_connection_inventory(path: Path, report: Report) -> Dict[Tuple[str, str
                 src_dir = src_dir or key_dir
                 src_port = src_port or key_port
             if not (dst_inst and dst_port and src_port):
-                report.warn(f"{path.name} row {row_idx}: skipped connection edge with incomplete src/dst endpoint")
+                message = f"{path.name} row {row_idx}: CONNECTION_ENDPOINT_INCOMPLETE"
+                (report.error if strict_target else report.warn)(message)
                 continue
+            if strict_target:
+                if re.search(r"[\*:]", src_port) or re.search(r"[\*:]", dst_port):
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_ENDPOINT_NOT_CANONICAL_BIT: "
+                        f"{src_inst}/{src_port} -> {dst_inst}/{dst_port}"
+                    )
+                    continue
+                validation_status = clean_cell(row.get("validation_status")).lower()
+                if validation_status not in {"matched", "ok", "valid"}:
+                    report.warn(
+                        f"{path.name} row {row_idx}: CONNECTION_EDGE_NOT_MATCHED: "
+                        f"status={validation_status or '<empty>'}; edge ignored"
+                    )
+                    continue
             key = (dst_inst, dst_port)
             edge = ConnectionEdge(
-                connection_id=clean_cell(row.get("connection_id")),
+                connection_id=connection_id,
                 src_instance=src_inst,
                 src_direction=src_dir,
                 src_port=src_port,
@@ -564,16 +661,143 @@ def read_connection_inventory(path: Path, report: Report) -> Dict[Tuple[str, str
                 dst_port=dst_port,
                 connection_type=clean_cell(row.get("connection_type")),
                 validation_status=clean_cell(row.get("validation_status")),
+                schema_version=schema_version,
+                scenario_scope=scenario_scope,
+                source_row=row_idx,
             )
             if key in edges:
-                report.warn(
-                    f"{path.name} row {row_idx}: duplicate dst edge for {dst_inst}/{dst_port}; "
-                    f"keeping {edges[key].connection_id or 'first edge'}"
+                message = (
+                    f"{path.name} row {row_idx}: CONNECTION_DESTINATION_MULTI_DRIVER: "
+                    f"duplicate dst edge for {dst_inst}/{dst_port}; first="
+                    f"{edges[key].connection_id or '<unnamed>'}, second={edge.connection_id or '<unnamed>'}"
                 )
+                (report.error if strict_target else report.warn)(message)
                 continue
             edges[key] = edge
-    report.info(f"loaded {len(edges)} connection edge(s) from {path}")
+    report.info(
+        f"loaded {len(edges)} connection edge(s) from {path} for scenario={scenario}"
+    )
     return edges
+
+
+def attach_target_port(
+    instances: Dict[str, InstInfo],
+    inst_name: str,
+    direction: str,
+    port: str,
+    report: Report,
+    source: str,
+) -> None:
+    if inst_name not in instances:
+        return
+    maps = {
+        "input": instances[inst_name].inputs,
+        "output": instances[inst_name].outputs,
+        "inout": instances[inst_name].inouts,
+    }
+    if direction not in maps:
+        report.error(
+            f"{source}: TARGET_PORT_DIRECTION_INVALID: {inst_name}/{port} direction={direction or '<empty>'}"
+        )
+        return
+    for other_direction, port_map in maps.items():
+        if other_direction != direction and port in port_map:
+            report.error(
+                f"{source}: TARGET_PORT_DIRECTION_CONFLICT: {inst_name}/{port} "
+                f"appears as {other_direction} and {direction}"
+            )
+            return
+    maps[direction].setdefault(port, PortInfo(name=port, width="1", used_width="1"))
+
+
+def attach_ports_from_connections(
+    instances: Dict[str, InstInfo],
+    edges: Dict[Tuple[str, str], ConnectionEdge],
+    report: Report,
+) -> None:
+    for edge in edges.values():
+        source = f"connection_inventory.csv row {edge.source_row}"
+        attach_target_port(
+            instances, edge.src_instance, edge.src_direction, edge.src_port, report, source
+        )
+        attach_target_port(
+            instances, edge.dst_instance, edge.dst_direction, edge.dst_port, report, source
+        )
+
+
+def read_target_pending_ports(
+    pending_dir: Path,
+    instances: Dict[str, InstInfo],
+    report: Report,
+    required: bool,
+) -> None:
+    if not pending_dir.is_dir():
+        if required:
+            report.error(f"{pending_dir}: TARGET_UPSTREAM_PENDING_MISSING")
+        else:
+            report.warn(
+                f"{pending_dir}: TARGET_PENDING_UNAVAILABLE_FOR_PORT_VALIDATION: "
+                "only ports present in connection inventory can be validated"
+            )
+        return
+    for inst_name in sorted(instances):
+        path = pending_dir / f"{inst_name}.ports"
+        if not path.is_file():
+            if required:
+                report.error(f"{path}: TARGET_PENDING_INSTANCE_FILE_MISSING")
+            continue
+        seen: Set[Tuple[str, str]] = set()
+        for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                report.error(f"{path.name}:{line_no}: TARGET_PENDING_LINE_INVALID: {line}")
+                continue
+            direction, port = parts[0], parts[1]
+            if direction not in {"input", "output", "inout"}:
+                report.error(
+                    f"{path.name}:{line_no}: TARGET_PENDING_DIRECTION_INVALID: {direction}"
+                )
+                continue
+            if re.search(r"[\*:]", port):
+                report.error(
+                    f"{path.name}:{line_no}: TARGET_PENDING_PORT_NOT_CANONICAL_BIT: {port}"
+                )
+                continue
+            key = (direction, port)
+            if key in seen:
+                report.error(
+                    f"{path.name}:{line_no}: TARGET_PENDING_DUPLICATE_PORT: {direction} {port}"
+                )
+                continue
+            seen.add(key)
+            attach_target_port(
+                instances, inst_name, direction, port, report, f"{path.name}:{line_no}"
+            )
+
+
+def attach_ports_from_previous_01_removed(
+    log_dir: Path,
+    instances: Dict[str, InstInfo],
+    report: Report,
+) -> None:
+    if not log_dir.is_dir():
+        return
+    for path in sorted(log_dir.glob("*.removed")):
+        for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            key = removed_line_key(raw_line)
+            if key is None or key.inst_name not in instances:
+                continue
+            attach_target_port(
+                instances,
+                key.inst_name,
+                key.direction,
+                key.port_name,
+                report,
+                f"{path.name}:{line_no}",
+            )
 
 
 def parse_port_sheet(df: pd.DataFrame) -> Dict[str, Dict[str, PortInfo]]:
@@ -675,6 +899,7 @@ def apply_harden_sdc_manifest(
     scenario: str,
     require_complete: bool,
     report: Report,
+    authoritative: bool = False,
 ) -> RunCompleteness:
     if not manifest_path.is_file():
         report.error(f"{manifest_path}: HARDEN_SDC_MANIFEST_MISSING: required target runtime manifest is absent")
@@ -729,11 +954,23 @@ def apply_harden_sdc_manifest(
             )
             entries[inst_name] = entry
 
-    for inst_name in sorted(set(entries) - set(instances)):
-        report.error(
-            f"{manifest_path.name} row {entries[inst_name].source_row}: HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: "
-            f"{inst_name} is not present in info_all.xlsx"
-        )
+    if authoritative:
+        for inst_name, entry in sorted(entries.items()):
+            if not entry.module_name:
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: HARDEN_SDC_MANIFEST_MODULE_EMPTY: {inst_name}"
+                )
+            instances[inst_name] = InstInfo(
+                module_name=entry.module_name or inst_name,
+                inst_name=inst_name,
+            )
+        report.info(f"loaded {len(instances)} target instance(s) from {manifest_path.name}")
+    else:
+        for inst_name in sorted(set(entries) - set(instances)):
+            report.error(
+                f"{manifest_path.name} row {entries[inst_name].source_row}: HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: "
+                f"{inst_name} is not present in info_all.xlsx"
+            )
 
     available: List[str] = []
     missing: List[str] = []
@@ -1600,6 +1837,7 @@ def process_instance(
     inst: InstInfo,
     report: Report,
     connection_by_dst: Dict[Tuple[str, str], ConnectionEdge],
+    strict_connections: bool = False,
 ) -> List[ClockRecord]:
     if not inst.sdc_path:
         return []
@@ -1688,6 +1926,43 @@ def process_instance(
             issue = harden_clock_issue(inst, cmd, target_rule_id, target_message)
             report.error(issue)
             continue
+
+        if strict_connections and direction == "input":
+            canonical_port = lookup_port(inst, port).canonical_port
+            if (inst.inst_name, canonical_port) not in connection_by_dst:
+                note = (
+                    "target mode requires one matched exact 00 connection edge for every boundary input clock"
+                )
+                records.append(
+                    ClockRecord(
+                        inst_name=inst.inst_name,
+                        module_name=inst.module_name,
+                        port_name=port,
+                        direction=direction,
+                        clock_name=name_map.get(cmd.original_name, clock_name_for(inst.inst_name, port)),
+                        clock_kind=command_kind(cmd),
+                        period=cmd.period,
+                        waveform=cmd.waveform,
+                        direct_source="",
+                        root_source="",
+                        from_whom="",
+                        original_sdc=inst.sdc_path.name,
+                        original_clock_name=cmd.original_name,
+                        final_action="skipped",
+                        note=note,
+                        source_line=cmd.source_line,
+                        original_command=cmd.raw,
+                    )
+                )
+                report.error(
+                    harden_clock_issue(
+                        inst,
+                        cmd,
+                        "CLOCK_INPUT_EXACT_EDGE_MISSING",
+                        note,
+                    )
+                )
+                continue
 
         test_tokens = test_like_clock_tokens(cmd)
         if test_tokens:
@@ -2557,6 +2832,8 @@ def write_sdc(
     records: List[ClockRecord],
     report: Report,
     completeness: RunCompleteness,
+    scenario: str,
+    target_layout: bool,
 ) -> None:
     emitted = dependency_ordered_emitted(records, report)
     lines = [
@@ -2565,10 +2842,15 @@ def write_sdc(
         f"# Author: {author_name()}",
         "# Stage: 01_soc_clocks",
         "# Script: 01_extract_soc_clocks.py",
+        f"# Scenario: {scenario}",
     ]
     lines.extend(completeness_lines(completeness, "# "))
     lines.extend([
-        "# Source: local info_all.xlsx, port_*.xlsx and harden SoC integration SDC files",
+        (
+            "# Source: 00 manifest/connection inventory and harden SoC integration SDC files"
+            if target_layout
+            else "# Source: local info_all.xlsx, port_*.xlsx and harden SoC integration SDC files"
+        ),
         "################################################################################",
         "",
     ])
@@ -2628,6 +2910,8 @@ def write_report(
     report: Report,
     records: List[ClockRecord],
     completeness: RunCompleteness,
+    scenario: str,
+    port_accounting_enabled: bool,
 ) -> None:
     action_counts: Dict[str, int] = {}
     for rec in records:
@@ -2639,6 +2923,12 @@ def write_report(
         f"Author: {author_name()}",
         "Stage: 01_soc_clocks",
         "Script: 01_extract_soc_clocks.py",
+        f"Scenario: {scenario}",
+        (
+            "Port accounting: enabled"
+            if port_accounting_enabled
+            else "Port accounting: disabled by explicit option"
+        ),
         "",
     ]
     lines.extend(completeness_lines(completeness))
@@ -3143,6 +3433,10 @@ def _main(argv: Sequence[str]) -> int:
         args.no_write_sdc = True
         args.no_update_pending = True
     debug_enabled = args.debug or bool(args.debug_dir) or args.debug_verbose
+    if args.no_update_pending:
+        report.info(
+            "Port accounting: disabled by explicit option; pending closure is not claimed"
+        )
 
     if args.scenario != "common":
         print("ERROR: current 01 implementation supports only --scenario common", file=sys.stderr)
@@ -3170,7 +3464,7 @@ def _main(argv: Sequence[str]) -> int:
     report_path = resolve_path(
         run_root if target_layout else cwd,
         args.report,
-        "01_result/reports/clock_check_report.txt" if target_layout else "clock_check_report.txt",
+        f"01_result/reports/clock_check_report_{args.scenario}.txt" if target_layout else "clock_check_report.txt",
     )
     virtual_path = resolve_path(input_root, args.virtual_clocks, "virtual_clocks.csv")
     manual_path = resolve_path(input_root, args.manual_clocks, "01_soc_clocks_manual.sdc")
@@ -3195,9 +3489,11 @@ def _main(argv: Sequence[str]) -> int:
             pending_base = resolve_path(run_root, args.pending_root, args.pending_root)
             pending_dir = pending_base / "pending"
         else:
-            pending_dir = run_root / "00_middle/scenario/common/pending"
-        removed_log_dir = run_root / "01_middle/scenario/common/removed_log"
+            pending_dir = run_root / f"00_middle/scenario/{args.scenario}/pending"
+        removed_log_dir = run_root / f"01_middle/scenario/{args.scenario}/removed_log"
         common_meta_path: Optional[Path] = run_root / "01_middle/common/clock_inventory.meta"
+        scenario_inventory_path: Optional[Path] = run_root / f"01_middle/scenario/{args.scenario}/clock_inventory.csv"
+        scenario_meta_path: Optional[Path] = run_root / f"01_middle/scenario/{args.scenario}/clock_inventory.meta"
         assembled_inventory_path: Optional[Path] = run_root / "01_middle/assembled/common/clock_inventory.csv"
         assembled_meta_path: Optional[Path] = run_root / "01_middle/assembled/common/clock_inventory.meta"
     else:
@@ -3205,6 +3501,8 @@ def _main(argv: Sequence[str]) -> int:
         pending_dir = pending_base / "pending"
         removed_log_dir = pending_base / "removed_log"
         common_meta_path = None
+        scenario_inventory_path = None
+        scenario_meta_path = None
         assembled_inventory_path = None
         assembled_meta_path = None
 
@@ -3214,8 +3512,11 @@ def _main(argv: Sequence[str]) -> int:
         "01_middle/debug/01_soc_clocks" if target_layout else "debug/01_soc_clocks",
     )
 
+    report.info(f"scenario: {args.scenario}")
+    report.info(f"runtime layout: {'target' if target_layout else 'legacy'}")
     report.info(f"resolved input root: {input_root.resolve()}")
-    report.info(f"resolved info workbook: {info_path.resolve()}")
+    if not target_layout:
+        report.info(f"resolved info workbook: {info_path.resolve()}")
     report.info(f"resolved connection inventory: {connection_path.resolve()}")
     report.info(f"resolved output SDC: {output_path.resolve()}")
     report.info(f"resolved output inventory: {inventory_path.resolve()}")
@@ -3224,31 +3525,10 @@ def _main(argv: Sequence[str]) -> int:
         report.info(f"resolved harden SDC manifest: {manifest_path.resolve()}")
     if debug_enabled:
         report.info(f"resolved debug directory: {debug_dir.resolve()}")
-    if not info_path.is_file():
-        print(f"ERROR: info workbook not found in execution directory: {info_path}", file=sys.stderr)
-        return 2
-
-    try:
-        instances = read_info_all(info_path, report)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-
-    if args.port_files:
-        port_files = [resolve_path(input_root, item, item) for item in args.port_files]
-    else:
-        port_files = default_port_files(input_root, info_path.name)
-    if not port_files:
-        print("ERROR: no owner port workbook found. Expected local port_*.xlsx or --port-files.", file=sys.stderr)
-        return 2
-    missing_ports = [str(path) for path in port_files if not path.is_file()]
-    if missing_ports:
-        print(f"ERROR: port workbook(s) not found: {', '.join(missing_ports)}", file=sys.stderr)
-        return 2
-
-    sheets = read_port_workbooks(port_files, report)
-    attach_port_data(instances, sheets, report)
-    if manifest_path is not None:
+    port_files: List[Path] = []
+    if target_layout:
+        instances: Dict[str, InstInfo] = {}
+        assert manifest_path is not None
         completeness = apply_harden_sdc_manifest(
             instances,
             manifest_path,
@@ -3256,8 +3536,49 @@ def _main(argv: Sequence[str]) -> int:
             args.scenario,
             args.require_complete_harden_sdc,
             report,
+            authoritative=True,
         )
+        if not connection_path.is_file():
+            report.error(
+                f"{connection_path}: TARGET_UPSTREAM_CONNECTION_INVENTORY_MISSING: "
+                "target runtime requires the fixed 00 connection inventory"
+            )
+        connection_by_dst = read_connection_inventory(
+            connection_path,
+            report,
+            scenario=args.scenario,
+            strict_target=True,
+        )
+        attach_ports_from_connections(instances, connection_by_dst, report)
+        read_target_pending_ports(
+            pending_dir,
+            instances,
+            report,
+            required=not args.no_update_pending,
+        )
+        attach_ports_from_previous_01_removed(removed_log_dir, instances, report)
     else:
+        if not info_path.is_file():
+            print(f"ERROR: info workbook not found in execution directory: {info_path}", file=sys.stderr)
+            return 2
+        try:
+            instances = read_info_all(info_path, report)
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        if args.port_files:
+            port_files = [resolve_path(input_root, item, item) for item in args.port_files]
+        else:
+            port_files = default_port_files(input_root, info_path.name)
+        if not port_files:
+            print("ERROR: no owner port workbook found. Expected local port_*.xlsx or --port-files.", file=sys.stderr)
+            return 2
+        missing_ports = [str(path) for path in port_files if not path.is_file()]
+        if missing_ports:
+            print(f"ERROR: port workbook(s) not found: {', '.join(missing_ports)}", file=sys.stderr)
+            return 2
+        sheets = read_port_workbooks(port_files, report)
+        attach_port_data(instances, sheets, report)
         completeness = resolve_sdc_paths(instances, input_root, report)
         if args.require_complete_harden_sdc and completeness.missing_instances:
             report.error(
@@ -3265,21 +3586,20 @@ def _main(argv: Sequence[str]) -> int:
                 + ", ".join(completeness.missing_instances)
             )
 
-    if target_layout and not connection_path.is_file():
-        report.error(
-            f"{connection_path}: TARGET_UPSTREAM_CONNECTION_INVENTORY_MISSING: "
-            "target runtime requires the fixed 00 connection inventory"
+        connection_by_dst = read_connection_inventory(
+            connection_path, report, scenario=args.scenario, strict_target=False
         )
-    if target_layout and not args.no_update_pending and not pending_dir.is_dir():
-        report.error(
-            f"{pending_dir}: TARGET_UPSTREAM_PENDING_MISSING: "
-            "target runtime requires the scenario pending directory unless --no-update-pending is used"
-        )
-    connection_by_dst = read_connection_inventory(connection_path, report)
 
     records: List[ClockRecord] = missing_sdc_records(instances, completeness)
     for inst_name in sorted(instances):
-        records.extend(process_instance(instances[inst_name], report, connection_by_dst))
+        records.extend(
+            process_instance(
+                instances[inst_name],
+                report,
+                connection_by_dst,
+                strict_connections=target_layout,
+            )
+        )
     dedupe_top_clocks(records, report)
     records.extend(virtual_clock_records(read_virtual_clock_csv(virtual_path, report)))
     dedupe_virtual_clocks(records, report)
@@ -3295,7 +3615,14 @@ def _main(argv: Sequence[str]) -> int:
         rec.missing_instances = missing_text
 
     if not args.no_write_sdc:
-        write_sdc(output_path, records, report, completeness)
+        write_sdc(
+            output_path,
+            records,
+            report,
+            completeness,
+            args.scenario,
+            target_layout,
+        )
         final_digest = sha256_file(output_path)
         for rec in records:
             if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command:
@@ -3311,20 +3638,44 @@ def _main(argv: Sequence[str]) -> int:
             update_pending_for_01(run_root, pending_dir, removed_log_dir, records, report)
     if target_layout and not args.no_write_sdc:
         assert common_meta_path is not None
+        assert scenario_inventory_path is not None
+        assert scenario_meta_path is not None
         assert assembled_inventory_path is not None
         assert assembled_meta_path is not None
-        write_inventory_meta(common_meta_path, "common", output_path, inventory_path, records, completeness)
+        write_inventory_meta(common_meta_path, args.scenario, output_path, inventory_path, records, completeness)
+        write_inventory(scenario_inventory_path, records)
+        write_inventory_meta(
+            scenario_meta_path,
+            args.scenario,
+            output_path,
+            scenario_inventory_path,
+            records,
+            completeness,
+        )
         write_inventory(assembled_inventory_path, records)
-        write_inventory_meta(assembled_meta_path, "common", output_path, assembled_inventory_path, records, completeness)
+        write_inventory_meta(
+            assembled_meta_path,
+            args.scenario,
+            output_path,
+            assembled_inventory_path,
+            records,
+            completeness,
+        )
     if debug_enabled:
         report.info(f"writing offline debug bundle to {debug_dir.resolve()}")
-    write_report(report_path, report, records, completeness)
+    write_report(
+        report_path,
+        report,
+        records,
+        completeness,
+        args.scenario,
+        port_accounting_enabled=not args.no_update_pending,
+    )
 
     if debug_enabled:
         resolved_paths = {
             "run_root": run_root,
             "input_root": input_root,
-            "info": info_path,
             "connection_inventory": connection_path,
             "pending_dir": pending_dir,
             "removed_log_dir": removed_log_dir,
@@ -3333,10 +3684,14 @@ def _main(argv: Sequence[str]) -> int:
             "output_report": report_path,
             "debug_dir": debug_dir,
         }
+        if not target_layout:
+            resolved_paths["info"] = info_path
         if manifest_path is not None:
             resolved_paths["harden_sdc_manifest"] = manifest_path
-        input_paths: List[Path] = [info_path, connection_path, virtual_path, manual_path]
-        input_paths.extend(port_files)
+        input_paths: List[Path] = [connection_path, virtual_path, manual_path]
+        if not target_layout:
+            input_paths.append(info_path)
+            input_paths.extend(port_files)
         input_paths.extend(
             inst.sdc_path for inst in instances.values() if inst.sdc_path is not None
         )

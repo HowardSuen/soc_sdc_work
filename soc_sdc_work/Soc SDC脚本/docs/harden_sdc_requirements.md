@@ -12,6 +12,17 @@ harden 交付的 SoC integration SDC 必须显式声明 harden output clock。
 
 因此，所有会从 harden input clock 转发到 harden output clock 的路径，都应在 harden SoC integration SDC 中明确表达；SoC 侧不依赖工具自动穿透 harden 推断 output clock。
 
+### 0.1 交付时间与 SoC 部分运行
+
+本文定义的是 harden SDC **最终交付质量要求**，不要求所有 harden 在项目同一时刻完成交付。
+
+- 项目推进中，SoC SDC 脚本允许基于已到位 harden SDC 进行 partial-availability 解析。
+- 未到位 harden 在 availability manifest 中标记 `missing`，不得用近似文件或其它 scenario SDC 静默代替。
+- missing 只表示交付进度，不表示该 harden 无 clock、无 timing contract 或无 exception。相关 SoC pending 项继续保留。
+- 到 SoC SDC 正式交付/signoff 冻结时，必须启用 complete gate，并要求所有 required harden SDC 按本文完成交付。
+
+因此 partial run 不降低 harden 最终交付标准；它只是允许 SoC 侧在交付过程中提前生成已具备证据的部分结果。
+
 ## 1. 交付文件定位
 
 harden 应交付的是 **SoC integration SDC**，不是 harden 内部 signoff full SDC。
@@ -141,7 +152,7 @@ create_generated_clock \
 
 ## 4. SoC 侧使用原则
 
-SoC 侧生成 `common/01_soc_clocks.sdc` 时，按 clock producer 建 clock：
+SoC 侧生成 `01_result/common/01_soc_clocks.sdc` 和对应 scenario overlay 时，按 clock producer 建 clock：
 
 - SoC 顶层 pad/ref/test 输入 clock：在 SoC 顶层 port 或明确 clock root 上 `create_clock`。
 - harden output clock：主要从 harden SoC integration SDC 提取，并映射到 SoC 实例 output pin。
