@@ -189,6 +189,12 @@ PAD_HEADERS = [
     "is_gpio_or_inout",
     "related_scenarios",
     "source_sdc_status",
+    "connection_id",
+    "scenario_scope",
+    "connection_type",
+    "source_workbook",
+    "source_sheet",
+    "source_row",
     "note",
 ]
 
@@ -260,6 +266,12 @@ class PadRecord:
     is_gpio_or_inout: str = "no"
     related_scenarios: str = ""
     source_sdc_status: str = ""
+    connection_id: str = ""
+    scenario_scope: str = ""
+    connection_type: str = ""
+    source_workbook: str = ""
+    source_sheet: str = ""
+    source_row: str = ""
     note: str = ""
 
 
@@ -279,6 +291,7 @@ class ExtractedConstraint:
     parse_status: str
     mapped_soc_object: str
     message: str = ""
+    include_in_form: bool = True
 
 
 @dataclass
@@ -325,13 +338,24 @@ class RunCompleteness:
 @dataclass(frozen=True)
 class ConnectionEdge:
     connection_id: str
+    scenario_scope: str
+    connection_type: str
     src_instance: str
     src_direction: str
     src_port: str
+    src_endpoint_key: str
+    src_soc_object: str
     dst_instance: str
     dst_direction: str
     dst_port: str
+    dst_endpoint_key: str
+    dst_soc_object: str
     validation_status: str = ""
+    owner_hint: str = ""
+    source_workbook: str = ""
+    source_sheet: str = ""
+    source_row: str = ""
+    note: str = ""
 
 
 @dataclass
@@ -634,6 +658,7 @@ def apply_harden_sdc_manifest(
     scenario: str,
     require_complete: bool,
     report: Report,
+    create_instances: bool = False,
 ) -> RunCompleteness:
     error_count_before = report.error_count
     if not manifest_path.is_file():
@@ -679,11 +704,23 @@ def apply_harden_sdc_manifest(
                 source_row=row_idx,
             )
 
-    for inst_name in sorted(set(entries) - set(instances)):
-        report.error(
-            f"{manifest_path.name} row {entries[inst_name].source_row}: "
-            f"HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: {inst_name}"
-        )
+    if create_instances:
+        for inst_name, entry in sorted(entries.items()):
+            if not entry.module_name:
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: "
+                    f"HARDEN_SDC_MANIFEST_MODULE_EMPTY: {inst_name}"
+                )
+            instances[inst_name] = InstInfo(
+                module_name=entry.module_name or inst_name,
+                inst_name=inst_name,
+            )
+    else:
+        for inst_name in sorted(set(entries) - set(instances)):
+            report.error(
+                f"{manifest_path.name} row {entries[inst_name].source_row}: "
+                f"HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: {inst_name}"
+            )
 
     available: List[str] = []
     missing: List[str] = []
@@ -804,7 +841,71 @@ def resolve_sdc_paths(instances: Dict[str, InstInfo], cwd: Path, report: Report)
     )
 
 
-def read_connection_inventory(path: Path, report: Report) -> List[ConnectionEdge]:
+TARGET_CONNECTION_FIELDS = {
+    "schema_version",
+    "connection_id",
+    "scenario_scope",
+    "connection_type",
+    "src_instance",
+    "src_direction",
+    "src_port",
+    "src_bit_index",
+    "src_endpoint_key",
+    "src_soc_object",
+    "dst_instance",
+    "dst_direction",
+    "dst_port",
+    "dst_bit_index",
+    "dst_endpoint_key",
+    "dst_soc_object",
+    "fanout_index",
+    "range_source_expr",
+    "range_sink_expr",
+    "bit_pair_order",
+    "source_workbook",
+    "source_sheet",
+    "source_row",
+    "validation_status",
+    "owner_hint",
+    "note",
+}
+PAD_CONNECTION_TYPES = {"top_pad_to_harden", "harden_to_top_pad", "pad_to_pad"}
+CONNECTION_TYPES = {
+    "harden_to_harden",
+    "fabric_to_harden",
+    "harden_to_fabric",
+    "top_pad_to_harden",
+    "harden_to_top_pad",
+    "pad_to_pad",
+    "clock_connection",
+    "feedthrough_candidate",
+    "constant_tie",
+    "no_connect",
+    "unknown",
+}
+
+
+def scenario_scope_matches(value: str, scenario: str) -> bool:
+    scopes = {
+        normalize_key(item)
+        for item in re.split(r"[,;|\s]+", clean_cell(value))
+        if normalize_key(item)
+    }
+    if not scopes:
+        scopes = {"common"}
+    return "common" in scopes or normalize_key(scenario) in scopes
+
+
+def endpoint_key(instance: str, direction: str, port: str) -> str:
+    return f"{instance}:{direction}:{port}"
+
+
+def read_connection_inventory(
+    path: Path,
+    report: Report,
+    scenario: str = "common",
+    strict_schema: bool = False,
+) -> List[ConnectionEdge]:
     edges: List[ConnectionEdge] = []
     required = {
         "connection_id", "src_instance", "src_direction", "src_port",
@@ -813,7 +914,7 @@ def read_connection_inventory(path: Path, report: Report) -> List[ConnectionEdge
     with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
         reader = csv.DictReader(file_obj)
         fields = set(reader.fieldnames or [])
-        missing = sorted(required - fields)
+        missing = sorted((TARGET_CONNECTION_FIELDS if strict_schema else required) - fields)
         if missing:
             report.error(f"{path}: CONNECTION_INVENTORY_SCHEMA_ERROR: missing field(s): {', '.join(missing)}")
             return edges
@@ -827,24 +928,186 @@ def read_connection_inventory(path: Path, report: Report) -> List[ConnectionEdge
                 report.error(f"{path.name} row {row_idx}: CONNECTION_ID_DUPLICATE: {connection_id}")
                 continue
             seen_ids.add(connection_id)
+            scenario_scope = clean_cell(row.get("scenario_scope")) or "common"
+            raw_scopes = [
+                normalize_key(item)
+                for item in re.split(r"[,;|\s]+", clean_cell(row.get("scenario_scope")))
+                if normalize_key(item)
+            ]
+            if strict_schema and not raw_scopes:
+                report.error(f"{path.name} row {row_idx}: CONNECTION_SCENARIO_SCOPE_EMPTY: {connection_id}")
+            invalid_scopes = sorted(set(raw_scopes) - SCENARIOS)
+            if invalid_scopes:
+                report.error(
+                    f"{path.name} row {row_idx}: CONNECTION_SCENARIO_SCOPE_INVALID: "
+                    f"{connection_id} scope={','.join(invalid_scopes)}"
+                )
+            if not scenario_scope_matches(scenario_scope, scenario):
+                continue
             edge = ConnectionEdge(
                 connection_id=connection_id,
+                scenario_scope=scenario_scope,
+                connection_type=normalize_key(row.get("connection_type")),
                 src_instance=clean_cell(row.get("src_instance")),
                 src_direction=normalize_key(row.get("src_direction")),
                 src_port=clean_cell(row.get("src_port")),
+                src_endpoint_key=clean_cell(row.get("src_endpoint_key")),
+                src_soc_object=clean_cell(row.get("src_soc_object")),
                 dst_instance=clean_cell(row.get("dst_instance")),
                 dst_direction=normalize_key(row.get("dst_direction")),
                 dst_port=clean_cell(row.get("dst_port")),
+                dst_endpoint_key=clean_cell(row.get("dst_endpoint_key")),
+                dst_soc_object=clean_cell(row.get("dst_soc_object")),
                 validation_status=normalize_key(row.get("validation_status")),
+                owner_hint=clean_cell(row.get("owner_hint")),
+                source_workbook=clean_cell(row.get("source_workbook")),
+                source_sheet=clean_cell(row.get("source_sheet")),
+                source_row=clean_cell(row.get("source_row")) or str(row_idx),
+                note=clean_cell(row.get("note")),
             )
-            if edge.validation_status and edge.validation_status != "matched":
+            if edge.validation_status != "matched":
                 report.error(
                     f"{path.name} row {row_idx}: CONNECTION_NOT_MATCHED: "
-                    f"{connection_id} status={edge.validation_status}"
+                    f"{connection_id} status={edge.validation_status or '<empty>'}"
                 )
+            if edge.connection_type not in CONNECTION_TYPES:
+                report.error(
+                    f"{path.name} row {row_idx}: CONNECTION_TYPE_INVALID: "
+                    f"{connection_id} type={edge.connection_type or '<empty>'}"
+                )
+            for side, instance, direction, port, key in (
+                ("src", edge.src_instance, edge.src_direction, edge.src_port, edge.src_endpoint_key),
+                ("dst", edge.dst_instance, edge.dst_direction, edge.dst_port, edge.dst_endpoint_key),
+            ):
+                if direction not in {"input", "output", "inout"}:
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_DIRECTION_INVALID: "
+                        f"{connection_id} {side}_direction={direction or '<empty>'}"
+                    )
+                if not PORT_BIT_RE.fullmatch(port):
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_PORT_NONCANONICAL: "
+                        f"{connection_id} {side}_port={port or '<empty>'}"
+                    )
+                expected_key = endpoint_key(instance, direction, port)
+                if strict_schema and not key:
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_ENDPOINT_KEY_EMPTY: {connection_id} {side}"
+                    )
+                elif key and key != expected_key:
+                    report.error(
+                        f"{path.name} row {row_idx}: CONNECTION_ENDPOINT_KEY_MISMATCH: "
+                        f"{connection_id} {side}={key}, expected={expected_key}"
+                    )
             edges.append(edge)
-    report.info(f"loaded {len(edges)} connection edge(s) from {path}")
+    report.info(f"loaded {len(edges)} connection edge(s) for scenario={scenario} from {path}")
     return edges
+
+
+def attach_target_pad_edges(
+    instances: Dict[str, InstInfo],
+    edges: Sequence[ConnectionEdge],
+    report: Report,
+) -> List[PadRecord]:
+    pads: List[PadRecord] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+
+    for edge in edges:
+        if edge.connection_type not in PAD_CONNECTION_TYPES:
+            continue
+        src_top = normalize_key(edge.src_instance) == "top"
+        dst_top = normalize_key(edge.dst_instance) == "top"
+        if edge.connection_type == "top_pad_to_harden" and not (src_top and not dst_top):
+            report.error(f"{edge.connection_id}: PAD_CONNECTION_TYPE_TOPOLOGY_MISMATCH: top_pad_to_harden")
+            continue
+        if edge.connection_type == "harden_to_top_pad" and not (dst_top and not src_top):
+            report.error(f"{edge.connection_id}: PAD_CONNECTION_TYPE_TOPOLOGY_MISMATCH: harden_to_top_pad")
+            continue
+        if src_top == dst_top:
+            report.warn(
+                f"{edge.connection_id}: pad-related edge does not have exactly one top endpoint; "
+                "kept out of harden pad inventory"
+            )
+            continue
+        if src_top:
+            top_port = edge.src_port
+            harden_name = edge.dst_instance
+            harden_direction = edge.dst_direction
+            harden_port = edge.dst_port
+        else:
+            top_port = edge.dst_port
+            harden_name = edge.src_instance
+            harden_direction = edge.src_direction
+            harden_port = edge.src_port
+
+        inst = instances.get(harden_name)
+        if inst is None:
+            report.error(
+                f"{edge.connection_id}: PAD_EDGE_INSTANCE_NOT_IN_MANIFEST: {harden_name}"
+            )
+            continue
+        if edge.owner_hint and not inst.owner:
+            inst.owner = edge.owner_hint
+        port = PortInfo(name=harden_port)
+        if harden_direction == "input":
+            port.from_whom = f"top.{top_port}"
+            existing = inst.inputs.get(harden_port)
+            if existing and existing.from_whom != port.from_whom:
+                report.error(
+                    f"{edge.connection_id}: PAD_PORT_MAPPING_CONFLICT: "
+                    f"{harden_name}/{harden_port} maps to both {existing.from_whom} and {port.from_whom}"
+                )
+                continue
+            inst.inputs[harden_port] = port
+        elif harden_direction == "output":
+            port.to_top = f"top.{top_port}"
+            existing = inst.outputs.get(harden_port)
+            if existing and existing.to_top != port.to_top:
+                report.error(
+                    f"{edge.connection_id}: PAD_PORT_MAPPING_CONFLICT: "
+                    f"{harden_name}/{harden_port} maps to both {existing.to_top} and {port.to_top}"
+                )
+                continue
+            inst.outputs[harden_port] = port
+        elif harden_direction == "inout":
+            port.inout_name = top_port
+            existing = inst.inouts.get(harden_port)
+            if existing and existing.inout_name != port.inout_name:
+                report.error(
+                    f"{edge.connection_id}: PAD_PORT_MAPPING_CONFLICT: "
+                    f"{harden_name}/{harden_port} maps to both {existing.inout_name} and {port.inout_name}"
+                )
+                continue
+            inst.inouts[harden_port] = port
+        else:
+            continue
+
+        key = (top_port, harden_name, harden_port, harden_direction)
+        if key in seen:
+            report.error(f"{edge.connection_id}: PAD_EDGE_DUPLICATE_MAPPING: {key}")
+            continue
+        seen.add(key)
+        pads.append(
+            PadRecord(
+                pad_name=top_port,
+                soc_top_port=top_port,
+                subsys_instance=harden_name,
+                subsys_port=harden_port,
+                direction=harden_direction,
+                is_gpio_or_inout="yes" if harden_direction == "inout" else "no",
+                related_scenarios="gpio_in,gpio_out" if harden_direction == "inout" else "",
+                source_sdc_status=inst.sdc_status,
+                connection_id=edge.connection_id,
+                scenario_scope=edge.scenario_scope,
+                connection_type=edge.connection_type,
+                source_workbook=edge.source_workbook,
+                source_sheet=edge.source_sheet,
+                source_row=edge.source_row,
+                note=edge.note,
+            )
+        )
+    report.info(f"derived {len(pads)} pad record(s) from 00 connection inventory")
+    return pads
 
 
 def validate_pad_connections(pads: Sequence[PadRecord], edges: Sequence[ConnectionEdge], report: Report) -> None:
@@ -1479,9 +1742,12 @@ def extract_constraints_from_instance(inst: InstInfo, scenario: str, report: Rep
 
         if ctype == "dont_touch_network" and unresolved:
             status = "needs_review"
-        if not values["pad_name"] and ctype != "false_path":
-            status = "needs_review"
-            rewrite_msg = "; ".join(filter(None, [rewrite_msg, "no SoC pad inferred"]))
+        include_in_form = bool(values["pad_name"])
+        if not include_in_form:
+            status = "out_of_scope_non_pad"
+            rewrite_msg = "; ".join(
+                filter(None, [rewrite_msg, "no 00 pad edge maps this constraint; kept in extraction_log only"])
+            )
 
         values["note"] = rewrite_msg
         results.append(
@@ -1490,9 +1756,14 @@ def extract_constraints_from_instance(inst: InstInfo, scenario: str, report: Rep
                 parse_status=status,
                 mapped_soc_object=mapped_obj or values["soc_object"],
                 message=rewrite_msg,
+                include_in_form=include_in_form,
             )
         )
-    report.info(f"extracted {len(results)} IO/pad candidate(s) from {inst.sdc_path.name}")
+    form_count = sum(1 for item in results if item.include_in_form)
+    report.info(
+        f"extracted {form_count} IO/pad candidate(s) and logged "
+        f"{len(results) - form_count} out-of-scope command(s) from {inst.sdc_path.name}"
+    )
     return results
 
 
@@ -1705,6 +1976,8 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
         if any(clean_cell(ws_io.cell(row=row_idx, column=col).value) for col in range(1, ws_io.max_column + 1))
     }
     for item in extracted:
+        if not item.include_in_form:
+            continue
         key = form_row_key(item.values)
         if key not in existing_keys:
             append_dict(ws_io, IO_HEADERS, item.values, NEW_FILL)
@@ -1729,6 +2002,12 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
             "is_gpio_or_inout": pad.is_gpio_or_inout,
             "related_scenarios": pad.related_scenarios,
             "source_sdc_status": pad.source_sdc_status,
+            "connection_id": pad.connection_id,
+            "scenario_scope": pad.scenario_scope,
+            "connection_type": pad.connection_type,
+            "source_workbook": pad.source_workbook,
+            "source_sheet": pad.source_sheet,
+            "source_row": pad.source_row,
             "note": pad.note,
         }
         key = pad_key(values)
@@ -1863,6 +2142,23 @@ def row_selected_for_assembled(row: FormRow, scenario: str, stage: str, corner: 
     return (row_st == "all" and row_co == "all") or (row_st == stage and row_co == corner)
 
 
+def delay_semantic_slots(row: FormRow) -> List[Tuple[str, ...]]:
+    values = row.values
+    prefix = (
+        clean_cell(values.get("pad_name")),
+        normalize_key(values.get("constraint_type")),
+        clean_cell(values.get("clock_name")),
+        normalize_key(values.get("delay_edge")) or "both",
+        normalize_key(values.get("delay_polarity")) or "clock_rise",
+        normalize_key(values.get("add_delay")) or "no",
+    )
+    slots = []
+    for field in ("value", "min_value", "max_value", "rise_value", "fall_value"):
+        if clean_cell(values.get(field)):
+            slots.append(prefix + (field,))
+    return slots
+
+
 def validate_rows(
     rows: Sequence[FormRow],
     pads: Sequence[PadRecord],
@@ -1878,9 +2174,20 @@ def validate_rows(
     report: Report,
 ) -> None:
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
+    assembled_na = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_approved_na(row)]
     approved_by_key: Dict[Tuple[str, str], List[FormRow]] = defaultdict(list)
     delay_groups: Dict[Tuple[str, str, str], List[FormRow]] = defaultdict(list)
+    delay_slots: Dict[Tuple[str, ...], List[FormRow]] = defaultdict(list)
     pad_rows: Dict[str, List[FormRow]] = defaultdict(list)
+    na_rows_by_pad: Dict[str, List[FormRow]] = defaultdict(list)
+    pad_identities = {
+        (pad.pad_name, pad.subsys_instance, pad.subsys_port)
+        for pad in pads
+    }
+    for row in assembled_na:
+        pad = clean_cell(row.values.get("pad_name"))
+        if pad:
+            na_rows_by_pad[pad].append(row)
 
     all_clocks = dict(common_clocks)
     all_clocks.update(scenario_clocks)
@@ -1896,6 +2203,7 @@ def validate_rows(
         soc_object = clean_cell(values.get("soc_object"))
         clock_name = clean_cell(values.get("clock_name"))
         raw_scenario = clean_cell(values.get("scenario"))
+        is_na = source_type == "na"
 
         if apply_value and apply_value not in APPLY_VALUES:
             report.error(f"io_constraints row {row.row_idx}: apply must be yes/no, got {apply_value}")
@@ -1911,10 +2219,36 @@ def validate_rows(
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but scenario is blank")
             if not pad:
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but pad_name is blank")
-            if not soc_object:
+            if not soc_object and not is_na:
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but soc_object is blank")
-            if not ctype:
+            if not ctype and not is_na:
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but constraint_type is blank")
+            if is_na and review_status == "approved" and not clean_cell(values.get("basis")):
+                report.error(f"io_constraints row {row.row_idx}: approved NA row requires basis")
+            if is_na and review_status == "approved":
+                identity = (
+                    pad,
+                    clean_cell(values.get("subsys_instance")),
+                    clean_cell(values.get("subsys_port")),
+                )
+                if identity not in pad_identities:
+                    report.error(
+                        f"io_constraints row {row.row_idx}: approved NA row does not match an exact pad inventory key"
+                    )
+            if (
+                not is_na
+                and review_status == "approved"
+                and normalize_key(values.get("object_granularity")) not in {"port_list", "pattern"}
+            ):
+                identity = (
+                    pad,
+                    clean_cell(values.get("subsys_instance")),
+                    clean_cell(values.get("subsys_port")),
+                )
+                if identity not in pad_identities:
+                    report.error(
+                        f"io_constraints row {row.row_idx}: approved row does not match an exact pad inventory key"
+                    )
             if ctype in DELAY_TYPES and not clock_name:
                 report.error(f"io_constraints row {row.row_idx}: {ctype} requires clock_name")
             if ctype in DELAY_TYPES and clock_name:
@@ -1981,6 +2315,8 @@ def validate_rows(
                 pad_rows[pad].append(row)
             if ctype in DELAY_TYPES:
                 delay_groups[(pad, ctype, clock_name)].append(row)
+                for slot in delay_semantic_slots(row):
+                    delay_slots[slot].append(row)
             if ctype in DELAY_TYPES and soc_object_references_clock_source(soc_object, all_clocks):
                 report.warn(
                     f"io_constraints row {row.row_idx} {pad}: delay target appears to be a clock source/target; "
@@ -1992,9 +2328,22 @@ def validate_rows(
                         f"io_constraints row {row.row_idx} {pad}: max delay exists without min delay/basis; "
                         "hold-side external constraint may be missing"
                     )
-            if ctype == "false_path" and normalize_key(values.get("timing_class")) == "timed":
+            if (
+                ctype == "false_path"
+                and normalize_key(values.get("timing_class")) == "timed"
+                and not has_explanation(row)
+            ):
                 report.error(
                     f"io_constraints row {row.row_idx} {pad}: timed IO has approved false_path without basis/note"
+                )
+            direction = normalize_key(values.get("direction"))
+            if direction == "output" and ctype in {"input_delay", "input_transition", "driving_cell", "drive"}:
+                report.error(
+                    f"io_constraints row {row.row_idx} {pad}: {ctype} is incompatible with output direction"
+                )
+            if direction == "input" and ctype in {"output_delay", "load"}:
+                report.error(
+                    f"io_constraints row {row.row_idx} {pad}: {ctype} is incompatible with input direction"
                 )
             if normalize_key(values.get("timing_class")) in {"async", "untimed"} and not has_explanation(row):
                 report.warn(
@@ -2025,6 +2374,13 @@ def validate_rows(
                 f"rows {', '.join(str(row.row_idx) for row in group)}"
             )
 
+    for slot, group in delay_slots.items():
+        if len(group) > 1:
+            report.error(
+                "assembled view duplicate/conflict for delay semantic slot "
+                f"{'/'.join(slot)}: rows {', '.join(str(row.row_idx) for row in group)}"
+            )
+
     for pad, group in pad_rows.items():
         timing_classes = {normalize_key(row.values.get("timing_class")) for row in group if normalize_key(row.values.get("timing_class"))}
         has_delay = any(normalize_key(row.values.get("constraint_type")) in DELAY_TYPES for row in group)
@@ -2036,7 +2392,7 @@ def validate_rows(
         )
         has_dc = any(normalize_key(row.values.get("constraint_type")) == "driving_cell" for row in group)
         has_it = any(normalize_key(row.values.get("constraint_type")) == "input_transition" for row in group)
-        explanations = any(has_explanation(row) for row in group)
+        explanations = any(has_explanation(row) for row in group + na_rows_by_pad.get(pad, []))
 
         if "timed" in timing_classes and not has_delay and not explanations:
             report.error(f"assembled view pad {pad}: timing_class=timed but no input/output delay or basis/note")
@@ -2054,7 +2410,7 @@ def validate_rows(
     for pad in pads:
         group = pad_rows.get(pad.pad_name, [])
         ctypes = {normalize_key(row.values.get("constraint_type")) for row in group}
-        explanations = any(has_explanation(row) for row in group)
+        explanations = any(has_explanation(row) for row in group + na_rows_by_pad.get(pad.pad_name, []))
         direction = normalize_key(pad.direction)
         if direction == "output" and "load" not in ctypes and not explanations:
             report.warn(f"pad_inventory {pad.pad_name}: output pad lacks approved set_load or NA/basis")
@@ -2329,8 +2685,9 @@ def build_coverage_lines(
 ) -> List[str]:
     selected = [row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)]
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
+    assembled_na = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_approved_na(row)]
     by_pad: Dict[str, List[FormRow]] = defaultdict(list)
-    for row in assembled:
+    for row in assembled + assembled_na:
         pad = clean_cell(row.values.get("pad_name")) or "<no-pad>"
         by_pad[pad].append(row)
 
@@ -2339,6 +2696,7 @@ def build_coverage_lines(
         "Coverage:",
         f"  inventory pads        : {len(pads)}",
         f"  assembled approved row: {len(assembled)}",
+        f"  assembled approved NA : {len(assembled_na)}",
         f"  emitted approved row  : {len(selected)}",
         "",
         "  Per-pad assembled status:",
@@ -2350,7 +2708,8 @@ def build_coverage_lines(
         ctypes = sorted({normalize_key(row.values.get("constraint_type")) for row in group if normalize_key(row.values.get("constraint_type"))})
         timing_classes = sorted({normalize_key(row.values.get("timing_class")) for row in group if normalize_key(row.values.get("timing_class"))})
         origin = sorted({row_scenario(row) + "/" + row_stage(row) + "/" + row_corner(row) for row in group})
-        status = ", ".join(ctypes) if ctypes else "NO_APPROVED_CONSTRAINT"
+        has_na = any(normalize_key(row.values.get("source_type")) == "na" for row in group)
+        status = ", ".join(ctypes) if ctypes else ("NA" if has_na else "NO_APPROVED_CONSTRAINT")
         cls = ",".join(timing_classes) if timing_classes else "class-unset"
         src = ",".join(origin) if origin else "-"
         lines.append(
@@ -2654,6 +3013,7 @@ def write_report(
     clock_inventory_paths: Sequence[Path],
     manifest_path: Optional[Path],
     connection_path: Optional[Path],
+    pending_update_enabled: bool,
 ) -> None:
     lines = [
         "04_soc_io_pads extraction report",
@@ -2671,6 +3031,7 @@ def write_report(
         f"Clock inventory: {', '.join(str(path) for path in clock_inventory_paths)}",
         f"Harden SDC manifest: {manifest_path or '<legacy inference>'}",
         f"Connection inventory: {connection_path or '<not used>'}",
+        f"Pending update: {'enabled' if pending_update_enabled else 'disabled'}",
         f"Run completeness: {completeness.status}",
         f"Available harden SDC: {completeness.available_count}",
         f"Missing harden SDC: {completeness.missing_count}",
@@ -2698,8 +3059,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
     parser.add_argument("-input", "--input", help="common 01 assembled clock inventory CSV")
     parser.add_argument("--scenario-input", help="scenario assembled clock inventory CSV")
-    parser.add_argument("--info-all", help="integration summary xlsx")
-    parser.add_argument("--port-files", nargs="*", help="explicit integration port workbook path(s)")
+    parser.add_argument("--info-all", help="legacy-only integration summary xlsx")
+    parser.add_argument("--port-files", nargs="*", help="legacy-only explicit integration port workbook path(s)")
     parser.add_argument("--form", help="IO pad constraint workbook")
     parser.add_argument("--output", help="output SDC path")
     parser.add_argument("--harden-sdc-manifest", help="00 harden SDC manifest CSV")
@@ -2809,8 +3170,10 @@ def main(argv: Sequence[str]) -> int:
         pending_dir = pending_base / "pending"
         removed_log_dir = pending_base / "removed_log"
 
-    report.info(f"resolved input root: {input_root.resolve()}")
-    report.info(f"resolved info workbook: {info_all.resolve()}")
+    report.info(f"resolved run root: {run_root.resolve()}")
+    if not target_layout:
+        report.info(f"resolved legacy input root: {input_root.resolve()}")
+        report.info(f"resolved legacy info workbook: {info_all.resolve()}")
     report.info(f"resolved form workbook: {form_path.resolve()}")
     report.info(f"resolved common clock inventory: {common_clock_path.resolve()}")
     if args.scenario != "common" and (target_layout or args.scenario_input):
@@ -2822,22 +3185,14 @@ def main(argv: Sequence[str]) -> int:
     report.info(f"resolved output SDC: {output_path.resolve()}")
     report.info(f"resolved output report: {rpt_path.resolve()}")
 
-    if not info_all.is_file():
-        raise RuntimeError(f"integration file not found: {info_all}")
-    instances = read_info_all(info_all, report)
-    if args.port_files:
-        port_paths = [resolve_path(input_root, value, value) for value in args.port_files]
-    else:
-        port_paths = default_port_workbooks(input_root, info_all.name, form_path.name, report)
-    if not port_paths:
-        report.error("no owner port workbook found; expected port_*.xlsx/ports_*.xlsx or --port-files")
-    for path in port_paths:
-        if not path.is_file():
-            report.error(f"port workbook not found: {path}")
-    port_sheets = read_port_workbooks(port_paths, report)
-    attach_port_data(instances, port_sheets, report)
-    validate_integration_port_keys(instances, report)
-    if manifest_path is not None:
+    if target_layout:
+        instances: Dict[str, InstInfo] = {}
+        if args.info_all or args.port_files:
+            report.error(
+                "TARGET_LEGACY_INTEGRATION_INPUT_FORBIDDEN: target mode derives pad mappings from "
+                "00_middle/connection_inventory.csv; --info-all/--port-files are legacy-only"
+            )
+        assert manifest_path is not None
         completeness = apply_harden_sdc_manifest(
             instances,
             manifest_path,
@@ -2845,22 +3200,65 @@ def main(argv: Sequence[str]) -> int:
             args.scenario,
             args.require_complete_harden_sdc,
             report,
+            create_instances=True,
         )
-    else:
-        completeness = resolve_sdc_paths(instances, input_root, report)
-        if args.require_complete_harden_sdc and completeness.missing_instances:
-            report.error(
-                "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): "
-                + ", ".join(completeness.missing_instances)
-            )
-    current_digests = collect_current_sdc_digests(instances)
-
-    pad_records = build_pad_records(instances)
-    if connection_path is not None:
-        if not connection_path.is_file():
+        if connection_path is None or not connection_path.is_file():
             report.error(f"TARGET_UPSTREAM_CONNECTION_INVENTORY_MISSING: {connection_path}")
+            pad_records: List[PadRecord] = []
         else:
-            validate_pad_connections(pad_records, read_connection_inventory(connection_path, report), report)
+            target_edges = read_connection_inventory(
+                connection_path,
+                report,
+                scenario=args.scenario,
+                strict_schema=True,
+            )
+            pad_records = attach_target_pad_edges(instances, target_edges, report)
+    else:
+        if not info_all.is_file():
+            raise RuntimeError(f"integration file not found: {info_all}")
+        instances = read_info_all(info_all, report)
+        if args.port_files:
+            port_paths = [resolve_path(input_root, value, value) for value in args.port_files]
+        else:
+            port_paths = default_port_workbooks(input_root, info_all.name, form_path.name, report)
+        if not port_paths:
+            report.error("no owner port workbook found; expected port_*.xlsx/ports_*.xlsx or --port-files")
+        for path in port_paths:
+            if not path.is_file():
+                report.error(f"port workbook not found: {path}")
+        port_sheets = read_port_workbooks(port_paths, report)
+        attach_port_data(instances, port_sheets, report)
+        validate_integration_port_keys(instances, report)
+        if manifest_path is not None:
+            completeness = apply_harden_sdc_manifest(
+                instances,
+                manifest_path,
+                run_root,
+                args.scenario,
+                args.require_complete_harden_sdc,
+                report,
+            )
+        else:
+            completeness = resolve_sdc_paths(instances, input_root, report)
+            if args.require_complete_harden_sdc and completeness.missing_instances:
+                report.error(
+                    "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): "
+                    + ", ".join(completeness.missing_instances)
+                )
+        pad_records = build_pad_records(instances)
+        if connection_path is not None:
+            if not connection_path.is_file():
+                report.error(f"LEGACY_CONNECTION_INVENTORY_MISSING: {connection_path}")
+            else:
+                legacy_edges = read_connection_inventory(
+                    connection_path,
+                    report,
+                    scenario=args.scenario,
+                    strict_schema=False,
+                )
+                validate_pad_connections(pad_records, legacy_edges, report)
+
+    current_digests = collect_current_sdc_digests(instances)
     extracted: List[ExtractedConstraint] = []
     for inst in instances.values():
         extracted.extend(extract_constraints_from_instance(inst, args.scenario, report))
@@ -2947,6 +3345,7 @@ def main(argv: Sequence[str]) -> int:
         clock_paths,
         manifest_path,
         connection_path,
+        not args.no_update_pending,
     )
     print(f"Report: {rpt_path}")
     print(f"Warnings: {report.warning_count}  Errors: {report.error_count}  Sync changed: {report.sync_changed}")

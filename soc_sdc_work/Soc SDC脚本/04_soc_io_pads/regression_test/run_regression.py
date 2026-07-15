@@ -98,21 +98,59 @@ def write_target_manifest(root, scenario, rows):
             writer.writerow(row)
 
 
-def write_target_connections(root, include_missing):
+def write_target_connections(root, include_missing, scenario):
     path = root / "00_middle" / "connection_inventory.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "schema_version", "connection_id", "scenario_scope", "connection_type",
+        "src_instance", "src_direction", "src_port", "src_bit_index",
+        "src_endpoint_key", "src_soc_object", "dst_instance", "dst_direction",
+        "dst_port", "dst_bit_index", "dst_endpoint_key", "dst_soc_object",
+        "fanout_index", "range_source_expr", "range_sink_expr", "bit_pair_order",
+        "source_workbook", "source_sheet", "source_row", "validation_status",
+        "owner_hint", "note",
+    ]
+
+    def edge(connection_id, scope, top_port, inst_name, harden_port, source_row):
+        return {
+            "schema_version": "1.0",
+            "connection_id": connection_id,
+            "scenario_scope": scope,
+            "connection_type": "top_pad_to_harden",
+            "src_instance": "top",
+            "src_direction": "input",
+            "src_port": top_port,
+            "src_bit_index": top_port.split("[")[-1].rstrip("]") if "[" in top_port else "",
+            "src_endpoint_key": "top:input:%s" % top_port,
+            "src_soc_object": top_port,
+            "dst_instance": inst_name,
+            "dst_direction": "input",
+            "dst_port": harden_port,
+            "dst_bit_index": harden_port.split("[")[-1].rstrip("]") if "[" in harden_port else "",
+            "dst_endpoint_key": "%s:input:%s" % (inst_name, harden_port),
+            "dst_soc_object": "%s/%s" % (inst_name, harden_port),
+            "fanout_index": "0",
+            "range_source_expr": top_port,
+            "range_sink_expr": harden_port,
+            "bit_pair_order": "explicit_map",
+            "source_workbook": "integration.xlsx",
+            "source_sheet": "pads",
+            "source_row": str(source_row),
+            "validation_status": "matched",
+            "owner_hint": "io_owner",
+            "note": "04 regression pad edge",
+        }
+
     rows = [
-        ["CONN_PAD_DQ", "top", "input", "pad_dq[0]", "u_io", "input", "dq_i[0]", "matched"],
-        ["CONN_PAD_FP", "top", "input", "pad_fp[0]", "u_io", "input", "pad_fp[0]", "matched"],
+        edge("CONN_PAD_DQ", scenario, "pad_dq[0]", "u_io", "dq_i[0]", 10),
+        edge("CONN_PAD_FP", "common", "pad_fp[0]", "u_io", "pad_fp[0]", 11),
+        edge("CONN_FOREIGN_SCAN", "scan", "pad_scan_only", "u_io", "scan_only_i", 12),
     ]
     if include_missing:
-        rows.append(["CONN_PAD_MISSING", "top", "input", "pad_missing", "u_missing", "input", "missing_i", "matched"])
+        rows.append(edge("CONN_PAD_MISSING", scenario, "pad_missing", "u_missing", "missing_i", 13))
     with path.open("w", encoding="utf-8", newline="") as file_obj:
-        writer = csv.writer(file_obj)
-        writer.writerow([
-            "connection_id", "src_instance", "src_direction", "src_port",
-            "dst_instance", "dst_direction", "dst_port", "validation_status",
-        ])
+        writer = csv.DictWriter(file_obj, fieldnames=fields)
+        writer.writeheader()
         writer.writerows(rows)
 
 
@@ -134,21 +172,10 @@ def build_target_inputs(root, scenario="common", clock_name="dqs_clk", include_m
     inputs = root / "inputs"
     inputs.mkdir(parents=True)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "info_all"
-    ws.append(["inst_name", "module_name", "owner", "sdc_path"])
-    ws.append(["u_io", "io_ring", "alice", "u_io.sdc"])
-    if include_missing:
-        ws.append(["u_missing", "missing_ring", "bob", "missing.sdc"])
-    wb.save(str(inputs / "info_all.xlsx"))
-    write_ports(inputs / "ports_u_io.xlsx")
-    if include_missing:
-        write_missing_ports(inputs / "ports_u_missing.xlsx")
-
     (inputs / "u_io.sdc").write_text(
         "set_input_delay -clock [get_clocks %s] -max 1.25 [get_ports {dq_i[0]}]\n" % clock_name
-        + "set_false_path -from [get_ports {pad_fp[0]}]\n",
+        + "set_false_path -from [get_ports {pad_fp[0]}]\n"
+        + "set_load 0.9 [get_ports {internal_non_pad_o}]\n",
         encoding="utf-8",
     )
     if scenario == "common":
@@ -179,7 +206,7 @@ def build_target_inputs(root, scenario="common", clock_name="dqs_clk", include_m
             }
         )
     write_target_manifest(root, scenario, manifest_rows)
-    write_target_connections(root, include_missing)
+    write_target_connections(root, include_missing, scenario)
 
     pending = root / "00_middle" / "scenario" / scenario / "pending"
     pending.mkdir(parents=True)
@@ -321,6 +348,34 @@ def run_target_complete_case():
     require(first.stdout.count("Author: Howard") == 1, "target stdout author marker missing or duplicated")
     form = root / "04_middle" / "04_soc_io_pads.xlsx"
     require(form.is_file(), "target 04_middle workbook missing")
+    wb = load_workbook(str(form), data_only=False)
+    io_ws = wb["io_constraints"]
+    io_col = header_map(io_ws)
+    require(
+        all(io_ws.cell(row, io_col["subsys_port"]).value != "internal_non_pad_o" for row in range(2, io_ws.max_row + 1)),
+        "target non-pad command leaked into io_constraints",
+    )
+    pad_ws = wb["pad_inventory"]
+    pad_col = header_map(pad_ws)
+    pad_names = {pad_ws.cell(row, pad_col["pad_name"]).value for row in range(2, pad_ws.max_row + 1)}
+    require("pad_scan_only" not in pad_names, "foreign-scenario edge leaked into target pad inventory")
+    require(
+        any(
+            pad_ws.cell(row, pad_col["connection_id"]).value == "CONN_PAD_DQ"
+            and pad_ws.cell(row, pad_col["source_workbook"]).value == "integration.xlsx"
+            for row in range(2, pad_ws.max_row + 1)
+        ),
+        "00 connection provenance missing from pad inventory",
+    )
+    log_ws = wb["extraction_log"]
+    log_col = header_map(log_ws)
+    require(
+        any(
+            log_ws.cell(row, log_col["parse_status"]).value == "out_of_scope_non_pad"
+            for row in range(2, log_ws.max_row + 1)
+        ),
+        "target non-pad command was not retained in extraction_log",
+    )
     approve_bit_row(form)
 
     second = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
@@ -390,6 +445,129 @@ def run_target_scenario_clock_case():
     require("01_middle/assembled/func/clock_inventory.csv" in report, "scenario assembled inventory path not reported")
 
 
+def run_target_approved_na_case():
+    root = WORK / "target_approved_na"
+    build_target_inputs(root)
+    first = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(first.returncode == 1, "approved NA first run should sync workbook")
+    form = root / "04_middle" / "04_soc_io_pads.xlsx"
+    wb = load_workbook(str(form))
+    ws = wb["io_constraints"]
+    col = header_map(ws)
+    row = ws.max_row + 1
+    values = {
+        "scenario": "common",
+        "stage": "all",
+        "corner": "all",
+        "pad_name": "pad_dq[0]",
+        "subsys_instance": "u_io",
+        "subsys_port": "dq_i[0]",
+        "direction": "input",
+        "timing_class": "untimed",
+        "source_type": "na",
+        "source_sdc_status": "not_required",
+        "apply": "yes",
+        "review_status": "approved",
+        "owner": "io_owner",
+        "basis": "demo pad is intentionally untimed and needs no 04 command",
+    }
+    for key, value in values.items():
+        ws.cell(row, col[key], value)
+    wb.save(str(form))
+
+    result = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(result.returncode == 0, "approved NA row should be a valid terminal disposition")
+    report = (root / "04_result" / "reports" / "io_pad_check_report_common_all_all.txt").read_text(encoding="utf-8")
+    pending = (root / "00_middle" / "scenario" / "common" / "pending" / "u_io.ports").read_text(encoding="utf-8")
+    require("assembled approved NA : 1" in report, "approved NA coverage count missing")
+    require("pad_dq[0]: dir=input class=untimed constraints=NA" in report, "approved NA pad status missing")
+    require("input dq_i[0]" not in pending, "approved NA exact pad key was not consumed")
+    require("input pad_fp[0]" in pending, "unreviewed pad was incorrectly consumed by NA")
+
+
+def run_target_delay_conflict_case():
+    root = WORK / "target_delay_conflict"
+    build_target_inputs(root)
+    first = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(first.returncode == 1, "delay conflict first run should sync workbook")
+    form = root / "04_middle" / "04_soc_io_pads.xlsx"
+    wb = load_workbook(str(form))
+    ws = wb["io_constraints"]
+    col = header_map(ws)
+    source_row = None
+    for row in range(2, ws.max_row + 1):
+        if ws.cell(row, col["pad_name"]).value == "pad_dq[0]":
+            source_row = row
+            ws.cell(row, col["apply"], "yes")
+            ws.cell(row, col["review_status"], "approved")
+            ws.cell(row, col["timing_class"], "timed")
+            ws.cell(row, col["basis"], "primary max delay")
+            break
+    require(source_row is not None, "source delay row missing")
+    duplicate = ws.max_row + 1
+    for header, column in col.items():
+        ws.cell(duplicate, column, ws.cell(source_row, column).value)
+    ws.cell(duplicate, col["source_type"], "manual")
+    ws.cell(duplicate, col["source_sdc_file"], "")
+    ws.cell(duplicate, col["source_line"], "")
+    ws.cell(duplicate, col["source_digest"], "")
+    ws.cell(duplicate, col["max_value"], "1.50")
+    ws.cell(duplicate, col["basis"], "conflicting max delay")
+    wb.save(str(form))
+
+    result = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(result.returncode == 1, "duplicate delay semantic slot must block generation")
+    report = (root / "04_result" / "reports" / "io_pad_check_report_common_all_all.txt").read_text(encoding="utf-8")
+    require("duplicate/conflict for delay semantic slot" in report, "delay semantic conflict was not reported")
+
+
+def run_target_connection_contract_case():
+    root = WORK / "target_connection_contract"
+    build_target_inputs(root)
+    connection = root / "00_middle" / "connection_inventory.csv"
+    with connection.open("r", encoding="utf-8", newline="") as file_obj:
+        rows = list(csv.DictReader(file_obj))
+        fields = list(rows[0].keys())
+    rows[0]["src_port"] = "pad_dq[1:0]"
+    with connection.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    result = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(result.returncode == 1, "target noncanonical 00 edge must fail")
+    report = (root / "04_result" / "reports" / "io_pad_check_report_common_all_all.txt").read_text(encoding="utf-8")
+    require("CONNECTION_PORT_NONCANONICAL" in report, "target canonical edge error missing")
+
+    root = WORK / "target_connection_values"
+    build_target_inputs(root)
+    connection = root / "00_middle" / "connection_inventory.csv"
+    with connection.open("r", encoding="utf-8", newline="") as file_obj:
+        rows = list(csv.DictReader(file_obj))
+        fields = list(rows[0].keys())
+    rows[0]["scenario_scope"] = ""
+    rows[1]["connection_type"] = "top_to_harden"
+    with connection.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    result = sh([EX04, "--run-root", root, "-scenario", "common"], BASE)
+    require(result.returncode == 1, "target invalid connection values must fail")
+    report = (root / "04_result" / "reports" / "io_pad_check_report_common_all_all.txt").read_text(encoding="utf-8")
+    require("CONNECTION_SCENARIO_SCOPE_EMPTY" in report, "empty scenario_scope error missing")
+    require("CONNECTION_TYPE_INVALID" in report, "invalid connection_type error missing")
+
+    root = WORK / "target_legacy_input_forbidden"
+    build_target_inputs(root)
+    result = sh([
+        EX04, "--run-root", root, "-scenario", "common", "--info-all", "inputs/info_all.xlsx",
+        "--no-update-pending",
+    ], BASE)
+    require(result.returncode == 1, "target legacy integration input must fail")
+    report = (root / "04_result" / "reports" / "io_pad_check_report_common_all_all.txt").read_text(encoding="utf-8")
+    require("TARGET_LEGACY_INTEGRATION_INPUT_FORBIDDEN" in report, "target legacy-input error missing")
+    require("Pending update: disabled" in report, "no-update-pending status missing from report")
+
+
 def main():
     clean_dir(WORK)
     run_bit_pending_case()
@@ -398,9 +576,12 @@ def main():
     run_target_complete_case()
     run_target_partial_strict_case()
     run_target_scenario_clock_case()
+    run_target_approved_na_case()
+    run_target_delay_conflict_case()
+    run_target_connection_contract_case()
     print("04 complex regression: PASS")
     print("  legacy cases: bit_pending, empty_command, noncanonical_port")
-    print("  target cases: complete, partial+strict, scenario assembled clock")
+    print("  target cases: machine artifact, partial+strict, scenario, approved NA, conflict, contract gates")
     return 0
 
 

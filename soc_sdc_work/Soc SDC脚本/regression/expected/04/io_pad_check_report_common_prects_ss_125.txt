@@ -13,6 +13,7 @@ Output  : <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
 Clock inventory: <WORK>/01_soc_clocks/clock_inventory.csv
 Harden SDC manifest: <legacy inference>
 Connection inventory: <not used>
+Pending update: enabled
 Run completeness: complete
 Available harden SDC: 1
 Missing harden SDC: 0
@@ -23,15 +24,16 @@ Errors  : 0
 Sync changed: no
 
 Messages:
-INFO: resolved input root: <WORK>/04_soc_io_pads
-INFO: resolved info workbook: <WORK>/04_soc_io_pads/info_all.xlsx
+INFO: resolved run root: <WORK>/04_soc_io_pads
+INFO: resolved legacy input root: <WORK>/04_soc_io_pads
+INFO: resolved legacy info workbook: <WORK>/04_soc_io_pads/info_all.xlsx
 INFO: resolved form workbook: <WORK>/04_soc_io_pads/04_soc_io_pads.xlsx
 INFO: resolved common clock inventory: <WORK>/01_soc_clocks/clock_inventory.csv
 INFO: resolved output SDC: <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
 INFO: resolved output report: <WORK>/04_soc_io_pads/io_pad_check_report_common_prects_ss_125.txt
 INFO: loaded 1 instance(s) from info_all.xlsx
 INFO: loaded 1 instance port sheet(s) from 1 workbook(s)
-INFO: extracted 6 IO/pad candidate(s) from u_io.sdc
+INFO: extracted 6 IO/pad candidate(s) and logged 0 out-of-scope command(s) from u_io.sdc
 INFO: loaded 13 clock(s) from <WORK>/01_soc_clocks/clock_inventory.csv
 WARNING: io_constraints row 3 pad_uart0_sin: input_transition is view-independent; confirm external electrical environment is shared by all stage/corner views
 WARNING: io_constraints row 6 pad_uart0_sout: load is view-independent; confirm external electrical environment is shared by all stage/corner views
@@ -40,6 +42,7 @@ INFO: wrote <WORK>/04_soc_io_pads/common/04_soc_io_pads_prects_ss_125.sdc
 Coverage:
   inventory pads        : 4
   assembled approved row: 5
+  assembled approved NA : 0
   emitted approved row  : 1
 
   Per-pad assembled status:

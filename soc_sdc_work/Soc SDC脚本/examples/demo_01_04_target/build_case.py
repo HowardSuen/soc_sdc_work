@@ -31,6 +31,10 @@ PORT_COLUMNS = [
 ]
 
 
+def soc_object(instance, port):
+    return port if instance == "top" else "%s/%s" % (instance, port)
+
+
 def port_sheet(rows):
     frame = pd.DataFrame(rows)
     for column in PORT_COLUMNS:
@@ -43,19 +47,32 @@ def write_connection_inventory():
     path = RUN_ROOT / "00_middle/connection_inventory.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = [
+        "schema_version",
         "connection_id",
+        "scenario_scope",
         "connection_type",
         "src_instance",
         "src_direction",
         "src_port",
         "src_bit_index",
         "src_endpoint_key",
+        "src_soc_object",
         "dst_instance",
         "dst_direction",
         "dst_port",
         "dst_bit_index",
         "dst_endpoint_key",
+        "dst_soc_object",
+        "fanout_index",
+        "range_source_expr",
+        "range_sink_expr",
+        "bit_pair_order",
+        "source_workbook",
+        "source_sheet",
+        "source_row",
         "validation_status",
+        "owner_hint",
+        "note",
     ]
     rows = [
         {
@@ -86,7 +103,7 @@ def write_connection_inventory():
         },
         {
             "connection_id": "CONN_UART_RX",
-            "connection_type": "top_to_harden",
+            "connection_type": "top_pad_to_harden",
             "src_instance": "top",
             "src_direction": "input",
             "src_port": "uart_rx_pad",
@@ -99,7 +116,7 @@ def write_connection_inventory():
         },
         {
             "connection_id": "CONN_UART_TX",
-            "connection_type": "harden_to_top",
+            "connection_type": "harden_to_top_pad",
             "src_instance": "u_harden_b",
             "src_direction": "output",
             "src_port": "uart_tx_o",
@@ -114,7 +131,22 @@ def write_connection_inventory():
     with path.open("w", encoding="utf-8", newline="") as file_obj:
         writer = csv.DictWriter(file_obj, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        for row_idx, row in enumerate(rows, start=2):
+            item = dict(row)
+            item["schema_version"] = "1"
+            item["scenario_scope"] = "common"
+            item.setdefault("src_soc_object", soc_object(item["src_instance"], item["src_port"]))
+            item.setdefault("dst_soc_object", soc_object(item["dst_instance"], item["dst_port"]))
+            item.setdefault("fanout_index", "0")
+            item.setdefault("range_source_expr", item["src_port"])
+            item.setdefault("range_sink_expr", item["dst_port"])
+            item.setdefault("bit_pair_order", "explicit_map")
+            item.setdefault("source_workbook", "demo")
+            item.setdefault("source_sheet", "connections")
+            item.setdefault("source_row", str(row_idx))
+            item.setdefault("owner_hint", "")
+            item.setdefault("note", "")
+            writer.writerow(item)
 
 
 def write_manifest():

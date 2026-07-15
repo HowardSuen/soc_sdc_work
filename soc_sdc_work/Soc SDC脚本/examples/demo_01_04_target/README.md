@@ -37,9 +37,8 @@ run/assembled/common_prects_ss_125.sdc
 
 该 preview 按顺序 source 01、02、03、04 的最终 SDC。`run/chain_summary.txt` 汇总 clock、clock relation、IO 命令和 pending 消账结果。
 
-当前示例最终允许 04 报告保留 3 个方法学 warning：
+当前示例最终允许 04 报告保留 2 个方法学 warning：
 
 - UART `set_input_transition` 和 `set_load` 使用 `stage=all/corner=all`，需要项目确认是否所有 view 共用。
-- `clk_ref_pad` 已由 01 建 clock，但示例没有在 04 中继续设置外部 drive/slew；真实项目应补电气模型或明确 NA/basis。
 
 这些 warning 不阻断生成；最终 report 的 error 数为 0。
