@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""Complex regression for 02_extract_soc_clock_timing.py.
+"""Regression for the single-run stage 02 clock-timing runtime."""
 
-The test builds fresh inputs under work_complex/ and checks:
-  * first-run workbook creation gate
-  * common clock timing SDC generation
-  * scenario resolved-effective generation with common fallback and scenario override
-  * explicit apply=no suppression of a common fallback row
-  * warnings for virtual/generated/propagated methodology risks
-  * runtime metadata in stdout, SDC, report, workbook, and resolved manifest
-  * blocking negative cases: stale clock, invalid numeric value, duplicate key,
-    blank stage/apply, apply=no without note, and duplicate headers
-  * safe missing-header migration, reordered headers, and case-sensitive corners
-"""
 from __future__ import print_function
 
 import csv
@@ -22,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 
 BASE = Path(__file__).resolve().parent
@@ -31,23 +20,24 @@ EX02 = SOC / "02_soc_clock_timing" / "02_extract_soc_clock_timing.py"
 WORK = BASE / "work_complex"
 
 CLOCK_BUDGET_HEADERS = [
-    "scenario",
-    "stage",
-    "corner",
-    "clock_name",
-    "setup_uncertainty",
-    "hold_uncertainty",
-    "source_latency_early",
-    "source_latency_late",
-    "network_latency_early",
-    "network_latency_late",
-    "transition_min",
-    "transition_max",
-    "propagated",
-    "apply",
-    "sync_status",
-    "note",
+    "stage", "corner", "clock_name", "clock_kind", "period",
+    "source_latency_early", "source_latency_late",
+    "network_latency_early", "network_latency_late",
+    "setup_uncertainty", "hold_uncertainty",
+    "transition_min", "transition_max", "propagated", "apply",
+    "sync_status", "source_inventory_digest", "note",
 ]
+INVENTORY_HEADERS = [
+    "run_id", "mode_label", "design_revision", "structure_digest",
+    "clock_name", "clock_kind", "period", "direction", "direct_source",
+    "final_action", "final_sdc_digest", "run_completeness",
+    "missing_instances", "note",
+]
+
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
 
 
 def clean_dir(path):
@@ -56,839 +46,415 @@ def clean_dir(path):
     path.mkdir(parents=True)
 
 
-def sh(args, cwd):
-    return subprocess.run(
-        [sys.executable] + [str(arg) for arg in args],
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-
-
-def require(condition, message):
-    if not condition:
-        raise AssertionError(message)
-
-
-def write_inventory(path, clocks):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "inst_name",
-        "module_name",
-        "port_name",
-        "direction",
-        "clock_name",
-        "clock_kind",
-        "period",
-        "waveform",
-        "direct_source",
-        "root_source",
-        "from_whom",
-        "original_sdc",
-        "source_line",
-        "original_clock_name",
-        "original_command",
-        "final_action",
-        "source_type",
-        "source_file",
-        "target_object",
-        "final_sdc_digest",
-        "run_completeness",
-        "missing_instances",
-        "note",
-    ]
-    with path.open("w", encoding="utf-8", newline="") as file_obj:
-        writer = csv.DictWriter(file_obj, fieldnames=fields)
-        writer.writeheader()
-        for clock in clocks:
-            row = dict((field, "") for field in fields)
-            row.update(clock)
-            writer.writerow(row)
-
-
-def base_clocks():
-    return [
-        {
-            "inst_name": "u_pll",
-            "port_name": "ref_clk_in",
-            "direction": "input",
-            "clock_name": "top_sys_clk_pad",
-            "clock_kind": "create_clock",
-            "direct_source": "top/sys_clk_pad",
-            "final_action": "emit_top_clock",
-        },
-        {
-            "inst_name": "u_pll",
-            "port_name": "core_clk_o",
-            "direction": "output",
-            "clock_name": "u_pll_core_clk_o",
-            "clock_kind": "create_generated_clock",
-            "direct_source": "u_pll/ref_clk_in",
-            "final_action": "emit_output_clock",
-        },
-        {
-            "inst_name": "u_periph",
-            "port_name": "clk_o",
-            "direction": "output",
-            "clock_name": "u_periph_clk_o",
-            "clock_kind": "generated_combinational",
-            "direct_source": "u_pll_core_clk_o",
-            "final_action": "emit_output_clock",
-        },
-        {
-            "clock_name": "v_ddr_ref",
-            "direction": "virtual",
-            "clock_kind": "virtual_clock",
-            "direct_source": "virtual/v_ddr_ref",
-            "final_action": "emit_virtual_clock",
-        },
-    ]
-
-
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as file_obj:
         while True:
             chunk = file_obj.read(1024 * 1024)
             if not chunk:
-                break
+                return digest.hexdigest()
             digest.update(chunk)
-    return digest.hexdigest()
 
 
-def write_target_bundle(root, scenario, clocks, completeness="complete", missing_instances=None):
-    missing_instances = sorted(missing_instances or [])
-    sdc = root / "01_result" / ("common/01_soc_clocks.sdc" if scenario == "common" else "scenarios/%s_clocks.sdc" % scenario)
-    sdc.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# target regression clock SDC"]
-    for clock in clocks:
-        name = clock["clock_name"]
-        if "generated" in clock.get("clock_kind", ""):
-            lines.append("create_generated_clock -name {%s} -source [get_clocks {master}] -divide_by 2 [get_pins {u/out}]" % name)
-        else:
-            lines.append("create_clock -name {%s} -period 10" % name)
-    sdc.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    sdc_digest = sha256_file(sdc)
-
-    inventory = root / "01_middle" / "assembled" / scenario / "clock_inventory.csv"
-    enriched = []
-    for clock in clocks:
-        row = dict(clock)
-        row["final_sdc_digest"] = sdc_digest
-        row["run_completeness"] = completeness
-        row["missing_instances"] = ";".join(missing_instances)
-        enriched.append(row)
-    write_inventory(inventory, enriched)
-    clock_names = sorted(clock["clock_name"] for clock in clocks)
-    clock_set_digest = hashlib.sha256("\n".join(clock_names).encode("utf-8")).hexdigest()
-    meta = inventory.with_suffix(".meta")
-    payload = {
-        "scenario": scenario,
-        "final_sdc_path": str(sdc.resolve()),
-        "final_sdc_digest": sdc_digest,
-        "inventory_path": str(inventory.resolve()),
-        "inventory_digest": sha256_file(inventory),
-        "clock_set_digest": clock_set_digest,
-        "clock_count": len(clock_names),
-        "run_completeness": completeness,
-        "available_harden_count": 1,
-        "missing_harden_count": len(missing_instances),
-        "not_required_harden_count": 0,
-        "missing_instances": missing_instances,
-    }
-    meta.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return inventory, meta, sdc
+def write_csv(path, headers, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.DictWriter(file_obj, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(dict((header, row.get(header, "")) for header in headers))
 
 
-def run_initial_gate(d):
-    clean_dir(d)
-    write_inventory(d / "clock_inventory.csv", base_clocks())
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "first 02 run should create workbook and stop")
-    require((d / "02_soc_clock_timing_budget_prects.xlsx").is_file(), "stage workbook was not created")
-    wb = open_budget(d)
-    metadata = runtime_metadata_map(wb)
-    require(metadata["Scenario"] == "common", "legacy workbook scenario metadata missing")
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value:
-            require(ws.cell(row_idx, mapping["propagated"]).value == "no", "new row propagated default is not no")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("created new stage workbook" in report, "first-run report missing workbook creation warning")
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
-def open_budget(d, stage="prects"):
-    return load_workbook(str(d / ("02_soc_clock_timing_budget_%s.xlsx" % stage)))
-
-
-def header_map(ws):
-    for row_idx in range(1, min(ws.max_row, 30) + 1):
-        mapping = {}
-        for col_idx in range(1, ws.max_column + 1):
-            value = ws.cell(row_idx, col_idx).value
-            if value:
-                mapping[str(value).strip()] = col_idx
-        if "clock_name" in mapping:
-            return row_idx, mapping
-    raise AssertionError("clock_budget header not found")
-
-
-def runtime_metadata_map(wb):
-    require("runtime_metadata" in wb.sheetnames, "runtime_metadata sheet missing")
-    ws = wb["runtime_metadata"]
-    return {
-        str(ws.cell(row_idx, 1).value).strip(): str(ws.cell(row_idx, 2).value).strip()
-        for row_idx in range(2, ws.max_row + 1)
-        if ws.cell(row_idx, 1).value
-    }
-
-
-def last_data_row(ws, header_row, mapping):
-    last = header_row
-    columns = list(mapping.values())
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if any(ws.cell(row_idx, col_idx).value not in (None, "") for col_idx in columns):
-            last = row_idx
-    return last
-
-
-def set_row(ws, row_idx, mapping, values):
-    for key, value in values.items():
-        ws.cell(row_idx, mapping[key], value)
-
-
-def append_row(ws, mapping, values):
-    header_row, _ = header_map(ws)
-    row_idx = last_data_row(ws, header_row, mapping) + 1
-    set_row(ws, row_idx, mapping, values)
-    return row_idx
-
-
-def fill_positive_workbook(d):
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    common_values = {
-        "top_sys_clk_pad": {
-            "setup_uncertainty": "0.120",
-            "hold_uncertainty": 0.03,
-            "source_latency_early": 0.05,
-            "source_latency_late": 0.20,
-            "network_latency_early": 0.20,
-            "network_latency_late": 0.60,
-            "transition_min": 0.03,
-            "transition_max": 0.12,
-            "apply": "yes",
-        },
-        "u_pll_core_clk_o": {
-            "setup_uncertainty": 0.12,
-            "hold_uncertainty": 0.04,
-            "source_latency_early": 0.01,
-            "source_latency_late": 0.02,
-            "network_latency_early": 0.25,
-            "network_latency_late": 0.70,
-            "transition_min": 0.03,
-            "transition_max": 0.13,
-            "apply": "yes",
-        },
-        "u_periph_clk_o": {
-            "setup_uncertainty": 0.11,
-            "hold_uncertainty": 0.035,
-            "network_latency_early": 0.24,
-            "network_latency_late": 0.68,
-            "transition_min": 0.03,
-            "transition_max": 0.12,
-            "apply": "yes",
-        },
-        "v_ddr_ref": {
-            "setup_uncertainty": 0.05,
-            "hold_uncertainty": 0.02,
-            "network_latency_early": 0.10,
-            "network_latency_late": 0.20,
-            "apply": "yes",
-        },
-    }
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        clock_name = ws.cell(row_idx, mapping["clock_name"]).value
-        if clock_name in common_values:
-            set_row(ws, row_idx, mapping, common_values[clock_name])
-
-    append_row(ws, mapping, {
-        "scenario": "func",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "u_pll_core_clk_o",
-        "setup_uncertainty": 0.18,
-        "hold_uncertainty": 0.06,
-        "network_latency_early": 0.30,
-        "network_latency_late": 0.80,
-        "transition_min": 0.04,
-        "transition_max": 0.15,
-        "apply": "yes",
-        "sync_status": "NEW_FROM_01",
-        "note": "func override",
-    })
-    append_row(ws, mapping, {
-        "scenario": "func",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "v_ddr_ref",
-        "apply": "no",
-        "sync_status": "NEW_FROM_01",
-        "note": "explicitly suppress virtual DDR ref in func",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-
-
-def run_positive_generation():
-    d = WORK / "positive"
-    run_initial_gate(d)
-    fill_positive_workbook(d)
-
-    common = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(common.returncode == 0, "common 02 generation failed:\n%s\n%s" % (common.stdout, common.stderr))
-    common_sdc = (d / "common" / "02_soc_clock_timing_prects_ss_125.sdc").read_text(encoding="utf-8")
-    common_report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("set_clock_uncertainty -setup 0.12 [get_clocks {top_sys_clk_pad}]" in common_sdc, "common setup uncertainty missing or not normalized")
-    require("set_clock_transition -max 0.12 [get_clocks {top_sys_clk_pad}]" in common_sdc, "common transition missing")
-    require("sync_status NEW_FROM_01 reset to OK" in common_report, "NEW_FROM_01 auto-reset message missing")
-    require("clock_kind=virtual_clock" in common_report, "virtual clock warning missing")
-    require("clock_kind=create_generated_clock" in common_report, "generated clock source latency warning missing")
-
-    func = sh([EX02, "-scenario", "func", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(func.returncode == 0, "func 02 generation failed:\n%s\n%s" % (func.stdout, func.stderr))
-    func_sdc = (d / "scenarios" / "func_clock_timing_prects_ss_125.sdc").read_text(encoding="utf-8")
-    require("row" in func_sdc and "func / ss_125 / u_pll_core_clk_o" in func_sdc, "func override row missing")
-    require("set_clock_uncertainty -setup 0.18 [get_clocks {u_pll_core_clk_o}]" in func_sdc, "func override value missing")
-    require("set_clock_uncertainty -setup 0.12 [get_clocks {u_pll_core_clk_o}]" not in func_sdc, "common value leaked into func override")
-    require("[get_clocks {v_ddr_ref}]" not in func_sdc, "apply=no func row did not suppress common fallback")
-    return d
-
-
-def build_postcts_case(d):
-    clean_dir(d)
-    write_inventory(d / "clock_inventory.csv", base_clocks())
-    first = sh([EX02, "-scenario", "common", "-stage", "postcts", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(first.returncode == 1, "postcts first run should create workbook")
-    wb = open_budget(d, "postcts")
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if not ws.cell(row_idx, mapping["clock_name"]).value:
-            continue
-        set_row(ws, row_idx, mapping, {
-            "propagated": "yes",
-            "network_latency_early": 0.10,
-            "network_latency_late": 0.20,
-            "apply": "yes",
-            "sync_status": "OK",
-        })
-    wb.save(str(d / "02_soc_clock_timing_budget_postcts.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "postcts", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 0, "postcts generation failed:\n%s\n%s" % (result.stdout, result.stderr))
-    sdc = (d / "common" / "02_soc_clock_timing_postcts_ss_125.sdc").read_text(encoding="utf-8")
-    report = (d / "clock_timing_check_report_common_postcts_ss_125.txt").read_text(encoding="utf-8")
-    require("set_propagated_clock [get_clocks {top_sys_clk_pad}]" in sdc, "propagated clock command missing")
-    require("propagated=yes means actual clock network is used" in report, "propagated mismatch warning missing")
-
-
-def run_uppercase_corner_case():
-    d = WORK / "uppercase_corner"
-    clean_dir(d)
-    write_inventory(d / "clock_inventory.csv", base_clocks())
-    first = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "SS_125", "-input", "clock_inventory.csv"], d)
-    require(first.returncode == 1, "uppercase corner first run should create workbook")
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        clock_name = ws.cell(row_idx, mapping["clock_name"]).value
-        if not clock_name:
-            continue
-        if clock_name == "top_sys_clk_pad":
-            set_row(ws, row_idx, mapping, {
-                "setup_uncertainty": 0.07,
-                "apply": "yes",
-            })
-        else:
-            set_row(ws, row_idx, mapping, {
-                "apply": "no",
-                "note": "not used in uppercase corner smoke test",
-            })
-        require(ws.cell(row_idx, mapping["corner"]).value == "SS_125", "corner case was not preserved in form")
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "SS_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 0, "uppercase corner generation failed:\n%s\n%s" % (result.stdout, result.stderr))
-    output = d / "common" / "02_soc_clock_timing_prects_SS_125.sdc"
-    require(output.is_file(), "uppercase corner output filename was not preserved")
-    sdc = output.read_text(encoding="utf-8")
-    require("corner: SS_125" in sdc, "uppercase corner not preserved in SDC header")
-    require("set_clock_uncertainty -setup 0.07 [get_clocks {top_sys_clk_pad}]" in sdc, "uppercase corner command missing")
-
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "common",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "top_sys_clk_pad",
-        "setup_uncertainty": 0.08,
-        "propagated": "no",
-        "apply": "yes",
-        "sync_status": "OK",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    rerun = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "SS_125", "-input", "clock_inventory.csv"], d)
-    require(rerun.returncode == 0, "case-distinct corner row was incorrectly treated as duplicate")
-
-
-def run_bit_clock_name_case():
-    d = WORK / "bit_clock_name"
-    clean_dir(d)
-    write_inventory(d / "clock_inventory.csv", [{
-        "inst_name": "u_busclk",
-        "port_name": "clk_o[1]",
-        "direction": "output",
-        "clock_name": "u_busclk_clk_o_bit1",
-        "clock_kind": "create_generated_clock",
-        "direct_source": "u_busclk/ref_clk_i[1]",
-        "final_action": "emit_output_clock",
-    }])
-    first = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(first.returncode == 1, "bit clock first run should create workbook")
-
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    matched = False
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value != "u_busclk_clk_o_bit1":
-            continue
-        matched = True
-        set_row(ws, row_idx, mapping, {
-            "setup_uncertainty": 0.08,
-            "hold_uncertainty": 0.025,
-            "transition_max": 0.11,
-            "apply": "yes",
-        })
-    require(matched, "bit-level clock_name row was not added to workbook")
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 0, "bit clock generation failed:\n%s\n%s" % (result.stdout, result.stderr))
-    sdc = (d / "common" / "02_soc_clock_timing_prects_ss_125.sdc").read_text(encoding="utf-8")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("set_clock_uncertainty -setup 0.08 [get_clocks {u_busclk_clk_o_bit1}]" in sdc, "bit clock setup command missing")
-    require("set_clock_transition -max 0.11 [get_clocks {u_busclk_clk_o_bit1}]" in sdc, "bit clock transition command missing")
-    require("sync_status NEW_FROM_01 reset to OK" in report, "bit clock sync_status was not auto-reset")
-
-
-def build_clean_workbook(d):
-    run_initial_gate(d)
-    fill_positive_workbook(d)
-
-
-def run_stale_case():
-    d = WORK / "stale"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "common",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "stale_clk",
-        "setup_uncertainty": 0.1,
-        "apply": "yes",
-        "sync_status": "OK",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "stale case should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("stale clock not found in 01 inventory: stale_clk" in report, "stale case report missing stale clock message")
-    require("Sync changed: yes" in report, "stale case should stop at sync gate")
-
-
-def run_stale_recovery_case():
-    d = WORK / "stale_recovery"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "common",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "restored_clk",
-        "setup_uncertainty": 0.09,
-        "hold_uncertainty": 0.025,
-        "apply": "yes",
-        "sync_status": "OK",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-
-    first = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(first.returncode == 1, "stale recovery first run should mark restored_clk stale")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("stale clock not found in 01 inventory: restored_clk" in report, "stale recovery did not mark restored clock stale")
-
-    restored = base_clocks() + [{
-        "inst_name": "u_restore",
-        "port_name": "clk_i",
-        "direction": "input",
-        "clock_name": "restored_clk",
-        "clock_kind": "create_clock",
-        "direct_source": "top/restored_clk",
-        "final_action": "emit_top_clock",
-    }]
-    write_inventory(d / "clock_inventory.csv", restored)
-    second = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(second.returncode == 0, "stale recovery second run should auto-clear stale status:\n%s\n%s" % (second.stdout, second.stderr))
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    sdc = (d / "common" / "02_soc_clock_timing_prects_ss_125.sdc").read_text(encoding="utf-8")
-    require("sync_status STALE_NOT_IN_01 reset to OK" in report, "stale status was not auto-reset")
-    require("set_clock_uncertainty -setup 0.09 [get_clocks {restored_clk}]" in sdc, "restored clock was not generated")
-
-
-def run_invalid_numeric_case():
-    d = WORK / "invalid_numeric"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
-            ws.cell(row_idx, mapping["setup_uncertainty"], "not_a_number")
-            break
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "invalid numeric case should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("setup_uncertainty must be numeric" in report, "invalid numeric error missing")
-
-
-def run_duplicate_key_case():
-    d = WORK / "duplicate_key"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "common",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "top_sys_clk_pad",
-        "setup_uncertainty": 0.11,
-        "apply": "yes",
-        "sync_status": "OK",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "duplicate key case should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("duplicate scenario/stage/corner/clock_name key" in report, "duplicate key error missing")
-
-
-def run_blank_apply_case():
-    d = WORK / "blank_apply"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
-            ws.cell(row_idx, mapping["apply"]).value = None
-            ws.cell(row_idx, mapping["sync_status"], "OK")
-            break
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "blank apply should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("apply must be explicitly yes/no" in report, "blank apply error missing")
-
-
-def run_apply_no_without_note_case():
-    d = WORK / "apply_no_without_note"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
-            set_row(ws, row_idx, mapping, {"apply": "no", "sync_status": "OK"})
-            ws.cell(row_idx, mapping["note"]).value = None
-            break
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "apply=no without note should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("apply=no requires a non-empty note" in report, "apply=no note error missing")
-
-
-def run_blank_stage_case():
-    d = WORK / "blank_stage"
-    build_clean_workbook(d)
-    wb = open_budget(d)
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "common",
-        "stage": "",
-        "corner": "ff_m40",
-        "clock_name": "top_sys_clk_pad",
-        "setup_uncertainty": 0.09,
-        "propagated": "no",
-        "apply": "yes",
-        "sync_status": "OK",
-    })
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "apply=yes row with blank stage should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("apply=yes but stage is blank" in report, "blank stage structural error missing")
-
-
-def run_header_integrity_cases():
-    missing_dir = WORK / "missing_header"
-    build_clean_workbook(missing_dir)
-    path = missing_dir / "02_soc_clock_timing_budget_prects.xlsx"
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    ws.delete_cols(mapping["sync_status"])
-    wb.save(str(path))
-    first = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], missing_dir)
-    require(first.returncode == 1, "missing header migration should update workbook and gate once")
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    require("sync_status" in mapping and "note" in mapping, "missing sync_status header was not restored")
-    notes = [ws.cell(row_idx, mapping["note"]).value for row_idx in range(1, ws.max_row + 1)]
-    require("func override" in notes, "missing-header migration corrupted note data")
-    second = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], missing_dir)
-    require(second.returncode == 0, "migrated workbook did not generate on review rerun")
-
-    reordered_dir = WORK / "reordered_headers"
-    build_clean_workbook(reordered_dir)
-    path = reordered_dir / "02_soc_clock_timing_budget_prects.xlsx"
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    left = mapping["sync_status"]
-    right = mapping["note"]
-    for row_idx in range(header_row, ws.max_row + 1):
-        left_value = ws.cell(row_idx, left).value
-        ws.cell(row_idx, left, ws.cell(row_idx, right).value)
-        ws.cell(row_idx, right, left_value)
-    wb.save(str(path))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], reordered_dir)
-    require(result.returncode == 0, "reordered valid headers should remain usable")
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    notes = [ws.cell(row_idx, mapping["note"]).value for row_idx in range(1, ws.max_row + 1)]
-    require("func override" in notes, "reordered-header handling corrupted note data")
-
-    duplicate_dir = WORK / "duplicate_header"
-    build_clean_workbook(duplicate_dir)
-    path = duplicate_dir / "02_soc_clock_timing_budget_prects.xlsx"
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    header_row, _ = header_map(ws)
-    ws.cell(header_row, ws.max_column + 1, "apply")
-    wb.save(str(path))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], duplicate_dir)
-    require(result.returncode == 2, "duplicate header should fail structurally")
-    report = (duplicate_dir / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("duplicate header(s): apply" in report, "duplicate header error missing")
-
-
-def fill_all_target_rows(root, stage="prects"):
-    path = root / "02_middle" / ("02_soc_clock_timing_budget_%s.xlsx" % stage)
-    wb = load_workbook(str(path))
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if not ws.cell(row_idx, mapping["clock_name"]).value:
-            continue
-        set_row(ws, row_idx, mapping, {
-            "setup_uncertainty": 0.1,
-            "apply": "yes",
-        })
-    wb.save(str(path))
-
-
-def run_target_runtime_and_partial_case():
-    root = WORK / "target_runtime"
-    clean_dir(root)
-    clocks = [
+def clocks():
+    return [
         {
-            "inst_name": "top",
-            "direction": "input",
-            "clock_name": "top_clk",
+            "clock_name": "top_sys_clk",
             "clock_kind": "create_clock",
-            "direct_source": "top/clk",
+            "period": "10",
+            "direction": "input",
+            "direct_source": "top/sys_clk",
             "final_action": "emit_top_clock",
         },
         {
-            "inst_name": "u_missing",
-            "direction": "output",
-            "clock_name": "u_missing_clk_o",
+            "clock_name": "u_pll_core_clk",
             "clock_kind": "create_generated_clock",
-            "direct_source": "u_missing/ref_i",
+            "period": "5",
+            "direction": "output",
+            "direct_source": "u_pll/core_clk_o",
             "final_action": "emit_output_clock",
         },
+        {
+            "clock_name": "v_ddr_ref",
+            "clock_kind": "virtual_clock",
+            "period": "8",
+            "direction": "virtual",
+            "direct_source": "virtual/v_ddr_ref",
+            "final_action": "emit_virtual_clock",
+        },
     ]
-    write_target_bundle(root, "common", clocks)
-    first = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(first.returncode == 1, "target first run should create 02_middle workbook")
-    require(first.stdout.count("Author: Howard") == 1, "target stdout author marker missing or duplicated")
-    require("Scenario: common" in first.stdout, "target stdout scenario metadata missing")
-    require("Run completeness: complete" in first.stdout, "target stdout completeness metadata missing")
-    require("Port accounting: not applicable" in first.stdout, "target stdout accounting metadata missing")
-    first_wb = load_workbook(str(root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"))
-    first_metadata = runtime_metadata_map(first_wb)
-    require(first_metadata["Author"] == "Howard", "workbook author metadata missing")
-    require(first_metadata["Scenario"] == "common", "workbook scenario metadata missing")
-    require(first_metadata["Run completeness"] == "complete", "workbook completeness metadata missing")
-    require(first_metadata["Port accounting"].startswith("not applicable"), "workbook accounting metadata missing")
-    require(first_metadata["Connection inventory"] == "not used by stage 02", "workbook connection metadata missing")
-    fill_all_target_rows(root)
-
-    complete = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(complete.returncode == 0, "target complete generation failed:\n%s\n%s" % (complete.stdout, complete.stderr))
-    output = root / "02_result/common/02_soc_clock_timing_prects_ss_125.sdc"
-    report = root / "02_result/reports/clock_timing_check_report_common_prects_ss_125.txt"
-    manifest = root / "02_middle/resolved/common_prects_ss_125.manifest"
-    for path in (output, report, manifest):
-        require(path.is_file(), "target artifact missing: %s" % path)
-    output_text = output.read_text(encoding="utf-8")
-    report_text = report.read_text(encoding="utf-8")
-    require("Author: Howard" in output_text, "target SDC author metadata missing")
-    require("# Scenario: common" in output_text, "target SDC scenario metadata missing")
-    require("# Port accounting: not applicable" in output_text, "target SDC accounting metadata missing")
-    require("# Connection inventory: not used by stage 02" in output_text, "target SDC connection metadata missing")
-    require("Author: Howard" in report_text, "target report author metadata missing")
-    require("Port accounting: not applicable" in report_text, "target report accounting metadata missing")
-    require("Connection inventory: not used by stage 02" in report_text, "target report connection metadata missing")
-    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
-    require(manifest_payload["port_accounting"].startswith("not applicable"), "manifest accounting metadata missing")
-    require(manifest_payload["connection_inventory"] == "not used by stage 02", "manifest connection metadata missing")
-
-    write_target_bundle(root, "common", clocks[:1], completeness="partial", missing_instances=["u_missing"])
-    partial = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(partial.returncode == 0, "partial target generation should continue for available clocks:\n%s\n%s" % (partial.stdout, partial.stderr))
-    partial_sdc = output.read_text(encoding="utf-8")
-    partial_report = report.read_text(encoding="utf-8")
-    require("Run completeness: partial" in partial_sdc, "partial completeness missing from SDC")
-    require("[get_clocks {top_clk}]" in partial_sdc, "available clock missing from partial output")
-    require("[get_clocks {u_missing_clk_o}]" not in partial_sdc, "blocked clock leaked into partial output")
-    require("BLOCKED_BY_MISSING_SDC" in partial_report, "partial blocked status missing from report")
-    wb = load_workbook(str(root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"))
-    partial_metadata = runtime_metadata_map(wb)
-    require(partial_metadata["Run completeness"] == "partial", "workbook partial completeness was not refreshed")
-    require(partial_metadata["Missing instances"] == "u_missing", "workbook missing-instance metadata was not refreshed")
-    ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    blocked = False
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "u_missing_clk_o":
-            blocked = ws.cell(row_idx, mapping["sync_status"]).value == "BLOCKED_BY_MISSING_SDC"
-    require(blocked, "missing-instance clock was not marked BLOCKED_BY_MISSING_SDC")
-
-    strict = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "--require-complete-harden-sdc"], BASE)
-    require(strict.returncode == 1, "strict completeness should block partial inventory")
-
-    sdc = root / "01_result/common/01_soc_clocks.sdc"
-    sdc.write_text(sdc.read_text(encoding="utf-8") + "# stale mutation\n", encoding="utf-8")
-    stale_digest = sh([EX02, "--run-root", root, "-scenario", "common", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(stale_digest.returncode == 1, "stale final SDC digest should block generation")
-    require("stale 01 final SDC" in report.read_text(encoding="utf-8"), "stale final SDC digest error missing")
 
 
-def run_cross_scenario_stale_scope_case():
-    root = WORK / "cross_scenario"
-    clean_dir(root)
-    clocks = [{
-        "inst_name": "top",
-        "direction": "input",
-        "clock_name": "func_clk",
-        "clock_kind": "create_clock",
-        "direct_source": "top/func_clk",
-        "final_action": "emit_top_clock",
-    }]
-    write_target_bundle(root, "func", clocks)
-    first = sh([EX02, "--run-root", root, "-scenario", "func", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(first.returncode == 1, "cross-scenario first run should create workbook")
-    fill_all_target_rows(root)
-    path = root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"
+def write_upstream(root, clock_rows=None, run_id="RUN_02_TARGET", mode="func", revision="revA", structure="structure-02", completeness="complete", missing=None):
+    clock_rows = list(clock_rows if clock_rows is not None else clocks())
+    missing = list(missing or [])
+    write_csv(
+        root / "inputs/run_context.csv",
+        ["run_id", "mode_label", "design_revision", "note"],
+        [{"run_id": run_id, "mode_label": mode, "design_revision": revision, "note": "02 regression"}],
+    )
+    write_csv(
+        root / "inputs/required_views.csv",
+        ["view_id", "stage", "corner", "require_02", "require_04", "require_20", "require_30", "note"],
+        [
+            {"view_id": "prects_ss", "stage": "prects", "corner": "ss_125", "require_02": "yes", "require_04": "yes", "require_20": "yes", "require_30": "yes", "note": "required"},
+            {"view_id": "prects_ff_diag", "stage": "prects", "corner": "ff_m40", "require_02": "no", "require_04": "no", "require_20": "no", "require_30": "no", "note": "diagnostic"},
+        ],
+    )
+    sdc_path = root / "01_result/01_soc_clocks.sdc"
+    sdc_path.parent.mkdir(parents=True, exist_ok=True)
+    sdc_lines = ["# 01 regression output"]
+    for row in clock_rows:
+        if row["clock_kind"] == "create_generated_clock":
+            sdc_lines.append("create_generated_clock -name {%s} -source [get_clocks {top_sys_clk}] -divide_by 2 [get_pins {u_pll/core_clk_o}]" % row["clock_name"])
+        else:
+            sdc_lines.append("create_clock -name {%s} -period %s" % (row["clock_name"], row["period"]))
+    sdc_path.write_text("\n".join(sdc_lines) + "\n", encoding="utf-8")
+    sdc_digest = sha256_file(sdc_path)
+    inventory_rows = []
+    for clock in clock_rows:
+        row = dict(clock)
+        row.update({
+            "run_id": run_id,
+            "mode_label": mode,
+            "design_revision": revision,
+            "structure_digest": structure,
+            "final_sdc_digest": sdc_digest,
+            "run_completeness": completeness,
+            "missing_instances": ";".join(missing),
+        })
+        inventory_rows.append(row)
+    inventory_path = root / "01_middle/clock_inventory.csv"
+    write_csv(inventory_path, INVENTORY_HEADERS, inventory_rows)
+    inventory_digest = sha256_file(inventory_path)
+    meta = {
+        "schema_version": "1.0",
+        "stage_name": "01_soc_clocks",
+        "run_id": run_id,
+        "mode_label": mode,
+        "design_revision": revision,
+        "completion_status": "complete",
+        "error_count": 0,
+        "structure_digest": structure,
+        "inventory_path": str(inventory_path.resolve()),
+        "inventory_digest": inventory_digest,
+        "final_sdc_path": str(sdc_path.resolve()),
+        "final_sdc_digest": sdc_digest,
+        "run_completeness": completeness,
+        "missing_instances": missing,
+    }
+    write_json(root / "01_middle/clock_inventory.meta", meta)
+    completion = {
+        "schema_version": "1.0",
+        "stage_name": "01_soc_clocks",
+        "run_id": run_id,
+        "mode_label": mode,
+        "design_revision": revision,
+        "completion_status": "complete",
+        "error_count": 0,
+        "sync_changed": "no",
+        "structure_digest": structure,
+        "clock_inventory_digest": inventory_digest,
+        "output_sdc_digest": sdc_digest,
+    }
+    write_json(root / "01_middle/stage_completion.meta", completion)
+
+
+def run02(root, stage="prects", corner="ss_125", diagnose=False, extra=None):
+    args = [sys.executable, str(EX02), "--run-root", str(root), "--stage", stage, "--corner", corner]
+    if diagnose:
+        args.append("--diagnose-only")
+    if extra:
+        args.extend(extra)
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+
+def workbook_path(root):
+    return root / "02_middle/02_soc_clock_timing_budget_prects.xlsx"
+
+
+def header_map(ws):
+    return dict((str(ws.cell(1, col).value), col) for col in range(1, ws.max_column + 1))
+
+
+def rows_for(ws, stage, corner):
+    mapping = header_map(ws)
+    result = []
+    for row_idx in range(2, ws.max_row + 1):
+        if str(ws.cell(row_idx, mapping["stage"]).value or "") == stage and str(ws.cell(row_idx, mapping["corner"]).value or "") == corner:
+            result.append(row_idx)
+    return mapping, result
+
+
+def review_view(root, stage="prects", corner="ss_125"):
+    path = workbook_path(root)
     wb = load_workbook(str(path))
     ws = wb["clock_budget"]
-    _, mapping = header_map(ws)
-    append_row(ws, mapping, {
-        "scenario": "scan",
-        "stage": "prects",
-        "corner": "ss_125",
-        "clock_name": "scan_only_clk",
-        "setup_uncertainty": 0.2,
-        "apply": "yes",
-        "sync_status": "OK",
-    })
+    mapping, row_indices = rows_for(ws, stage, corner)
+    require(row_indices, "no workbook rows found for review")
+    for row_idx in row_indices:
+        ws.cell(row_idx, mapping["setup_uncertainty"], 0.10)
+        ws.cell(row_idx, mapping["hold_uncertainty"], 0.02)
+        ws.cell(row_idx, mapping["transition_max"], 0.20)
+        ws.cell(row_idx, mapping["propagated"], "no")
+        ws.cell(row_idx, mapping["apply"], "yes")
+        ws.cell(row_idx, mapping["note"], "reviewed regression budget")
     wb.save(str(path))
-    result = sh([EX02, "--run-root", root, "-scenario", "func", "-stage", "prects", "-corner", "ss_125"], BASE)
-    require(result.returncode == 0, "unrelated scan-only row should not be stale in func run:\n%s\n%s" % (result.stdout, result.stderr))
+
+
+def settle_view(root, stage="prects", corner="ss_125", diagnose=False):
+    first = run02(root, stage, corner, diagnose)
+    require(first.returncode == 1, "first run must create/sync workbook")
+    review_view(root, stage, corner)
+    second = run02(root, stage, corner, diagnose)
+    require(second.returncode == 1, "reviewed NEW_FROM_01 rows must pass through sync gate")
+    third = run02(root, stage, corner, diagnose)
+    require(third.returncode == 0, "clean reviewed view did not pass: %s\n%s" % (third.stdout, third.stderr))
+    return third
+
+
+def copy_case(source, name):
+    target = WORK / name
+    if target.exists():
+        shutil.rmtree(str(target))
+    shutil.copytree(str(source), str(target))
+    meta_path = target / "01_middle/clock_inventory.meta"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["inventory_path"] = str((target / "01_middle/clock_inventory.csv").resolve())
+    meta["final_sdc_path"] = str((target / "01_result/01_soc_clocks.sdc").resolve())
+    write_json(meta_path, meta)
+    return target
+
+
+def update_upstream_digests(root, structure=None, run_id=None, mode=None, revision=None):
+    inventory_path = root / "01_middle/clock_inventory.csv"
+    inventory_digest = sha256_file(inventory_path)
+    meta_path = root / "01_middle/clock_inventory.meta"
+    completion_path = root / "01_middle/stage_completion.meta"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    meta["inventory_digest"] = inventory_digest
+    completion["clock_inventory_digest"] = inventory_digest
+    if structure is not None:
+        meta["structure_digest"] = structure
+        completion["structure_digest"] = structure
+    for payload in (meta, completion):
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if mode is not None:
+            payload["mode_label"] = mode
+        if revision is not None:
+            payload["design_revision"] = revision
+    write_json(meta_path, meta)
+    write_json(completion_path, completion)
+
+
+def test_success_and_completion():
+    root = WORK / "success"
+    clean_dir(root)
+    write_upstream(root)
+    port_file = root / "inputs/port_dummy.xlsx"
+    port_file.write_bytes(b"stage02-must-not-touch-port-workbook")
+    port_before = sha256_file(port_file)
+    result = settle_view(root)
+    require("Port accounting: not_applicable; added_bits=0" in result.stdout, "stdout port-accounting contract missing")
+    output = root / "02_result/02_soc_clock_timing_prects_ss_125.sdc"
+    manifest = root / "02_middle/resolved/prects_ss_125.manifest"
+    completion_path = root / "02_middle/completion/prects_ss_125.meta"
+    report = root / "02_result/reports/clock_timing_check_report_prects_ss_125.txt"
+    for path in (output, manifest, completion_path, report):
+        require(path.is_file(), "missing formal artifact %s" % path)
+    text = output.read_text(encoding="utf-8")
+    require("set_clock_uncertainty -setup 0.1 [get_clocks {top_sys_clk}]" in text, "setup uncertainty command missing")
+    require("set_clock_transition -max 0.2 [get_clocks {u_pll_core_clk}]" in text, "transition command missing")
+    require("# Port accounting: not_applicable; added_bits=0" in text, "SDC port-accounting contract missing")
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    require(completion["completion_status"] == "complete", "02 completion status is not complete")
+    require(completion["view_id"] == "prects_ss", "completion view_id mismatch")
+    require(completion["error_count"] == 0 and completion["sync_changed"] == "no", "unsafe completion flags")
+    require(completion["port_accounting"] == "not_applicable" and completion["added_bits"] == 0, "completion port accounting mismatch")
+    require(completion["port_accounting_summary"] == "Port accounting: not_applicable; added_bits=0", "completion literal port-accounting summary missing")
+    require(completion["output_sdc_digest"] == sha256_file(output), "completion output digest mismatch")
+    require(completion["resolved_manifest_digest"] == sha256_file(manifest), "completion manifest digest mismatch")
+    require(completion["upstream_01_inventory_digest"] == sha256_file(root / "01_middle/clock_inventory.csv"), "completion inventory digest mismatch")
+    require(completion["upstream_01_completion_digest"] == sha256_file(root / "01_middle/stage_completion.meta"), "completion upstream completion digest mismatch")
+    require(len(completion["workbook_semantic_digest"]) == 64, "workbook semantic digest missing")
+    require(port_before == sha256_file(port_file), "stage 02 modified a port workbook")
+    wb = load_workbook(str(workbook_path(root)), data_only=True)
+    metadata = dict((str(wb["runtime_metadata"].cell(row, 1).value), str(wb["runtime_metadata"].cell(row, 2).value or "")) for row in range(2, wb["runtime_metadata"].max_row + 1))
+    require(metadata["run_id"] == "RUN_02_TARGET" and metadata["view_id"] == "prects_ss", "runtime metadata provenance missing")
+    require(metadata["Port accounting"] == "not_applicable" and metadata["added_bits"] == "0", "runtime metadata port-accounting mismatch")
+    return root
+
+
+def test_non_required_diagnostic(base_root):
+    root = copy_case(base_root, "non_required")
+    formal = run02(root, corner="ff_m40")
+    require(formal.returncode == 1, "non-required formal view must be blocked")
+    report = root / "02_result/reports/clock_timing_check_report_prects_ff_m40.txt"
+    require("require_02=no" in report.read_text(encoding="utf-8"), "non-required report did not explain gate")
+    first = run02(root, corner="ff_m40", diagnose=True)
+    require(first.returncode == 1, "first diagnostic run should sync rows")
+    review_view(root, corner="ff_m40")
+    second = run02(root, corner="ff_m40", diagnose=True)
+    require(second.returncode == 1, "diagnostic sync review gate missing")
+    third = run02(root, corner="ff_m40", diagnose=True)
+    require(third.returncode == 0, "clean diagnostic view did not pass")
+    require(not (root / "02_middle/completion/prects_ff_m40.meta").exists(), "diagnostic run published completion")
+    require(not (root / "02_result/02_soc_clock_timing_prects_ff_m40.sdc").exists(), "diagnostic run published formal SDC")
+
+
+def test_other_corner_ignored(base_root):
+    root = copy_case(base_root, "other_corner_ignored")
+    path = workbook_path(root)
     wb = load_workbook(str(path))
     ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "scan_only_clk":
-            require(ws.cell(row_idx, mapping["sync_status"]).value == "OK", "unrelated scenario row was marked stale")
+    mapping = header_map(ws)
+    row = ws.max_row + 1
+    values = {"stage": "prects", "corner": "ff_m40", "clock_name": "obsolete_other_corner", "apply": "yes", "setup_uncertainty": 0.2, "sync_status": "STALE_NOT_IN_01", "note": "must be ignored"}
+    for key, value in values.items():
+        ws.cell(row, mapping[key], value)
+    wb.save(str(path))
+    result = run02(root)
+    require(result.returncode == 0, "other-corner stale row incorrectly blocked current view")
 
 
-def run_nonfinite_numeric_case():
-    d = WORK / "nonfinite_numeric"
-    build_clean_workbook(d)
-    wb = open_budget(d)
+def test_sync_and_duplicates(base_root):
+    sync_root = copy_case(base_root, "machine_sync")
+    path = workbook_path(sync_root)
+    wb = load_workbook(str(path))
     ws = wb["clock_budget"]
-    header_row, mapping = header_map(ws)
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if ws.cell(row_idx, mapping["clock_name"]).value == "top_sys_clk_pad":
-            ws.cell(row_idx, mapping["setup_uncertainty"], "nan")
-            break
-    wb.save(str(d / "02_soc_clock_timing_budget_prects.xlsx"))
-    result = sh([EX02, "-scenario", "common", "-stage", "prects", "-corner", "ss_125", "-input", "clock_inventory.csv"], d)
-    require(result.returncode == 1, "non-finite numeric case should fail")
-    report = (d / "clock_timing_check_report_common_prects_ss_125.txt").read_text(encoding="utf-8")
-    require("must be finite" in report, "non-finite numeric error missing")
+    mapping, indices = rows_for(ws, "prects", "ss_125")
+    ws.cell(indices[0], mapping["clock_kind"], "wrong_kind")
+    ws.cell(indices[0], mapping["period"], "999")
+    ws.cell(indices[0], mapping["source_inventory_digest"], "stale")
+    wb.save(str(path))
+    result = run02(sync_root)
+    require(result.returncode == 1, "machine-column synchronization must stop generation")
+    require(not (sync_root / "02_middle/completion/prects_ss_125.meta").exists(), "sync-changing run retained completion")
+    wb = load_workbook(str(path), data_only=True)
+    ws = wb["clock_budget"]
+    mapping, indices = rows_for(ws, "prects", "ss_125")
+    require(str(ws.cell(indices[0], mapping["period"]).value) == "10", "period was not synchronized from 01")
+    require(ws.cell(indices[0], mapping["clock_kind"]).value == "create_clock", "clock_kind was not synchronized")
+    require(ws.cell(indices[0], mapping["source_inventory_digest"]).value == sha256_file(sync_root / "01_middle/clock_inventory.csv"), "source inventory digest was not synchronized")
+
+    duplicate_root = copy_case(base_root, "duplicate")
+    path = workbook_path(duplicate_root)
+    wb = load_workbook(str(path))
+    ws = wb["clock_budget"]
+    mapping, indices = rows_for(ws, "prects", "ss_125")
+    source = indices[0]
+    target = ws.max_row + 1
+    for col in range(1, ws.max_column + 1):
+        ws.cell(target, col, ws.cell(source, col).value)
+    wb.save(str(path))
+    result = run02(duplicate_root)
+    require(result.returncode == 1, "duplicate current view key must fail")
+    report = duplicate_root / "02_result/reports/clock_timing_check_report_prects_ss_125.txt"
+    require("duplicate stage/corner/clock_name" in report.read_text(encoding="utf-8"), "duplicate failure missing from report")
+
+
+def test_auxiliary_validation(base_root):
+    root = copy_case(base_root, "auxiliary")
+    path = workbook_path(root)
+    wb = load_workbook(str(path))
+    pair = wb["clock_pair_uncertainty"]
+    pair.append(["prects", "ss_125", "unknown_clock", "top_sys_clk", 0.03, 0.01, "yes", "pair review"])
+    wb.save(str(path))
+    result = run02(root)
+    require(result.returncode == 1, "invalid auxiliary clock must fail")
+    wb = load_workbook(str(path))
+    pair = wb["clock_pair_uncertainty"]
+    pair.cell(2, 3, "u_pll_core_clk")
+    derate = wb["derate_ocv"]
+    derate.append(["prects", "ss_125", "all_clocks", "clock", 0.95, 1.05, "yes", "yes", "MMMC owns derate"])
+    wb.save(str(path))
+    result = run02(root)
+    require(result.returncode == 0, "valid auxiliary placeholder rows should pass validation")
+    output = (root / "02_result/02_soc_clock_timing_prects_ss_125.sdc").read_text(encoding="utf-8")
+    require("set_clock_derate" not in output and "-from" not in output, "placeholder auxiliary sheets emitted unsupported commands")
+    report = (root / "02_result/reports/clock_timing_check_report_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("managed by external flow" in report, "external derate warning missing")
+
+
+def test_upstream_failures(base_root):
+    root = copy_case(base_root, "missing_completion")
+    (root / "01_middle/stage_completion.meta").unlink()
+    require(run02(root).returncode == 1, "missing 01 completion must fail")
+
+    root = copy_case(base_root, "provenance_mismatch")
+    context = root / "inputs/run_context.csv"
+    write_csv(context, ["run_id", "mode_label", "design_revision", "note"], [{"run_id": "RUN_CHANGED", "mode_label": "scan", "design_revision": "revB", "note": "changed"}])
+    require(run02(root).returncode == 1, "run provenance mismatch must fail")
+
+    root = copy_case(base_root, "structure_mismatch")
+    completion_path = root / "01_middle/stage_completion.meta"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["structure_digest"] = "stale-structure"
+    write_json(completion_path, completion)
+    require(run02(root).returncode == 1, "01 structure digest mismatch must fail")
+
+    root = copy_case(base_root, "inventory_digest_mismatch")
+    with (root / "01_middle/clock_inventory.csv").open("a", encoding="utf-8") as file_obj:
+        file_obj.write("#stale\n")
+    require(run02(root).returncode == 1, "01 inventory digest mismatch must fail")
+
+    root = copy_case(base_root, "completion_flags")
+    completion_path = root / "01_middle/stage_completion.meta"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["sync_changed"] = "yes"
+    write_json(completion_path, completion)
+    require(run02(root).returncode == 1, "01 sync_changed=yes must fail")
+
+
+def test_partial_inventory(base_root):
+    root = copy_case(base_root, "partial_inventory")
+    remaining = clocks()[:2]
+    write_upstream(root, clock_rows=remaining, completeness="partial", missing=["u_missing"])
+    result = run02(root)
+    require(result.returncode == 1, "partial inventory removal should synchronize workbook")
+    wb = load_workbook(str(workbook_path(root)), data_only=True)
+    ws = wb["clock_budget"]
+    mapping, indices = rows_for(ws, "prects", "ss_125")
+    statuses = dict((ws.cell(row, mapping["clock_name"]).value, ws.cell(row, mapping["sync_status"]).value) for row in indices)
+    require(statuses.get("v_ddr_ref") == "BLOCKED_BY_MISSING_SDC", "partial inventory clock was marked as real stale")
+    require(not (root / "02_middle/completion/prects_ss_125.meta").exists(), "partial sync-changing run retained completion")
+    report = (root / "02_result/reports/clock_timing_check_report_prects_ss_125.txt").read_text(encoding="utf-8")
+    require("run completeness is partial" in report, "partial inventory warning missing")
+
+
+def test_cli_rejects_scenario(base_root):
+    result = run02(base_root, extra=["--scenario", "func"])
+    require(result.returncode == 2, "stage 02 must reject scenario CLI selection")
 
 
 def main():
     clean_dir(WORK)
-    positive_dir = run_positive_generation()
-    build_postcts_case(WORK / "postcts")
-    run_uppercase_corner_case()
-    run_bit_clock_name_case()
-    run_stale_case()
-    run_stale_recovery_case()
-    run_invalid_numeric_case()
-    run_nonfinite_numeric_case()
-    run_duplicate_key_case()
-    run_blank_apply_case()
-    run_apply_no_without_note_case()
-    run_blank_stage_case()
-    run_header_integrity_cases()
-    run_target_runtime_and_partial_case()
-    run_cross_scenario_stale_scope_case()
-    print("02 complex regression: PASS")
-    print("  positive artifacts: %s" % positive_dir)
-    print("  extra cases: postcts, uppercase_corner, bit_clock_name, stale, stale_recovery, invalid_numeric, nonfinite, duplicate_key, explicit_apply, blank_stage, header_integrity, target_runtime, partial, cross_scenario")
-    return 0
+    base_root = test_success_and_completion()
+    test_non_required_diagnostic(base_root)
+    test_other_corner_ignored(base_root)
+    test_sync_and_duplicates(base_root)
+    test_auxiliary_validation(base_root)
+    test_upstream_failures(base_root)
+    test_partial_inventory(base_root)
+    test_cli_rejects_scenario(base_root)
+    print("02 single-run clock timing regression: PASS")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

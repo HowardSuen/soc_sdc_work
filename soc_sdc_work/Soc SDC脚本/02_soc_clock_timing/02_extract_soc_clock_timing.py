@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""
-Generate one stage/corner/scenario-specific 02 clock timing SDC from a
-stage-specific clock timing budget workbook and 01_soc_clocks
-clock_inventory.csv.
+"""Generate one SoC clock-timing SDC for a single-run stage/corner view.
 
-The script first synchronizes/checks the workbook against 01 clock inventory.
-If clocks are added or stale clocks are found, it updates the workbook and
-stops before SDC generation.
+Stage 02 consumes the completed flat artifacts from stage 01.  It never
+selects a scenario and never performs port accounting.  A formal completion
+record is published only for a required view after a clean, review-stable run.
 """
 
 import argparse
@@ -15,139 +12,87 @@ import hashlib
 import json
 import math
 import os
-import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from dataclasses import dataclass
-except ImportError:  # pragma: no cover - Python 3.6 compatibility path
-    def dataclass(_cls=None):
-        def wrap(cls):
-            annotations = getattr(cls, "__annotations__", {})
-            names = list(annotations.keys())
-            defaults = {}
+except ImportError:  # pragma: no cover - project still supports Python 3.6
+    def dataclass(cls):
+        annotations = getattr(cls, "__annotations__", {})
+        names = list(annotations.keys())
+        defaults = dict((name, getattr(cls, name)) for name in names if hasattr(cls, name))
+
+        def __init__(self, *args, **kwargs):
+            if len(args) > len(names):
+                raise TypeError("too many positional arguments")
+            values = dict(zip(names, args))
+            for name in names[len(args):]:
+                if name in kwargs:
+                    values[name] = kwargs.pop(name)
+                elif name in defaults:
+                    values[name] = defaults[name]
+                else:
+                    raise TypeError("missing required argument: " + name)
+            if kwargs:
+                raise TypeError("unexpected argument: " + sorted(kwargs)[0])
             for name in names:
-                if hasattr(cls, name):
-                    defaults[name] = getattr(cls, name)
+                setattr(self, name, values[name])
 
-            def __init__(self, *args, **kwargs):
-                if len(args) > len(names):
-                    raise TypeError("too many positional arguments")
-                values = {}
-                for name, value in zip(names, args):
-                    values[name] = value
-                for name in names[len(args):]:
-                    if name in kwargs:
-                        values[name] = kwargs.pop(name)
-                    elif name in defaults:
-                        values[name] = defaults[name]
-                    else:
-                        raise TypeError("missing required argument: " + name)
-                if kwargs:
-                    raise TypeError("unexpected argument: " + sorted(kwargs)[0])
-                for name in names:
-                    setattr(self, name, values[name])
-
-            def __eq__(self, other):
-                if other.__class__ is not cls:
-                    return False
-                return all(getattr(self, name) == getattr(other, name) for name in names)
-
-            cls.__init__ = __init__
-            cls.__eq__ = __eq__
-            cls.__hash__ = None
-            return cls
-
-        if _cls is None:
-            return wrap
-        return wrap(_cls)
+        cls.__init__ = __init__
+        return cls
 
 try:
     from openpyxl import Workbook, load_workbook
-    from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
     from openpyxl.worksheet.datavalidation import DataValidation
     from openpyxl.worksheet.table import Table, TableStyleInfo
-except ImportError as exc:  # pragma: no cover - user environment guard
-    print("ERROR: openpyxl is required to read/write 02 clock timing xlsx files.", file=sys.stderr)
+except ImportError as exc:  # pragma: no cover
+    print("ERROR: openpyxl is required for stage 02 workbooks.", file=sys.stderr)
     raise SystemExit(2) from exc
 
 
-STAGES = {"synth", "prects", "postcts", "postroute"}
-SCENARIOS = {"common", "func", "scan", "mbist", "gpio_in", "gpio_out"}
 ACTIVE_01_ACTIONS = {"emit_top_clock", "emit_output_clock", "emit_virtual_clock"}
 YES_NO = {"yes", "no"}
 SYNC_OK = {"", "OK"}
-SYNC_BLOCKED_MISSING = "BLOCKED_BY_MISSING_SDC"
-SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING}
-RUNTIME_METADATA_SHEET = "runtime_metadata"
-PORT_ACCOUNTING_STATUS = "not applicable (stage 02 never updates pending)"
-CONNECTION_INVENTORY_STATUS = "not used by stage 02"
-HARDEN_SDC_MANIFEST_STATUS = "not used by stage 02"
+SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01", "BLOCKED_BY_MISSING_SDC"}
+MACHINE_COLUMNS = ("clock_kind", "period", "source_inventory_digest")
+NUMERIC_COLUMNS = (
+    "source_latency_early",
+    "source_latency_late",
+    "network_latency_early",
+    "network_latency_late",
+    "setup_uncertainty",
+    "hold_uncertainty",
+    "transition_min",
+    "transition_max",
+)
 
 CLOCK_BUDGET_HEADERS = [
-    "scenario",
-    "stage",
-    "corner",
-    "clock_name",
-    "setup_uncertainty",
-    "hold_uncertainty",
-    "source_latency_early",
-    "source_latency_late",
-    "network_latency_early",
-    "network_latency_late",
-    "transition_min",
-    "transition_max",
-    "propagated",
-    "apply",
-    "sync_status",
-    "note",
+    "stage", "corner", "clock_name", "clock_kind", "period",
+    "source_latency_early", "source_latency_late",
+    "network_latency_early", "network_latency_late",
+    "setup_uncertainty", "hold_uncertainty",
+    "transition_min", "transition_max", "propagated", "apply",
+    "sync_status", "source_inventory_digest", "note",
 ]
-
 PAIR_HEADERS = [
-    "scenario",
-    "stage",
-    "corner",
-    "from_clock",
-    "to_clock",
-    "setup_uncertainty",
-    "hold_uncertainty",
-    "apply",
-    "note",
+    "stage", "corner", "from_clock", "to_clock",
+    "setup_uncertainty", "hold_uncertainty", "apply", "note",
 ]
-
 DERATE_HEADERS = [
-    "scenario",
-    "stage",
-    "corner",
-    "derate_scope",
-    "object_type",
-    "early",
-    "late",
-    "apply",
-    "managed_by_flow",
-    "note",
+    "stage", "corner", "derate_scope", "object_type", "early", "late",
+    "apply", "managed_by_flow", "note",
 ]
-
-NUMERIC_COLUMNS = {
-    "setup_uncertainty",
-    "hold_uncertainty",
-    "source_latency_early",
-    "source_latency_late",
-    "network_latency_early",
-    "network_latency_late",
-    "transition_min",
-    "transition_max",
-}
-SOURCE_LATENCY_COLUMNS = {"source_latency_early", "source_latency_late"}
-NETWORK_LATENCY_COLUMNS = {"network_latency_early", "network_latency_late"}
-TRANSITION_COLUMNS = {"transition_min", "transition_max"}
+REQUIRED_VIEW_HEADERS = [
+    "view_id", "stage", "corner", "require_02", "require_04",
+    "require_20", "require_30", "note",
+]
 
 HEADER_FILL = PatternFill("solid", fgColor="215967")
 TITLE_FILL = PatternFill("solid", fgColor="335C81")
-SUBTITLE_FILL = PatternFill("solid", fgColor="EAF3F6")
 NEW_FILL = PatternFill("solid", fgColor="FFF2CC")
 STALE_FILL = PatternFill("solid", fgColor="F4CCCC")
 BLOCKED_FILL = PatternFill("solid", fgColor="FCE5CD")
@@ -161,27 +106,50 @@ THIN_BORDER = Border(
 
 
 @dataclass
+class RunContext:
+    run_id: str
+    mode_label: str
+    design_revision: str = ""
+    note: str = ""
+
+
+@dataclass
+class RequiredView:
+    view_id: str
+    stage: str
+    corner: str
+    require_02: bool
+
+
+@dataclass
 class ClockInfo:
     clock_name: str
     direction: str = ""
     clock_kind: str = ""
+    period: str = ""
     source: str = ""
 
 
 @dataclass
 class InventoryContext:
     path: Path
+    meta_path: Path
+    completion_path: Path
+    final_sdc_path: Path
     clocks: Dict[str, ClockInfo]
-    scenario: str = ""
-    completeness: str = "complete"
-    missing_instances: Tuple[str, ...] = ()
-    meta_path: Optional[Path] = None
-    final_sdc_path: Optional[Path] = None
-    final_sdc_digest: str = ""
+    completeness: str
+    missing_instances: Tuple[str, ...]
+    inventory_digest: str
+    final_sdc_digest: str
+    structure_digest: str
+    run_id: str
+    mode_label: str
+    design_revision: str
+    completion_digest: str
 
 
 @dataclass
-class BudgetRow:
+class SheetRow:
     row_idx: int
     values: Dict[str, object]
 
@@ -192,34 +160,40 @@ class Report:
         self.warning_count = 0
         self.error_count = 0
         self.sync_changed = False
-        self.sync_blocking_changed = False
 
-    def info(self, msg: str) -> None:
-        self.lines.append(f"INFO: {msg}")
+    def info(self, message: str) -> None:
+        self.lines.append("INFO: " + message)
 
-    def warn(self, msg: str) -> None:
+    def warn(self, message: str) -> None:
         self.warning_count += 1
-        self.lines.append(f"WARNING: {msg}")
+        self.lines.append("WARNING: " + message)
 
-    def error(self, msg: str) -> None:
+    def error(self, message: str) -> None:
         self.error_count += 1
-        self.lines.append(f"ERROR: {msg}")
-
-
-def _author_part_a() -> str:
-    return chr(72) + chr(111)
-
-
-def _author_part_b() -> str:
-    return chr(119) + chr(97)
-
-
-def _author_part_c() -> str:
-    return chr(114) + chr(100)
+        self.lines.append("ERROR: " + message)
 
 
 def author_name() -> str:
-    return _author_part_a() + _author_part_b() + _author_part_c()
+    return "".join(chr(value) for value in (72, 111, 119, 97, 114, 100))
+
+
+def clean(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(".%s.%s.tmp" % (path.name, os.getpid()))
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(str(temporary), str(path))
+
+
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -228,1244 +202,817 @@ def sha256_file(path: Path) -> str:
         while True:
             chunk = file_obj.read(1024 * 1024)
             if not chunk:
-                break
+                return digest.hexdigest()
             digest.update(chunk)
-    return digest.hexdigest()
 
 
-def sha256_clock_set(clock_names: Iterable[str]) -> str:
-    payload = "\n".join(sorted(clock_names)).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(".%s.tmp.%s" % (path.name, os.getpid()))
-    try:
-        tmp_path.write_text(content, encoding=encoding)
-        os.replace(str(tmp_path), str(path))
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
-
-
-def atomic_save_workbook(wb, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(".%s.tmp.%s.xlsx" % (path.stem, os.getpid()))
-    try:
-        wb.save(str(tmp_path))
-        os.replace(str(tmp_path), str(path))
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
-
-
-def clean_cell(value) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.endswith(".0") and text.replace(".", "", 1).isdigit():
-        return text[:-2]
-    return text
-
-
-def normalize_key(value) -> str:
-    return clean_cell(value).strip().lower()
-
-
-def safe_filename_token(value: str) -> str:
-    text = clean_cell(value)
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-    token = "".join(char if char in allowed else "_" for char in text)
-    return token or "unknown"
-
-
-def output_sdc_path(cwd: Path, scenario: str, stage: str, corner_token: str) -> Path:
-    if scenario == "common":
-        return cwd / f"common/02_soc_clock_timing_{stage}_{corner_token}.sdc"
-    return cwd / f"scenarios/{scenario}_clock_timing_{stage}_{corner_token}.sdc"
-
-
-def tcl_obj(name: str) -> str:
-    return "{" + name + "}"
-
-
-def get_clocks(clock_name: str) -> str:
-    return f"[get_clocks {tcl_obj(clock_name)}]"
-
-
-def format_number(value) -> str:
-    number = parse_number(value)
-    if number is not None:
-        return f"{number:.12g}"
-    return clean_cell(value)
-
-
-def parse_number(value) -> Optional[float]:
-    text = clean_cell(value)
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def filled_columns(values: Dict[str, object], columns: Iterable[str]) -> List[str]:
-    return [column for column in columns if clean_cell(values.get(column))]
-
-
-def read_clock_inventory(path: Path, report: Report) -> Dict[str, ClockInfo]:
+def read_json(path: Path, label: str, report: Report) -> Dict[str, object]:
     if not path.is_file():
-        raise RuntimeError(f"01 clock inventory not found: {path}")
+        report.error("required %s is missing: %s" % (label, path))
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        report.error("cannot read %s %s: %s" % (label, path, exc))
+        return {}
+    if not isinstance(payload, dict):
+        report.error("%s must contain a JSON object: %s" % (label, path))
+        return {}
+    return payload
+
+
+def read_csv_rows(path: Path, label: str, report: Report) -> Tuple[List[str], List[Dict[str, str]]]:
+    if not path.is_file():
+        report.error("required %s is missing: %s" % (label, path))
+        return [], []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            headers = [clean(item) for item in (reader.fieldnames or [])]
+            if len(headers) != len(set(headers)):
+                report.error("%s has duplicate headers: %s" % (label, path))
+            return headers, [dict(row) for row in reader]
+    except (OSError, csv.Error) as exc:
+        report.error("cannot read %s %s: %s" % (label, path, exc))
+        return [], []
+
+
+def read_run_context(path: Path, report: Report) -> RunContext:
+    headers, rows = read_csv_rows(path, "run context", report)
+    expected = ["run_id", "mode_label", "design_revision", "note"]
+    if headers != expected:
+        report.error("run_context.csv headers must be exactly: " + ",".join(expected))
+    if len(rows) != 1:
+        report.error("run_context.csv must contain exactly one data row")
+    row = rows[0] if rows else {}
+    run_id = clean(row.get("run_id"))
+    mode_label = clean(row.get("mode_label"))
+    if not run_id:
+        report.error("run_context.csv run_id is required")
+    if not mode_label:
+        report.error("run_context.csv mode_label is required")
+    return RunContext(run_id, mode_label, clean(row.get("design_revision")), clean(row.get("note")))
+
+
+def read_required_view(path: Path, stage: str, corner: str, report: Report) -> Optional[RequiredView]:
+    headers, rows = read_csv_rows(path, "required views", report)
+    if headers != REQUIRED_VIEW_HEADERS:
+        report.error("required_views.csv headers must be exactly: " + ",".join(REQUIRED_VIEW_HEADERS))
+    seen_ids: Dict[str, int] = {}
+    seen_keys: Dict[Tuple[str, str], int] = {}
+    selected: Optional[RequiredView] = None
+    for row_idx, row in enumerate(rows, start=2):
+        view_id = clean(row.get("view_id"))
+        row_stage = clean(row.get("stage"))
+        row_corner = clean(row.get("corner"))
+        if not view_id or not row_stage or not row_corner:
+            report.error("required_views.csv row %d has blank view_id/stage/corner" % row_idx)
+        if view_id in seen_ids:
+            report.error("required_views.csv duplicate view_id %s at rows %d and %d" % (view_id, seen_ids[view_id], row_idx))
+        seen_ids[view_id] = row_idx
+        key = (row_stage, row_corner)
+        if key in seen_keys:
+            report.error("required_views.csv duplicate stage/corner %s/%s at rows %d and %d" % (row_stage, row_corner, seen_keys[key], row_idx))
+        seen_keys[key] = row_idx
+        for flag in ("require_02", "require_04", "require_20", "require_30"):
+            value = clean(row.get(flag)).lower()
+            if value not in YES_NO:
+                report.error("required_views.csv row %d %s must be yes/no" % (row_idx, flag))
+        if key == (stage, corner):
+            selected = RequiredView(view_id, stage, corner, clean(row.get("require_02")).lower() == "yes")
+    if selected is None:
+        report.error("stage/corner %s/%s is not declared in required_views.csv" % (stage, corner))
+    return selected
+
+
+def validate_provenance(payload: Dict[str, object], label: str, run: RunContext, report: Report) -> None:
+    for field in ("run_id", "mode_label", "design_revision"):
+        expected = clean(getattr(run, field))
+        actual = clean(payload.get(field))
+        if actual != expected:
+            report.error("%s %s mismatch: expected %s, got %s" % (label, field, expected or "<blank>", actual or "<blank>"))
+
+
+def load_inventory_context(run_root: Path, run: RunContext, report: Report) -> Optional[InventoryContext]:
+    inventory_path = run_root / "01_middle/clock_inventory.csv"
+    meta_path = run_root / "01_middle/clock_inventory.meta"
+    completion_path = run_root / "01_middle/stage_completion.meta"
+    default_sdc_path = run_root / "01_result/01_soc_clocks.sdc"
+    meta = read_json(meta_path, "01 clock inventory meta", report)
+    completion = read_json(completion_path, "01 completion meta", report)
+    headers, rows = read_csv_rows(inventory_path, "01 clock inventory", report)
+    required_headers = {"clock_name", "clock_kind", "period", "final_action"}
+    missing_headers = sorted(required_headers - set(headers))
+    if missing_headers:
+        report.error("01 clock inventory missing headers: " + ",".join(missing_headers))
+    if not meta or not completion or not inventory_path.is_file():
+        return None
+
+    inventory_digest = sha256_file(inventory_path)
+    if clean(meta.get("inventory_digest")) != inventory_digest:
+        report.error("01 clock inventory digest does not match clock_inventory.meta")
+    if clean(completion.get("clock_inventory_digest")) != inventory_digest:
+        report.error("01 clock inventory digest does not match stage_completion.meta")
+    validate_provenance(meta, "01 clock inventory meta", run, report)
+    validate_provenance(completion, "01 completion meta", run, report)
+    if clean(meta.get("stage_name")) != "01_soc_clocks":
+        report.error("01 clock inventory meta stage_name must be 01_soc_clocks")
+    if clean(completion.get("stage_name")) != "01_soc_clocks":
+        report.error("01 completion stage_name must be 01_soc_clocks")
+    if clean(meta.get("completion_status")) != "complete":
+        report.error("01 clock inventory meta is not complete")
+    if clean(completion.get("completion_status")) != "complete":
+        report.error("01 stage completion is not complete")
+    try:
+        if int(completion.get("error_count", 1)) != 0:
+            report.error("01 stage completion error_count is not zero")
+    except (TypeError, ValueError):
+        report.error("01 stage completion error_count is invalid")
+    if clean(completion.get("sync_changed")).lower() != "no":
+        report.error("01 stage completion sync_changed must be no")
+    structure_digest = clean(meta.get("structure_digest"))
+    if not structure_digest or clean(completion.get("structure_digest")) != structure_digest:
+        report.error("01 structure_digest is blank or inconsistent between meta/completion")
+
+    declared_sdc = clean(meta.get("final_sdc_path"))
+    final_sdc_path = Path(declared_sdc).expanduser() if declared_sdc else default_sdc_path
+    if not final_sdc_path.is_absolute():
+        final_sdc_path = (run_root / final_sdc_path).resolve()
+    if final_sdc_path.resolve() != default_sdc_path.resolve():
+        report.error("01 clock inventory meta final_sdc_path must resolve to %s" % default_sdc_path.resolve())
+    final_sdc_digest = ""
+    if not default_sdc_path.is_file():
+        report.error("required final 01 SDC is missing: %s" % default_sdc_path)
+    else:
+        final_sdc_digest = sha256_file(default_sdc_path)
+        if clean(meta.get("final_sdc_digest")) != final_sdc_digest:
+            report.error("01 final SDC digest does not match clock_inventory.meta")
+        if clean(completion.get("output_sdc_digest")) != final_sdc_digest:
+            report.error("01 final SDC digest does not match stage_completion.meta")
 
     clocks: Dict[str, ClockInfo] = {}
-    duplicates: List[str] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
-        reader = csv.DictReader(file_obj)
-        if not reader.fieldnames or "clock_name" not in reader.fieldnames:
-            raise RuntimeError(f"{path} does not contain a clock_name column")
-        for row_idx, row in enumerate(reader, start=2):
-            action = clean_cell(row.get("final_action"))
-            if action not in ACTIVE_01_ACTIONS:
-                continue
-            clock_name = clean_cell(row.get("clock_name"))
-            if not clock_name:
-                report.warn(f"{path.name} row {row_idx}: active clock record has empty clock_name")
-                continue
-            if clock_name in clocks:
-                duplicates.append(clock_name)
-                continue
-            clocks[clock_name] = ClockInfo(
-                clock_name=clock_name,
-                direction=clean_cell(row.get("direction")),
-                clock_kind=clean_cell(row.get("clock_kind")),
-                source=clean_cell(row.get("direct_source")),
-            )
-
-    if duplicates:
-        report.error("duplicate active clock_name in 01 inventory: " + ", ".join(sorted(set(duplicates))))
-    report.info(f"loaded {len(clocks)} active clock(s) from {path}")
-    return clocks
-
-
-def read_active_inventory_digests(path: Path) -> Set[str]:
-    digests: Set[str] = set()
-    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
-        reader = csv.DictReader(file_obj)
-        for row in reader:
-            if clean_cell(row.get("final_action")) not in ACTIVE_01_ACTIONS:
-                continue
-            value = clean_cell(row.get("final_sdc_digest"))
-            if value:
-                digests.add(value)
-    return digests
-
-
-def extract_clock_names_from_sdc(path: Path) -> Set[str]:
-    text = path.read_text(encoding="utf-8")
-    logical_lines: List[str] = []
-    pending = ""
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if not line and not pending:
+    completeness_values = set()
+    missing_instances = set()
+    for row_idx, row in enumerate(rows, start=2):
+        action = clean(row.get("final_action"))
+        if action not in ACTIVE_01_ACTIONS:
             continue
-        if line.endswith("\\"):
-            pending += line[:-1] + " "
+        name = clean(row.get("clock_name"))
+        if not name:
+            report.error("01 clock inventory row %d has active action but blank clock_name" % row_idx)
             continue
-        logical_lines.append(pending + line)
-        pending = ""
-    if pending:
-        logical_lines.append(pending)
-
-    names: Set[str] = set()
-    name_pattern = re.compile(r'(?:^|\s)-name\s+(?:\{([^}]*)\}|"([^"]*)"|(\S+))')
-    for line in logical_lines:
-        stripped = line.lstrip()
-        if not (stripped.startswith("create_clock ") or stripped.startswith("create_generated_clock ")):
+        if name in clocks:
+            report.error("01 clock inventory contains duplicate active clock_name %s" % name)
             continue
-        match = name_pattern.search(stripped)
-        if match:
-            names.add(next(group for group in match.groups() if group is not None))
-    return names
-
-
-def load_inventory_context(
-    inventory_path: Path,
-    report: Report,
-    expected_scenario: str,
-    meta_path: Optional[Path] = None,
-    clock_sdc_path: Optional[Path] = None,
-    require_meta: bool = False,
-) -> InventoryContext:
-    clocks = read_clock_inventory(inventory_path, report)
-    context = InventoryContext(path=inventory_path, clocks=clocks, scenario=expected_scenario)
-
-    if meta_path is not None and meta_path.is_file():
-        try:
-            payload = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (ValueError, OSError) as exc:
-            raise RuntimeError(f"invalid 01 clock inventory meta {meta_path}: {exc}")
-        context.meta_path = meta_path
-        context.scenario = clean_cell(payload.get("scenario"))
-        context.completeness = normalize_key(payload.get("run_completeness")) or "complete"
-        context.missing_instances = tuple(
-            sorted(clean_cell(item) for item in payload.get("missing_instances", []) if clean_cell(item))
+        row_run = clean(row.get("run_id"))
+        row_mode = clean(row.get("mode_label"))
+        row_revision = clean(row.get("design_revision"))
+        if row_run and row_run != run.run_id:
+            report.error("01 clock inventory row %d run_id is stale" % row_idx)
+        if row_mode and row_mode != run.mode_label:
+            report.error("01 clock inventory row %d mode_label is stale" % row_idx)
+        if row_revision and row_revision != run.design_revision:
+            report.error("01 clock inventory row %d design_revision is stale" % row_idx)
+        row_structure = clean(row.get("structure_digest"))
+        if row_structure and row_structure != structure_digest:
+            report.error("01 clock inventory row %d structure_digest is stale" % row_idx)
+        row_sdc_digest = clean(row.get("final_sdc_digest"))
+        if row_sdc_digest and row_sdc_digest != final_sdc_digest:
+            report.error("01 clock inventory row %d final_sdc_digest is stale" % row_idx)
+        completeness = clean(row.get("run_completeness"))
+        if completeness:
+            completeness_values.add(completeness)
+        for item in clean(row.get("missing_instances")).split(";"):
+            if item.strip():
+                missing_instances.add(item.strip())
+        clocks[name] = ClockInfo(
+            name,
+            clean(row.get("direction")),
+            clean(row.get("clock_kind")),
+            clean(row.get("period")),
+            clean(row.get("direct_source")),
         )
-        final_path_text = clean_cell(payload.get("final_sdc_path"))
-        if final_path_text:
-            context.final_sdc_path = Path(final_path_text)
-        context.final_sdc_digest = clean_cell(payload.get("final_sdc_digest"))
-
-        if context.scenario != expected_scenario:
-            report.error(
-                f"01 inventory meta scenario mismatch: expected {expected_scenario}, got {context.scenario or '<blank>'}"
-            )
-        expected_inventory_digest = clean_cell(payload.get("inventory_digest"))
-        actual_inventory_digest = sha256_file(inventory_path)
-        if expected_inventory_digest != actual_inventory_digest:
-            report.error(
-                f"stale 01 inventory: meta digest {expected_inventory_digest or '<blank>'} "
-                f"does not match {actual_inventory_digest}"
-            )
-        expected_clock_set_digest = clean_cell(payload.get("clock_set_digest"))
-        actual_clock_set_digest = sha256_clock_set(clocks)
-        if expected_clock_set_digest != actual_clock_set_digest:
-            report.error(
-                f"stale 01 inventory: clock set digest {expected_clock_set_digest or '<blank>'} "
-                f"does not match {actual_clock_set_digest}"
-            )
-        expected_clock_count = payload.get("clock_count")
-        if expected_clock_count is not None:
-            try:
-                clock_count = int(expected_clock_count)
-            except (TypeError, ValueError):
-                report.error(f"01 inventory meta has invalid clock_count: {expected_clock_count}")
-            else:
-                if clock_count != len(clocks):
-                    report.error(f"01 inventory meta clock_count={clock_count}, actual={len(clocks)}")
-    elif require_meta:
-        raise RuntimeError(f"01 assembled clock inventory meta not found: {meta_path}")
-    elif meta_path is not None:
-        report.warn(f"01 inventory meta not found; legacy validation only: {meta_path}")
-
-    effective_sdc_path = clock_sdc_path or context.final_sdc_path
-    if effective_sdc_path is not None:
-        if not effective_sdc_path.is_file():
-            raise RuntimeError(f"01 final clock SDC not found: {effective_sdc_path}")
-        actual_sdc_digest = sha256_file(effective_sdc_path)
-        if context.final_sdc_digest and context.final_sdc_digest != actual_sdc_digest:
-            report.error(
-                f"stale 01 final SDC: meta digest {context.final_sdc_digest} does not match {actual_sdc_digest}"
-            )
-        inventory_digests = read_active_inventory_digests(inventory_path)
-        if inventory_digests and inventory_digests != {actual_sdc_digest}:
-            report.error(
-                "stale 01 inventory: active final_sdc_digest value(s) do not match final SDC digest: "
-                + ", ".join(sorted(inventory_digests))
-            )
-        sdc_clock_names = extract_clock_names_from_sdc(effective_sdc_path)
-        if sdc_clock_names != set(clocks):
-            missing = sorted(set(clocks) - sdc_clock_names)
-            extra = sorted(sdc_clock_names - set(clocks))
-            report.error(
-                f"01 final SDC clock set differs from inventory; missing_in_sdc={missing}; extra_in_sdc={extra}"
-            )
-        context.final_sdc_path = effective_sdc_path
-        context.final_sdc_digest = actual_sdc_digest
-        report.info(f"verified 01 final SDC digest and {len(sdc_clock_names)} clock name(s): {effective_sdc_path}")
-    elif require_meta:
-        report.error("01 assembled meta does not provide final_sdc_path")
-    else:
-        report.warn("01 final clock SDC was not found; legacy inventory authenticity check was skipped")
-
-    if context.completeness not in {"complete", "partial"}:
-        report.error(f"01 inventory meta has invalid run_completeness: {context.completeness}")
-    report.info(
-        f"01 run completeness: {context.completeness}; missing instances: "
-        f"{', '.join(context.missing_instances) or '<none>'}"
+    if not clocks:
+        report.error("01 clock inventory contains no active emitted clocks")
+    completeness = clean(meta.get("run_completeness")) or (sorted(completeness_values)[0] if completeness_values else "complete")
+    meta_missing = meta.get("missing_instances", [])
+    if isinstance(meta_missing, list):
+        missing_instances.update(clean(item) for item in meta_missing if clean(item))
+    if completeness == "partial":
+        report.warn("01 run completeness is partial; missing harden SDC: %s" % (",".join(sorted(missing_instances)) or "<unspecified>"))
+    elif completeness != "complete":
+        report.error("01 run completeness must be complete or partial, got %s" % (completeness or "<blank>"))
+    return InventoryContext(
+        inventory_path, meta_path, completion_path, default_sdc_path, clocks,
+        completeness, tuple(sorted(missing_instances)), inventory_digest,
+        final_sdc_digest, structure_digest, run.run_id, run.mode_label,
+        run.design_revision, sha256_file(completion_path),
     )
-    return context
 
 
-def style_title(ws, title: str, subtitle: str, width_cols: int) -> None:
-    ws.sheet_view.showGridLines = False
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=width_cols)
-    ws.cell(1, 1, title)
-    ws.cell(1, 1).fill = TITLE_FILL
-    ws.cell(1, 1).font = Font(bold=True, color="FFFFFF", size=14)
-    ws.row_dimensions[1].height = 24
-
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=width_cols)
-    ws.cell(2, 1, subtitle)
-    ws.cell(2, 1).fill = SUBTITLE_FILL
-    ws.cell(2, 1).font = Font(color="5C6670")
-    ws.cell(2, 1).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.row_dimensions[2].height = 32
-
-
-def write_header(ws, headers: Sequence[str], row: int = 4) -> None:
+def style_header(ws, row_idx: int, headers: Sequence[str]) -> None:
     for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row, col_idx, header)
+        cell = ws.cell(row_idx, col_idx, header)
         cell.fill = HEADER_FILL
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = THIN_BORDER
-    ws.freeze_panes = "A5"
-
-
-def set_widths(ws, widths: Sequence[int]) -> None:
-    for idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-
-
-def add_validation(ws, cell_range: str, values: Sequence[str]) -> None:
-    quoted = ",".join(values)
-    dv = DataValidation(type="list", formula1=f'"{quoted}"', allow_blank=True)
-    ws.add_data_validation(dv)
-    dv.add(cell_range)
-
-
-def ensure_table(ws, name: str, ref: str) -> None:
-    for table in ws.tables.values():
-        if table.name == name:
-            table.ref = ref
-            return
-    table = Table(displayName=name, ref=ref)
-    table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    ws.add_table(table)
-
-
-def style_body_row(ws, row_idx: int, col_count: int, fill: Optional[PatternFill] = None) -> None:
-    for col_idx in range(1, col_count + 1):
-        cell = ws.cell(row_idx, col_idx)
-        cell.border = THIN_BORDER
-        cell.alignment = Alignment(wrap_text=True, vertical="top")
-        if fill is not None:
-            cell.fill = fill
-
-
-def setup_clock_budget_sheet(wb: Workbook, stage: str) -> None:
-    ws = wb.active
-    ws.title = "clock_budget"
-    style_title(
-        ws,
-        f"02 SoC Clock Timing Budget - {stage} - clock_budget",
-        (
-            f"Stage-specific form. Rows are grouped by clock_name first for comparison within {stage}; "
-            "sync_status must be OK/blank before SDC generation."
-        ),
-        len(CLOCK_BUDGET_HEADERS),
-    )
-    write_header(ws, CLOCK_BUDGET_HEADERS)
-    set_widths(ws, [12, 10, 11, 22, 16, 16, 22, 22, 23, 23, 15, 15, 13, 10, 16, 38])
-    add_validation(ws, "A5:A5000", ["common", "func", "scan", "mbist", "gpio_in", "gpio_out"])
-    add_validation(ws, "B5:B5000", sorted(STAGES))
-    add_validation(ws, "M5:N5000", ["yes", "no"])
-    add_validation(
-        ws,
-        "O5:O5000",
-        ["OK", "NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING],
-    )
-
-
-def setup_aux_sheet(wb: Workbook, name: str, headers: Sequence[str], stage: str) -> None:
-    ws = wb.create_sheet(name)
-    style_title(
-        ws,
-        f"02 SoC Clock Timing Budget - {stage} - {name}",
-        "Reserved for later 02 expansion. First 02 script version does not generate SDC from this sheet.",
-        len(headers),
-    )
-    write_header(ws, headers)
-    set_widths(ws, [12, 10, 12, 20, 20, 16, 16, 12, 40, 40][: len(headers)])
-
-
-def runtime_metadata_rows(
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-) -> List[Tuple[str, str]]:
-    return [
-        ("Author", author_name()),
-        ("Stage ID", "02_soc_clock_timing"),
-        ("Script", "02_extract_soc_clock_timing.py"),
-        ("Scenario", scenario),
-        ("Timing stage", stage),
-        ("Corner", corner),
-        ("Run completeness", inventory.completeness),
-        ("Port accounting", PORT_ACCOUNTING_STATUS),
-        ("Connection inventory", CONNECTION_INVENTORY_STATUS),
-        ("Harden SDC manifest", HARDEN_SDC_MANIFEST_STATUS),
-        ("Clock inventory", str(inventory.path.resolve())),
-        ("Clock inventory meta", str(inventory.meta_path.resolve()) if inventory.meta_path else "<none>"),
-        ("Final clock SDC", str(inventory.final_sdc_path.resolve()) if inventory.final_sdc_path else "<none>"),
-        ("Missing instances", ", ".join(inventory.missing_instances) or "<none>"),
-    ]
-
-
-def update_runtime_metadata_sheet(
-    wb,
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-) -> bool:
-    expected = runtime_metadata_rows(scenario, stage, corner, inventory)
-    if RUNTIME_METADATA_SHEET in wb.sheetnames:
-        ws = wb[RUNTIME_METADATA_SHEET]
-        existing = [
-            (clean_cell(ws.cell(row_idx, 1).value), clean_cell(ws.cell(row_idx, 2).value))
-            for row_idx in range(2, ws.max_row + 1)
-            if clean_cell(ws.cell(row_idx, 1).value)
-        ]
-        if existing == expected:
-            return False
-        for merged_range in list(ws.merged_cells.ranges):
-            ws.unmerge_cells(str(merged_range))
-        ws.delete_rows(1, ws.max_row)
-    else:
-        ws = wb.create_sheet(RUNTIME_METADATA_SHEET, 0)
-
-    ws.sheet_view.showGridLines = False
-    ws.cell(1, 1, "02 SoC Clock Timing Runtime Metadata")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
-    ws.cell(1, 1).fill = TITLE_FILL
-    ws.cell(1, 1).font = Font(bold=True, color="FFFFFF", size=14)
-    for row_idx, (key, value) in enumerate(expected, start=2):
-        ws.cell(row_idx, 1, key)
-        ws.cell(row_idx, 2, value)
-        ws.cell(row_idx, 1).font = Font(bold=True)
-        ws.cell(row_idx, 1).fill = SUBTITLE_FILL
-        for col_idx in (1, 2):
-            ws.cell(row_idx, col_idx).border = THIN_BORDER
-            ws.cell(row_idx, col_idx).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 100
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(13, min(30, len(header) + 3))
     ws.freeze_panes = "A2"
-    if "clock_budget" in wb.sheetnames:
-        wb.active = wb.sheetnames.index("clock_budget")
-    return True
+    ws.auto_filter.ref = "A1:%s1" % get_column_letter(len(headers))
 
 
-def create_new_workbook(
-    form_path: Path,
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-) -> None:
-    wb = Workbook()
-    setup_clock_budget_sheet(wb, stage)
-    setup_aux_sheet(wb, "clock_pair_uncertainty", PAIR_HEADERS, stage)
-    setup_aux_sheet(wb, "derate_ocv", DERATE_HEADERS, stage)
-
-    update_runtime_metadata_sheet(wb, scenario, stage, corner, inventory)
-    ws = wb["clock_budget"]
-    for clock_name in sorted(inventory.clocks):
-        append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
-    refresh_clock_budget_table(ws)
-    atomic_save_workbook(wb, form_path)
+def setup_sheet(wb: Workbook, name: str, headers: Sequence[str]) -> object:
+    ws = wb.create_sheet(name)
+    style_header(ws, 1, headers)
+    if "apply" in headers:
+        col = get_column_letter(headers.index("apply") + 1)
+        validation = DataValidation(type="list", formula1='"yes,no"', allow_blank=False)
+        ws.add_data_validation(validation)
+        validation.add("%s2:%s1048576" % (col, col))
+    for flag in ("propagated", "managed_by_flow"):
+        if flag in headers:
+            col = get_column_letter(headers.index(flag) + 1)
+            validation = DataValidation(type="list", formula1='"yes,no"', allow_blank=True)
+            ws.add_data_validation(validation)
+            validation.add("%s2:%s1048576" % (col, col))
+    return ws
 
 
-def find_header_row(ws, required: str = "clock_name") -> Tuple[int, Dict[str, int]]:
-    for row_idx in range(1, min(ws.max_row, 30) + 1):
-        mapping: Dict[str, int] = {}
-        duplicates: Set[str] = set()
-        for col_idx in range(1, ws.max_column + 1):
-            value = clean_cell(ws.cell(row_idx, col_idx).value)
-            if value:
-                if value in mapping:
-                    duplicates.add(value)
-                mapping[value] = col_idx
-        if required in mapping:
-            if duplicates:
-                raise RuntimeError(
-                    f"sheet {ws.title} row {row_idx} contains duplicate header(s): "
-                    + ", ".join(sorted(duplicates))
-                )
-            return row_idx, mapping
-    raise RuntimeError(f"sheet {ws.title} does not contain a {required} header")
-
-
-def ensure_clock_budget_headers(ws) -> Tuple[int, Dict[str, int], bool]:
-    header_row, mapping = find_header_row(ws)
-    changed = False
-    for header in CLOCK_BUDGET_HEADERS:
-        if header in mapping:
-            continue
-        insert_at = ws.max_column + 1
-        if header == "sync_status" and "note" in mapping:
-            insert_at = mapping["note"]
-            ws.insert_cols(insert_at)
-            mapping = {key: (value + 1 if value >= insert_at else value) for key, value in mapping.items()}
-        ws.cell(header_row, insert_at, header)
-        changed = True
-        header_row, mapping = find_header_row(ws)
-    for header in CLOCK_BUDGET_HEADERS:
-        cell = ws.cell(header_row, mapping[header])
-        cell.fill = HEADER_FILL
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-        cell.border = THIN_BORDER
-    ws.freeze_panes = f"A{header_row + 1}"
-    return header_row, mapping, changed
-
-
-def append_clock_row(
-    ws,
-    scenario: str,
-    stage: str,
-    corner: str,
-    clock_name: str,
-    sync_status: str,
-    fill: PatternFill,
-) -> int:
-    header_row, mapping = find_header_row(ws)
-    row_idx = last_budget_data_row(ws, header_row, mapping) + 1
+def append_budget_row(ws, stage: str, corner: str, clock: ClockInfo, inventory_digest: str, status: str) -> None:
+    mapping = dict((header, index + 1) for index, header in enumerate(CLOCK_BUDGET_HEADERS))
+    row_idx = ws.max_row + 1
     values = {
-        "scenario": scenario,
-        "stage": stage,
-        "corner": corner,
-        "clock_name": clock_name,
-        "propagated": "no",
-        "apply": "no",
-        "sync_status": sync_status,
+        "stage": stage, "corner": corner, "clock_name": clock.clock_name,
+        "clock_kind": clock.clock_kind, "period": clock.period,
+        "propagated": "no", "apply": "", "sync_status": status,
+        "source_inventory_digest": inventory_digest, "note": "",
     }
     for header, value in values.items():
         ws.cell(row_idx, mapping[header], value)
-    style_body_row(ws, row_idx, len(CLOCK_BUDGET_HEADERS), fill)
-    return row_idx
+    fill = NEW_FILL if status == "NEW_FROM_01" else CLEAR_FILL
+    for col_idx in range(1, len(CLOCK_BUDGET_HEADERS) + 1):
+        ws.cell(row_idx, col_idx).fill = fill
+        ws.cell(row_idx, col_idx).border = THIN_BORDER
 
 
-def last_budget_data_row(ws, header_row: int, mapping: Dict[str, int]) -> int:
-    last_row = header_row
-    columns = [mapping[header] for header in CLOCK_BUDGET_HEADERS if header in mapping]
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        if any(clean_cell(ws.cell(row_idx, col_idx).value) for col_idx in columns):
-            last_row = row_idx
-    return last_row
+def metadata_rows(run: RunContext, view: RequiredView, inventory: InventoryContext) -> List[Tuple[str, str]]:
+    return [
+        ("Author", author_name()),
+        ("run_id", run.run_id),
+        ("mode_label", run.mode_label),
+        ("design_revision", run.design_revision),
+        ("view_id", view.view_id),
+        ("stage", view.stage),
+        ("corner", view.corner),
+        ("run completeness", inventory.completeness),
+        ("structure digest", inventory.structure_digest),
+        ("01 inventory path", str(inventory.path.resolve())),
+        ("01 inventory digest", inventory.inventory_digest),
+        ("01 completion path", str(inventory.completion_path.resolve())),
+        ("01 completion digest", inventory.completion_digest),
+        ("Port accounting", "not_applicable"),
+        ("added_bits", "0"),
+    ]
 
 
-def read_budget_rows(ws, header_row: int, mapping: Dict[str, int]) -> List[BudgetRow]:
-    rows: List[BudgetRow] = []
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        values = {header: ws.cell(row_idx, col_idx).value for header, col_idx in mapping.items()}
-        if not any(clean_cell(value) for value in values.values()):
-            continue
-        rows.append(BudgetRow(row_idx=row_idx, values=values))
+def update_metadata(wb: Workbook, run: RunContext, view: RequiredView, inventory: InventoryContext) -> bool:
+    expected = metadata_rows(run, view, inventory)
+    if "runtime_metadata" in wb.sheetnames:
+        ws = wb["runtime_metadata"]
+        current = [(clean(ws.cell(row, 1).value), clean(ws.cell(row, 2).value)) for row in range(2, ws.max_row + 1)]
+        if current == expected:
+            return False
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("runtime_metadata", 0)
+    ws.cell(1, 1, "Field")
+    ws.cell(1, 2, "Value")
+    style_header(ws, 1, ["Field", "Value"])
+    for row_idx, (field, value) in enumerate(expected, start=2):
+        ws.cell(row_idx, 1, field).font = Font(bold=True)
+        ws.cell(row_idx, 2, value)
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 90
+    return True
+
+
+def save_workbook_atomic(wb: Workbook, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(".%s.%s.tmp.xlsx" % (path.stem, os.getpid()))
+    wb.save(str(temporary))
+    os.replace(str(temporary), str(path))
+
+
+def create_workbook(path: Path, run: RunContext, view: RequiredView, inventory: InventoryContext) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = setup_sheet(wb, "clock_budget", CLOCK_BUDGET_HEADERS)
+    setup_sheet(wb, "clock_pair_uncertainty", PAIR_HEADERS)
+    setup_sheet(wb, "derate_ocv", DERATE_HEADERS)
+    update_metadata(wb, run, view, inventory)
+    for name in sorted(inventory.clocks):
+        append_budget_row(ws, view.stage, view.corner, inventory.clocks[name], inventory.inventory_digest, "NEW_FROM_01")
+    if ws.max_row >= 2:
+        table = Table(displayName="clock_budget_table", ref="A1:%s%d" % (get_column_letter(len(CLOCK_BUDGET_HEADERS)), ws.max_row))
+        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+        ws.add_table(table)
+    save_workbook_atomic(wb, path)
+
+
+def sheet_mapping(ws, expected: Sequence[str], label: str, report: Report) -> Tuple[Dict[str, int], bool]:
+    headers = [clean(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+    changed = False
+    duplicate = sorted(item for item in set(headers) if item and headers.count(item) > 1)
+    if duplicate:
+        report.error("%s has duplicate headers: %s" % (label, ",".join(duplicate)))
+    for header in expected:
+        if header not in headers:
+            ws.cell(1, ws.max_column + 1, header)
+            headers.append(header)
+            changed = True
+            report.warn("%s added missing header %s" % (label, header))
+    mapping = dict((header, headers.index(header) + 1) for header in expected if header in headers)
+    style_header(ws, 1, headers)
+    return mapping, changed
+
+
+def read_sheet_rows(ws, mapping: Dict[str, int], key_headers: Iterable[str]) -> List[SheetRow]:
+    rows = []
+    for row_idx in range(2, ws.max_row + 1):
+        values = dict((header, ws.cell(row_idx, col_idx).value) for header, col_idx in mapping.items())
+        if any(clean(values.get(header)) for header in key_headers):
+            rows.append(SheetRow(row_idx, values))
     return rows
 
 
-def row_clock_name(row: BudgetRow) -> str:
-    return clean_cell(row.values.get("clock_name"))
+def row_is_view(row: SheetRow, stage: str, corner: str) -> bool:
+    return clean(row.values.get("stage")) == stage and clean(row.values.get("corner")) == corner
 
 
-def row_scenario_key(row: BudgetRow) -> str:
-    return normalize_key(row.values.get("scenario"))
+def apply_row_fill(ws, row_idx: int, status: str) -> None:
+    fill = CLEAR_FILL
+    if status == "NEW_FROM_01":
+        fill = NEW_FILL
+    elif status == "STALE_NOT_IN_01":
+        fill = STALE_FILL
+    elif status == "BLOCKED_BY_MISSING_SDC":
+        fill = BLOCKED_FILL
+    for col_idx in range(1, ws.max_column + 1):
+        ws.cell(row_idx, col_idx).fill = fill
 
 
-def row_stage_key(row: BudgetRow) -> str:
-    return normalize_key(row.values.get("stage"))
+def row_has_intent(values: Dict[str, object]) -> bool:
+    if clean(values.get("apply")).lower() == "no" and clean(values.get("note")):
+        return True
+    if clean(values.get("propagated")).lower() == "yes":
+        return True
+    return any(clean(values.get(column)) for column in NUMERIC_COLUMNS)
 
 
-def row_corner_key(row: BudgetRow) -> str:
-    return clean_cell(row.values.get("corner"))
-
-
-def scenario_priority(row_scenario: str, target_scenario: str) -> int:
-    if row_scenario == target_scenario:
-        return 2
-    if target_scenario != "common" and row_scenario == "common":
-        return 1
-    return 0
-
-
-def resolve_winning_rows(rows: Sequence[BudgetRow], scenario: str, stage: str, corner: str) -> List[BudgetRow]:
-    winners: Dict[str, Tuple[int, BudgetRow]] = {}
-    for row in rows:
-        clock_name = row_clock_name(row)
-        if not clock_name:
-            continue
-        if row_stage_key(row) != stage:
-            continue
-        if row_corner_key(row) != corner:
-            continue
-        priority = scenario_priority(row_scenario_key(row), scenario)
-        if priority == 0:
-            continue
-        current = winners.get(clock_name)
-        if current is None or priority > current[0]:
-            winners[clock_name] = (priority, row)
-    return [item[1] for item in sorted(winners.values(), key=lambda item: item[1].row_idx)]
-
-
-def refresh_clock_budget_table(ws) -> None:
-    header_row, mapping = find_header_row(ws)
-    last_row = max(last_budget_data_row(ws, header_row, mapping), header_row + 1)
-    table_columns = [mapping[header] for header in CLOCK_BUDGET_HEADERS if header in mapping]
-    first_col = min(table_columns) if table_columns else 1
-    last_col = max(table_columns) if table_columns else len(CLOCK_BUDGET_HEADERS)
-    ref = f"{get_column_letter(first_col)}{header_row}:{get_column_letter(last_col)}{last_row}"
-    ensure_table(ws, "ClockBudget", ref)
-    for row_idx in range(header_row + 1, last_row + 1):
-        style_body_row(ws, row_idx, len(CLOCK_BUDGET_HEADERS))
-
-
-def sync_workbook(
-    wb,
-    form_path: Path,
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-    report: Report,
-) -> Tuple[object, int, Dict[str, int], List[BudgetRow]]:
+def sync_workbook(wb: Workbook, path: Path, view: RequiredView, inventory: InventoryContext, report: Report) -> Tuple[object, Dict[str, int], List[SheetRow]]:
     if "clock_budget" not in wb.sheetnames:
-        raise RuntimeError(f"{form_path.name} does not contain sheet clock_budget")
+        report.error("workbook is missing required sheet clock_budget")
+        return None, {}, []
     ws = wb["clock_budget"]
-    header_row, mapping, header_changed = ensure_clock_budget_headers(ws)
+    mapping, header_changed = sheet_mapping(ws, CLOCK_BUDGET_HEADERS, "clock_budget", report)
     if header_changed:
         report.sync_changed = True
-        report.sync_blocking_changed = True
-        report.warn(f"{form_path.name}: added missing clock_budget header(s)")
-
-    rows = read_budget_rows(ws, header_row, mapping)
-    selected_scenario_corner_clocks = {row_clock_name(row) for row in resolve_winning_rows(rows, scenario, stage, corner)}
-    inv_clocks = set(inventory.clocks)
-
-    missing = sorted(inv_clocks - selected_scenario_corner_clocks)
-    relevant_scenarios = {"common"} if scenario == "common" else {"common", scenario}
-    relevant_rows = [
-        row
-        for row in rows
-        if row_scenario_key(row) in relevant_scenarios and row_stage_key(row) == stage
-    ]
-    stale = sorted({row_clock_name(row) for row in relevant_rows if row_clock_name(row)} - inv_clocks)
-
-    for clock_name in missing:
-        append_clock_row(ws, scenario, stage, corner, clock_name, "NEW_FROM_01", NEW_FILL)
-        report.sync_changed = True
-        report.sync_blocking_changed = True
-        report.warn(
-            f"{form_path.name}: added clock from 01 inventory for scenario {scenario}, "
-            f"corner {corner}: {clock_name}"
-        )
-
-    rows = read_budget_rows(ws, header_row, mapping)
+    rows = read_sheet_rows(ws, mapping, ("stage", "corner", "clock_name"))
+    current = [row for row in rows if row_is_view(row, view.stage, view.corner)]
+    by_name: Dict[str, List[SheetRow]] = {}
+    for row in current:
+        by_name.setdefault(clean(row.values.get("clock_name")), []).append(row)
+    for name in sorted(inventory.clocks):
+        if name not in by_name:
+            append_budget_row(ws, view.stage, view.corner, inventory.clocks[name], inventory.inventory_digest, "NEW_FROM_01")
+            report.warn("added clock %s from 01 inventory to %s/%s" % (name, view.stage, view.corner))
+            report.sync_changed = True
+    rows = read_sheet_rows(ws, mapping, ("stage", "corner", "clock_name"))
     for row in rows:
-        clock_name = clean_cell(row.values.get("clock_name"))
-        if not clock_name:
+        if not row_is_view(row, view.stage, view.corner):
             continue
-        row_is_relevant = row_scenario_key(row) in relevant_scenarios and row_stage_key(row) == stage
-        if row_is_relevant and clock_name in stale:
-            if clock_traces_to_missing_instance(clock_name, inventory.missing_instances):
-                if clean_cell(row.values.get("sync_status")) != SYNC_BLOCKED_MISSING:
-                    ws.cell(row.row_idx, mapping["sync_status"], SYNC_BLOCKED_MISSING)
-                    style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), BLOCKED_FILL)
-                    report.sync_changed = True
-                report.warn(
-                    f"{form_path.name} row {row.row_idx}: {clock_name} is blocked by missing harden SDC; "
-                    "other available clocks may still be generated"
-                )
-            else:
-                if clean_cell(row.values.get("sync_status")) != "STALE_NOT_IN_01":
-                    ws.cell(row.row_idx, mapping["sync_status"], "STALE_NOT_IN_01")
-                    style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), STALE_FILL)
-                    report.sync_changed = True
-                report.sync_blocking_changed = True
-                report.warn(
-                    f"{form_path.name} row {row.row_idx}: stale clock not found in 01 inventory: {clock_name}"
-                )
-            continue
-
-        sync_status = clean_cell(row.values.get("sync_status"))
-        if clock_name in inv_clocks and sync_status in {"NEW_FROM_01", "STALE_NOT_IN_01", SYNC_BLOCKED_MISSING}:
-            if row_ready_for_sync_ok(row):
-                ws.cell(row.row_idx, mapping["sync_status"], "OK")
-                style_body_row(ws, row.row_idx, len(CLOCK_BUDGET_HEADERS), CLEAR_FILL)
+        name = clean(row.values.get("clock_name"))
+        status = clean(row.values.get("sync_status"))
+        if name not in inventory.clocks:
+            desired = "BLOCKED_BY_MISSING_SDC" if inventory.completeness == "partial" else "STALE_NOT_IN_01"
+            if status != desired:
+                ws.cell(row.row_idx, mapping["sync_status"], desired)
                 report.sync_changed = True
-                report.info(
-                    f"{form_path.name} row {row.row_idx} {clock_name}: "
-                    f"sync_status {sync_status} reset to OK"
-                )
-            else:
-                report.warn(
-                    f"{form_path.name} row {row.row_idx} {clock_name}: sync_status {sync_status} "
-                    "is still blocking; fill budget fields for apply=yes, or set apply=no with note"
-                )
-
-    refresh_clock_budget_table(ws)
-    rows = read_budget_rows(ws, header_row, mapping)
-    return ws, header_row, mapping, rows
-
-
-def clock_traces_to_missing_instance(clock_name: str, missing_instances: Sequence[str]) -> bool:
-    for inst_name in missing_instances:
-        if clock_name == inst_name:
-            return True
-        for separator in ("_", "/", "."):
-            if clock_name.startswith(inst_name + separator):
-                return True
-    return False
-
-
-def row_ready_for_sync_ok(row: BudgetRow) -> bool:
-    values = row.values
-    apply_value = normalize_key(values.get("apply"))
-    if apply_value == "yes":
-        return row_generates_any_command(values)
-    if apply_value == "no":
-        return bool(clean_cell(values.get("note")))
-    return False
+            apply_row_fill(ws, row.row_idx, desired)
+            continue
+        clock = inventory.clocks[name]
+        expected_machine = {
+            "clock_kind": clock.clock_kind,
+            "period": clock.period,
+            "source_inventory_digest": inventory.inventory_digest,
+        }
+        machine_changed = False
+        for column, expected in expected_machine.items():
+            if clean(row.values.get(column)) != expected:
+                ws.cell(row.row_idx, mapping[column], expected)
+                machine_changed = True
+        if machine_changed:
+            ws.cell(row.row_idx, mapping["sync_status"], "NEW_FROM_01")
+            apply_row_fill(ws, row.row_idx, "NEW_FROM_01")
+            report.warn("synchronized machine context for clock %s" % name)
+            report.sync_changed = True
+        elif status in {"NEW_FROM_01", "STALE_NOT_IN_01", "BLOCKED_BY_MISSING_SDC"} and row_has_intent(row.values):
+            ws.cell(row.row_idx, mapping["sync_status"], "OK")
+            apply_row_fill(ws, row.row_idx, "OK")
+            report.info("reset reviewed sync_status to OK for clock %s" % name)
+            report.sync_changed = True
+    if report.sync_changed:
+        report.info("workbook synchronization changed %s" % path)
+    return ws, mapping, read_sheet_rows(ws, mapping, ("stage", "corner", "clock_name"))
 
 
-def validate_rows(
-    rows: Sequence[BudgetRow],
-    mapping: Dict[str, int],
-    clocks: Dict[str, ClockInfo],
-    scenario: str,
-    stage: str,
-    corner: str,
-    report: Report,
-) -> None:
-    seen_keys = set()
-    winning_row_ids = {row.row_idx for row in resolve_winning_rows(rows, scenario, stage, corner)}
-    relevant_scenarios = {"common"} if scenario == "common" else {"common", scenario}
-    selected_count = 0
-    for row in rows:
+def parse_number(value: object, label: str, report: Report) -> Optional[str]:
+    text = clean(value)
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        report.error("%s is not numeric: %s" % (label, text))
+        return None
+    if not math.isfinite(number):
+        report.error("%s must be finite" % label)
+        return None
+    if number < 0:
+        report.error("%s must be non-negative" % label)
+        return None
+    return format(number, ".15g")
+
+
+def validate_budget_rows(rows: Sequence[SheetRow], inventory: InventoryContext, view: RequiredView, report: Report) -> List[SheetRow]:
+    current = [row for row in rows if row_is_view(row, view.stage, view.corner)]
+    seen: Dict[Tuple[str, str, str], int] = {}
+    selected_names = set()
+    for row in current:
         values = row.values
-        clock_name = clean_cell(values.get("clock_name"))
-        if not clock_name:
-            report.error(f"clock_budget row {row.row_idx}: missing clock_name")
+        name = clean(values.get("clock_name"))
+        key = (clean(values.get("stage")), clean(values.get("corner")), name)
+        if key in seen:
+            report.error("clock_budget duplicate stage/corner/clock_name %s/%s/%s at rows %d and %d" % (key[0], key[1], key[2], seen[key], row.row_idx))
+        seen[key] = row.row_idx
+        if not name:
+            report.error("clock_budget row %d has blank clock_name" % row.row_idx)
             continue
-
-        row_stage = normalize_key(values.get("stage"))
-        if not row_stage:
-            report.warn(f"clock_budget row {row.row_idx} {clock_name}: stage is blank; expected {stage}")
-        elif row_stage != stage:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: stage={row_stage}, expected {stage}")
-
-        row_scenario = normalize_key(values.get("scenario"))
-        if not row_scenario:
-            report.warn(f"clock_budget row {row.row_idx} {clock_name}: scenario is blank; expected {scenario}")
-        elif row_scenario not in SCENARIOS:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: invalid scenario {row_scenario}")
-
-        row_corner = clean_cell(values.get("corner"))
-        key = (row_scenario, row_stage, row_corner, clock_name)
-        if key in seen_keys:
-            report.error(
-                f"clock_budget row {row.row_idx} {clock_name}: duplicate scenario/stage/corner/clock_name key {key}"
-            )
-        seen_keys.add(key)
-
-        apply_value = normalize_key(values.get("apply"))
-        propagated_value = normalize_key(values.get("propagated"))
-        sync_value = clean_cell(values.get("sync_status"))
-
-        selected = row.row_idx in winning_row_ids
-        if sync_value not in SYNC_VALUES:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: invalid sync_status {sync_value}")
-        if (
-            sync_value == "STALE_NOT_IN_01"
-            and row_scenario in relevant_scenarios
-            and row_stage == stage
-        ):
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: blocking sync_status {sync_value}")
-        if selected and sync_value == "NEW_FROM_01":
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: blocking sync_status {sync_value}")
-
-        if apply_value == "yes" and not row_scenario:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but scenario is blank")
-        if apply_value == "yes" and not row_stage:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but stage is blank")
-        if apply_value == "yes" and not row_corner:
-            report.error(f"clock_budget row {row.row_idx} {clock_name}: apply=yes but corner is blank")
-
-        if not selected:
-            continue
-        selected_count += 1
-        if sync_value == SYNC_BLOCKED_MISSING:
-            report.warn(
-                f"clock_budget row {row.row_idx} {clock_name}: skipped because sync_status={SYNC_BLOCKED_MISSING}"
-            )
-            continue
-        clock_info = clocks.get(clock_name)
-        if clock_info:
-            warn_clock_kind_budget_mismatch(row, clock_info, report)
-        warn_propagated_budget_mismatch(row, report)
-
+        selected_names.add(name)
+        if name not in inventory.clocks:
+            report.error("clock_budget row %d clock %s is not in current 01 inventory" % (row.row_idx, name))
+        status = clean(values.get("sync_status"))
+        if status not in SYNC_VALUES:
+            report.error("clock_budget row %d invalid sync_status %s" % (row.row_idx, status))
+        if status not in SYNC_OK:
+            report.error("clock_budget row %d clock %s has blocking sync_status %s" % (row.row_idx, name, status))
+        apply_value = clean(values.get("apply")).lower()
         if apply_value not in YES_NO:
-            report.error(
-                f"clock_budget row {row.row_idx} {clock_name}: apply must be explicitly yes/no, "
-                f"got {apply_value or '<blank>'}"
-            )
-        if propagated_value and propagated_value not in YES_NO:
-            report.error(
-                f"clock_budget row {row.row_idx} {clock_name}: propagated must be yes/no, got {propagated_value}"
-            )
+            report.error("clock_budget row %d apply must be yes/no" % row.row_idx)
+        propagated = clean(values.get("propagated")).lower()
+        if propagated not in {"", "yes", "no"}:
+            report.error("clock_budget row %d propagated must be yes/no/blank" % row.row_idx)
+        parsed = {}
+        for column in NUMERIC_COLUMNS:
+            parsed[column] = parse_number(values.get(column), "clock_budget row %d %s" % (row.row_idx, column), report)
+        if apply_value == "yes" and not (any(parsed.values()) or propagated == "yes"):
+            report.error("clock_budget row %d apply=yes but no supported command is defined" % row.row_idx)
+        if apply_value == "no" and not clean(values.get("note")):
+            report.error("clock_budget row %d apply=no requires a note" % row.row_idx)
+        if view.stage.lower().startswith("pre") and propagated == "yes":
+            report.warn("clock_budget row %d uses propagated=yes in a pre-CTS-like stage" % row.row_idx)
+        if view.stage.lower().startswith("post") and propagated == "no" and apply_value == "yes":
+            report.warn("clock_budget row %d keeps propagated=no in a post-CTS-like stage" % row.row_idx)
+    missing = sorted(set(inventory.clocks) - selected_names)
+    extra = sorted(selected_names - set(inventory.clocks))
+    if missing:
+        report.error("current view is missing 01 clock(s): " + ",".join(missing))
+    if extra:
+        report.error("current view contains stale clock(s): " + ",".join(extra))
+    if not current:
+        report.error("clock_budget contains no rows for %s/%s" % (view.stage, view.corner))
+    return current
 
-        for col in NUMERIC_COLUMNS:
-            text = clean_cell(values.get(col))
-            number = parse_number(text) if text else None
-            if text and number is None:
-                report.error(f"clock_budget row {row.row_idx} {clock_name}: {col} must be numeric, got {text}")
-            elif number is not None and not math.isfinite(number):
-                report.error(f"clock_budget row {row.row_idx} {clock_name}: {col} must be finite, got {text}")
 
-        if apply_value == "no" and not clean_cell(values.get("note")):
-            report.error(
-                f"clock_budget row {row.row_idx} {clock_name}: apply=no requires a non-empty note"
-            )
-        if apply_value == "yes":
-            if not row_generates_any_command(values):
-                report.error(
-                    f"clock_budget row {row.row_idx} {clock_name}: apply=yes but no timing/propagated fields are set"
-                )
-    report.info(
-        f"resolved {selected_count} winning clock_budget row(s) for scenario={scenario}, "
-        f"stage={stage}, corner={corner}"
+def validate_aux_sheets(wb: Workbook, inventory: InventoryContext, view: RequiredView, report: Report) -> None:
+    for name, headers in (("clock_pair_uncertainty", PAIR_HEADERS), ("derate_ocv", DERATE_HEADERS)):
+        if name not in wb.sheetnames:
+            report.error("workbook is missing required sheet %s" % name)
+            continue
+        ws = wb[name]
+        mapping, changed = sheet_mapping(ws, headers, name, report)
+        if changed:
+            report.sync_changed = True
+        key_headers = ("stage", "corner", "from_clock", "to_clock") if name == "clock_pair_uncertainty" else ("stage", "corner", "derate_scope", "object_type")
+        rows = read_sheet_rows(ws, mapping, key_headers)
+        for row in rows:
+            if not row_is_view(row, view.stage, view.corner):
+                continue
+            values = row.values
+            apply_value = clean(values.get("apply")).lower()
+            if apply_value not in YES_NO:
+                report.error("%s row %d apply must be yes/no" % (name, row.row_idx))
+            if name == "clock_pair_uncertainty":
+                for field in ("from_clock", "to_clock"):
+                    clock_name = clean(values.get(field))
+                    if not clock_name or clock_name not in inventory.clocks:
+                        report.error("%s row %d %s is not a current 01 clock: %s" % (name, row.row_idx, field, clock_name or "<blank>"))
+                setup = parse_number(values.get("setup_uncertainty"), "%s row %d setup_uncertainty" % (name, row.row_idx), report)
+                hold = parse_number(values.get("hold_uncertainty"), "%s row %d hold_uncertainty" % (name, row.row_idx), report)
+                if apply_value == "yes" and not (setup or hold):
+                    report.error("%s row %d apply=yes but setup/hold are both blank" % (name, row.row_idx))
+                if apply_value == "yes":
+                    report.warn("%s row %d is validated but pair command emission is not enabled" % (name, row.row_idx))
+            else:
+                managed = clean(values.get("managed_by_flow")).lower()
+                if managed not in YES_NO:
+                    report.error("%s row %d managed_by_flow must be yes/no" % (name, row.row_idx))
+                early = parse_number(values.get("early"), "%s row %d early" % (name, row.row_idx), report)
+                late = parse_number(values.get("late"), "%s row %d late" % (name, row.row_idx), report)
+                if apply_value == "yes" and not (early or late):
+                    report.error("%s row %d apply=yes but early/late are both blank" % (name, row.row_idx))
+                if managed == "yes":
+                    report.warn("%s row %d derate is managed by external flow; stage 02 will not emit it" % (name, row.row_idx))
+                elif apply_value == "yes":
+                    report.warn("%s row %d is validated but derate command emission is not enabled" % (name, row.row_idx))
+
+
+def tcl_object(name: str) -> str:
+    return "[get_clocks {%s}]" % name.replace("}", "\\}")
+
+
+def generate_sdc(rows: Sequence[SheetRow], run: RunContext, view: RequiredView, inventory: InventoryContext) -> str:
+    lines = [
+        "# Auto-generated by 02_extract_soc_clock_timing.py",
+        "# Author: %s" % author_name(),
+        "# Run ID: %s" % run.run_id,
+        "# Mode label: %s" % run.mode_label,
+        "# Design revision: %s" % run.design_revision,
+        "# View ID: %s" % view.view_id,
+        "# Stage: %s" % view.stage,
+        "# Corner: %s" % view.corner,
+        "# Structure digest: %s" % inventory.structure_digest,
+        "# 01 inventory digest: %s" % inventory.inventory_digest,
+        "# Port accounting: not_applicable; added_bits=0",
+        "",
+    ]
+    command_map = (
+        ("setup_uncertainty", "set_clock_uncertainty -setup {value} {object}"),
+        ("hold_uncertainty", "set_clock_uncertainty -hold {value} {object}"),
+        ("source_latency_early", "set_clock_latency -source -early {value} {object}"),
+        ("source_latency_late", "set_clock_latency -source -late {value} {object}"),
+        ("network_latency_early", "set_clock_latency -early {value} {object}"),
+        ("network_latency_late", "set_clock_latency -late {value} {object}"),
+        ("transition_min", "set_clock_transition -min {value} {object}"),
+        ("transition_max", "set_clock_transition -max {value} {object}"),
     )
-    if selected_count == 0:
-        report.error(f"no winning clock_budget rows found for scenario={scenario}, stage={stage}, corner={corner}")
-
-
-def row_generates_any_command(values: Dict[str, object]) -> bool:
-    if normalize_key(values.get("propagated")) == "yes":
-        return True
-    return any(clean_cell(values.get(col)) for col in NUMERIC_COLUMNS)
-
-
-def warn_clock_kind_budget_mismatch(row: BudgetRow, clock_info: ClockInfo, report: Report) -> None:
-    values = row.values
-    clock_name = row_clock_name(row)
-    clock_kind = normalize_key(clock_info.clock_kind)
-
-    if "virtual" in clock_kind:
-        filled = filled_columns(values, sorted(NETWORK_LATENCY_COLUMNS | TRANSITION_COLUMNS))
-        if filled:
-            report.warn(
-                f"clock_budget row {row.row_idx} {clock_name}: clock_kind={clock_info.clock_kind} "
-                f"has no physical clock network; review filled columns: {', '.join(filled)}"
-            )
-
-    if "generated" in clock_kind:
-        filled = filled_columns(values, sorted(SOURCE_LATENCY_COLUMNS))
-        if filled:
-            report.warn(
-                f"clock_budget row {row.row_idx} {clock_name}: clock_kind={clock_info.clock_kind} "
-                f"usually inherits master source latency; review filled columns: {', '.join(filled)}"
-            )
-
-
-def warn_propagated_budget_mismatch(row: BudgetRow, report: Report) -> None:
-    values = row.values
-    if normalize_key(values.get("propagated")) != "yes":
-        return
-    filled = filled_columns(values, sorted(NETWORK_LATENCY_COLUMNS | TRANSITION_COLUMNS))
-    if filled:
-        report.warn(
-            f"clock_budget row {row.row_idx} {row_clock_name(row)}: propagated=yes means actual clock "
-            f"network is used; review filled columns that may be ignored: {', '.join(filled)}"
-        )
-
-
-def generate_sdc(
-    rows: Sequence[BudgetRow],
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-) -> List[str]:
-    lines = [
-        "################################################################################",
-        (
-            "# Auto-generated SoC clock timing constraints for "
-            f"scenario: {scenario}, stage: {stage}, corner: {corner}"
-        ),
-        f"# Author: {author_name()}",
-        "# Stage: 02_soc_clock_timing",
-        "# Script: 02_extract_soc_clock_timing.py",
-        f"# Scenario: {scenario}",
-        f"# Run completeness: {inventory.completeness}",
-        f"# Port accounting: {PORT_ACCOUNTING_STATUS}",
-        f"# Connection inventory: {CONNECTION_INVENTORY_STATUS}",
-        f"# Harden SDC manifest: {HARDEN_SDC_MANIFEST_STATUS}",
-        f"# Clock inventory: {inventory.path.resolve()}",
-        f"# Clock inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
-        f"# Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
-        f"# Source: 02_soc_clock_timing_budget_{stage}.xlsx clock_budget sheet",
-        "# Rows are resolved by scenario priority: selected scenario > common.",
-        "################################################################################",
-        "",
-    ]
-    emitted_count = 0
-    for row in resolve_winning_rows(rows, scenario, stage, corner):
+    emitted = 0
+    for row in sorted(rows, key=lambda item: clean(item.values.get("clock_name"))):
         values = row.values
-        if normalize_key(values.get("apply")) != "yes":
+        if clean(values.get("apply")).lower() != "yes" or clean(values.get("sync_status")) not in SYNC_OK:
             continue
-        if clean_cell(values.get("sync_status")) not in SYNC_OK:
-            continue
-        clock_name = clean_cell(values.get("clock_name"))
-        commands = commands_for_row(values)
-        if not commands:
-            continue
-        row_scenario = clean_cell(values.get("scenario")) or "unknown_scenario"
-        row_corner = clean_cell(values.get("corner")) or "unknown_corner"
-        lines.append(f"# row {row.row_idx}: {row_scenario} / {row_corner} / {clock_name}")
-        lines.extend(commands)
+        name = clean(values.get("clock_name"))
+        lines.append("# clock_budget row %d: %s" % (row.row_idx, name))
+        object_expr = tcl_object(name)
+        for column, template in command_map:
+            value = parse_number(values.get(column), "internal generation %s" % column, Report())
+            if value is not None:
+                lines.append(template.format(value=value, object=object_expr))
+                emitted += 1
+        if clean(values.get("propagated")).lower() == "yes":
+            lines.append("set_propagated_clock %s" % object_expr)
+            emitted += 1
         lines.append("")
-        emitted_count += len(commands)
-    if emitted_count == 0:
-        lines.append("# No clock timing commands emitted for selected scenario/stage/corner.")
-    return lines
+    if not emitted:
+        lines.append("# No clock timing commands emitted for this view.")
+    return "\n".join(lines).rstrip() + "\n"
 
 
-def commands_for_row(values: Dict[str, object]) -> List[str]:
-    clock_name = clean_cell(values.get("clock_name"))
-    clock_obj = get_clocks(clock_name)
-    commands: List[str] = []
-
-    def add_numeric(column: str, template: str) -> None:
-        value = values.get(column)
-        if clean_cell(value):
-            commands.append(template.format(value=format_number(value), clock=clock_obj))
-
-    add_numeric("setup_uncertainty", "set_clock_uncertainty -setup {value} {clock}")
-    add_numeric("hold_uncertainty", "set_clock_uncertainty -hold {value} {clock}")
-    add_numeric("source_latency_early", "set_clock_latency -source -early {value} {clock}")
-    add_numeric("source_latency_late", "set_clock_latency -source -late {value} {clock}")
-    add_numeric("network_latency_early", "set_clock_latency -early {value} {clock}")
-    add_numeric("network_latency_late", "set_clock_latency -late {value} {clock}")
-    add_numeric("transition_min", "set_clock_transition -min {value} {clock}")
-    add_numeric("transition_max", "set_clock_transition -max {value} {clock}")
-    if normalize_key(values.get("propagated")) == "yes":
-        commands.append(f"set_propagated_clock {clock_obj}")
-    return commands
+def semantic_value(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        return format(value, ".15g")
+    return clean(value)
 
 
-def write_report(
-    path: Path,
-    report: Report,
-    scenario: str,
-    stage: str,
-    corner: str,
-    form_path: Path,
-    output_path: Path,
-    inventory: Optional[InventoryContext] = None,
-) -> None:
-    lines = [
-        "02_soc_clock_timing extraction report",
-        "=====================================",
-        "",
-        f"Author: {author_name()}",
-        "Stage ID: 02_soc_clock_timing",
-        "Script  : 02_extract_soc_clock_timing.py",
-        f"Scenario: {scenario}",
-        f"Stage   : {stage}",
-        f"Corner  : {corner}",
-        f"Run completeness: {inventory.completeness if inventory is not None else 'unknown'}",
-        f"Port accounting: {PORT_ACCOUNTING_STATUS}",
-        f"Connection inventory: {CONNECTION_INVENTORY_STATUS}",
-        f"Harden SDC manifest: {HARDEN_SDC_MANIFEST_STATUS}",
-        f"Form    : {form_path}",
-        f"Output  : {output_path}",
-        f"Warnings: {report.warning_count}",
-        f"Errors  : {report.error_count}",
-        f"Sync changed: {'yes' if report.sync_changed else 'no'}",
-    ]
-    if inventory is not None:
-        lines.extend([
-            f"Missing instances: {', '.join(inventory.missing_instances) or '<none>'}",
-            f"Clock inventory: {inventory.path.resolve()}",
-            f"Clock inventory meta: {inventory.meta_path.resolve() if inventory.meta_path else '<none>'}",
-            f"Final clock SDC: {inventory.final_sdc_path.resolve() if inventory.final_sdc_path else '<none>'}",
-        ])
-    lines.extend(["", "Messages:"])
-    lines.extend(report.lines or ["INFO: no messages"])
-    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+def workbook_semantic_digest(wb: Workbook) -> str:
+    payload = {}
+    for sheet_name, expected in (
+        ("clock_budget", CLOCK_BUDGET_HEADERS),
+        ("clock_pair_uncertainty", PAIR_HEADERS),
+        ("derate_ocv", DERATE_HEADERS),
+    ):
+        ws = wb[sheet_name]
+        headers = [clean(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+        ordered = [header for header in expected if header in headers]
+        mapping = dict((header, headers.index(header) + 1) for header in ordered)
+        rows = []
+        for row_idx in range(2, ws.max_row + 1):
+            row = dict((header, semantic_value(ws.cell(row_idx, mapping[header]).value)) for header in ordered)
+            if any(value != "" for value in row.values()):
+                rows.append(row)
+        payload[sheet_name] = {"headers": ordered, "rows": rows}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256_bytes(canonical)
 
 
-def write_resolved_manifest(
-    path: Path,
-    rows: Sequence[BudgetRow],
-    scenario: str,
-    stage: str,
-    corner: str,
-    inventory: InventoryContext,
-    form_path: Path,
-    output_path: Path,
-) -> None:
-    winners = []
-    for row in resolve_winning_rows(rows, scenario, stage, corner):
+def resolved_manifest_payload(rows: Sequence[SheetRow], run: RunContext, view: RequiredView, inventory: InventoryContext, workbook_digest: str, output_digest: str) -> Dict[str, object]:
+    resolved = []
+    for row in sorted(rows, key=lambda item: clean(item.values.get("clock_name"))):
         values = row.values
-        apply_value = normalize_key(values.get("apply"))
-        sync_value = clean_cell(values.get("sync_status"))
-        emitted = apply_value == "yes" and sync_value in SYNC_OK
-        winners.append({
+        resolved.append({
             "row": row.row_idx,
-            "clock_name": row_clock_name(row),
-            "source_scenario": clean_cell(values.get("scenario")),
-            "apply": apply_value,
-            "sync_status": sync_value,
-            "emitted": emitted,
-            "command_count": len(commands_for_row(values)) if emitted else 0,
+            "clock_name": clean(values.get("clock_name")),
+            "apply": clean(values.get("apply")).lower(),
+            "sync_status": clean(values.get("sync_status")),
+            "emitted": clean(values.get("apply")).lower() == "yes" and clean(values.get("sync_status")) in SYNC_OK,
         })
-    payload = {
+    return {
+        "schema_version": "1.0",
         "author": author_name(),
-        "stage": "02_soc_clock_timing",
-        "script": "02_extract_soc_clock_timing.py",
-        "scenario": scenario,
-        "timing_stage": stage,
-        "corner": corner,
-        "run_completeness": inventory.completeness,
-        "port_accounting": PORT_ACCOUNTING_STATUS,
-        "connection_inventory": CONNECTION_INVENTORY_STATUS,
-        "harden_sdc_manifest": HARDEN_SDC_MANIFEST_STATUS,
-        "missing_instances": list(inventory.missing_instances),
-        "inventory_path": str(inventory.path.resolve()),
-        "inventory_digest": sha256_file(inventory.path),
-        "inventory_meta_path": str(inventory.meta_path.resolve()) if inventory.meta_path else "",
-        "final_sdc_path": str(inventory.final_sdc_path.resolve()) if inventory.final_sdc_path else "",
-        "final_sdc_digest": inventory.final_sdc_digest,
-        "form_path": str(form_path.resolve()),
-        "form_digest": sha256_file(form_path),
-        "output_path": str(output_path.resolve()),
-        "output_digest": sha256_file(output_path),
-        "winning_rows": winners,
+        "stage_name": "02_soc_clock_timing",
+        "run_id": run.run_id,
+        "mode_label": run.mode_label,
+        "design_revision": run.design_revision,
+        "view_id": view.view_id,
+        "stage": view.stage,
+        "corner": view.corner,
+        "structure_digest": inventory.structure_digest,
+        "upstream_01_inventory_digest": inventory.inventory_digest,
+        "upstream_01_completion_digest": inventory.completion_digest,
+        "workbook_semantic_digest": workbook_digest,
+        "output_sdc_digest": output_digest,
+        "port_accounting": "not_applicable",
+        "added_bits": 0,
+        "rows": resolved,
     }
-    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def render_report(report: Report, run: RunContext, view: Optional[RequiredView], inventory: Optional[InventoryContext], diagnose_only: bool, form_path: Path, output_path: Path, completion_path: Path) -> str:
+    lines = [
+        "02 SoC Clock Timing Check Report",
+        "Author: %s" % author_name(),
+        "Run ID: %s" % run.run_id,
+        "Mode label: %s" % run.mode_label,
+        "Design revision: %s" % run.design_revision,
+        "View ID: %s" % (view.view_id if view else ""),
+        "Stage: %s" % (view.stage if view else ""),
+        "Corner: %s" % (view.corner if view else ""),
+        "Required by 02: %s" % ("yes" if view and view.require_02 else "no"),
+        "Diagnose only: %s" % ("yes" if diagnose_only else "no"),
+        "Run completeness: %s" % (inventory.completeness if inventory else "unknown"),
+        "Structure digest: %s" % (inventory.structure_digest if inventory else ""),
+        "01 inventory digest: %s" % (inventory.inventory_digest if inventory else ""),
+        "01 completion digest: %s" % (inventory.completion_digest if inventory else ""),
+        "Workbook: %s" % form_path,
+        "Output SDC: %s" % output_path,
+        "Completion meta: %s" % completion_path,
+        "Port accounting: not_applicable; added_bits=0",
+        "Sync changed: %s" % ("yes" if report.sync_changed else "no"),
+        "Warning count: %d" % report.warning_count,
+        "Error count: %d" % report.error_count,
+        "",
+    ]
+    lines.extend(report.lines)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate one scenario/stage/corner 02 clock timing SDC "
-            "from a stage-specific timing budget xlsx."
-        )
-    )
-    parser.add_argument(
-        "--run-root",
-        help="target runtime root; reads 01_middle/assembled and writes 02_middle/02_result",
-    )
-    parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS), help="timing scenario")
-    parser.add_argument("-stage", "--stage", required=True, choices=sorted(STAGES), help="timing stage")
-    parser.add_argument("-corner", "--corner", required=True, help="corner / analysis view name")
-    parser.add_argument(
-        "-input",
-        "--input",
-        default=None,
-        help="01 clock inventory CSV path",
-    )
-    parser.add_argument("--inventory-meta", help="01 assembled clock inventory meta JSON path")
-    parser.add_argument("--clock-sdc", help="final 01 clock SDC path used for digest and clock-set validation")
-    parser.add_argument("--form", help="stage timing budget workbook path")
-    parser.add_argument(
-        "--report",
-        help="output report path; default: clock_timing_check_report_<scenario>_<stage>_<corner>.txt",
-    )
-    parser.add_argument("--resolved-manifest", help="resolved 02 manifest output path")
-    parser.add_argument(
-        "--require-complete-harden-sdc",
-        action="store_true",
-        help="block when the 01 assembled inventory reports partial harden SDC availability",
-    )
+    parser = argparse.ArgumentParser(description="Generate one single-run stage 02 clock timing view")
+    parser.add_argument("--run-root", required=True, help="single-run SoC SDC root")
+    parser.add_argument("--stage", required=True, help="timing stage, for example prects")
+    parser.add_argument("--corner", required=True, help="case-sensitive timing corner/view")
+    parser.add_argument("--diagnose-only", action="store_true", help="validate/synchronize without formal SDC or completion publication")
     return parser.parse_args(argv)
-
-
-def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
-    candidate = Path(value) if value else Path(default)
-    if candidate.is_absolute():
-        return candidate
-    return base / candidate
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
-    print(f"Author: {author_name()}")
-    scenario = args.scenario
-    stage = args.stage
-    corner = clean_cell(args.corner)
-    if not corner:
-        print("ERROR: -corner must not be blank", file=sys.stderr)
+    run_root = Path(args.run_root).expanduser().resolve()
+    stage = clean(args.stage)
+    corner = clean(args.corner)
+    if not stage or not corner or "/" in stage or "/" in corner or "\\" in stage or "\\" in corner:
+        print("ERROR: stage and corner must be non-blank filename-safe tokens", file=sys.stderr)
         return 2
-    print(f"Scenario: {scenario}")
-    print(f"Timing stage: {stage}")
-    print(f"Corner: {corner}")
-    print(f"Port accounting: {PORT_ACCOUNTING_STATUS}")
-    print(f"Connection inventory: {CONNECTION_INVENTORY_STATUS}")
-    corner_token = safe_filename_token(corner)
-    cwd = Path.cwd()
-    target_layout = bool(args.run_root)
-    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
+
+    form_path = run_root / ("02_middle/02_soc_clock_timing_budget_%s.xlsx" % stage)
+    output_path = run_root / ("02_result/02_soc_clock_timing_%s_%s.sdc" % (stage, corner))
+    manifest_path = run_root / ("02_middle/resolved/%s_%s.manifest" % (stage, corner))
+    completion_path = run_root / ("02_middle/completion/%s_%s.meta" % (stage, corner))
+    report_path = run_root / ("02_result/reports/clock_timing_check_report_%s_%s.txt" % (stage, corner))
     report = Report()
-    if corner_token != corner:
-        report.warn(f"corner name {corner} is written as filename token {corner_token}")
+    run = read_run_context(run_root / "inputs/run_context.csv", report)
+    view = read_required_view(run_root / "inputs/required_views.csv", stage, corner, report)
+    inventory = load_inventory_context(run_root, run, report)
 
-    if target_layout:
-        form_path = resolve_path(
-            run_root,
-            args.form,
-            f"02_middle/02_soc_clock_timing_budget_{stage}.xlsx",
-        )
-        output_path = output_sdc_path(run_root / "02_result", scenario, stage, corner_token)
-        report_path = resolve_path(
-            run_root,
-            args.report,
-            f"02_result/reports/clock_timing_check_report_{scenario}_{stage}_{corner_token}.txt",
-        )
-        inventory_path = resolve_path(
-            run_root,
-            args.input,
-            f"01_middle/assembled/{scenario}/clock_inventory.csv",
-        )
-        meta_path: Optional[Path] = resolve_path(
-            run_root,
-            args.inventory_meta,
-            f"01_middle/assembled/{scenario}/clock_inventory.meta",
-        )
-        clock_sdc_path = resolve_path(run_root, args.clock_sdc, args.clock_sdc) if args.clock_sdc else None
-        resolved_manifest_path = resolve_path(
-            run_root,
-            args.resolved_manifest,
-            f"02_middle/resolved/{scenario}_{stage}_{corner_token}.manifest",
-        )
-    else:
-        form_path = resolve_path(cwd, args.form, f"02_soc_clock_timing_budget_{stage}.xlsx")
-        output_path = output_sdc_path(cwd, scenario, stage, corner_token)
-        report_path = resolve_path(
-            cwd,
-            args.report,
-            f"clock_timing_check_report_{scenario}_{stage}_{corner_token}.txt",
-        )
-        inventory_path = resolve_path(cwd, args.input, "../01_soc_clocks/clock_inventory.csv")
-        if args.inventory_meta:
-            meta_path = resolve_path(cwd, args.inventory_meta, args.inventory_meta)
-        else:
-            candidate_meta = inventory_path.with_suffix(".meta")
-            meta_path = candidate_meta if candidate_meta.is_file() else None
-        if args.clock_sdc:
-            clock_sdc_path = resolve_path(cwd, args.clock_sdc, args.clock_sdc)
-        else:
-            candidate_sdc = cwd / "../01_soc_clocks/common/01_soc_clocks.sdc"
-            clock_sdc_path = candidate_sdc if candidate_sdc.is_file() else None
-        resolved_manifest_path = (
-            resolve_path(cwd, args.resolved_manifest, args.resolved_manifest)
-            if args.resolved_manifest
-            else None
-        )
+    print("Run root: %s" % run_root)
+    print("Run ID: %s" % run.run_id)
+    print("Mode label: %s" % run.mode_label)
+    print("Stage: %s" % stage)
+    print("Corner: %s" % corner)
+    print("Port accounting: not_applicable; added_bits=0")
 
-    report.info(f"resolved run root: {run_root.resolve()}")
-    report.info(f"resolved inventory: {inventory_path.resolve()}")
-    report.info(f"resolved inventory meta: {meta_path.resolve() if meta_path else '<none>'}")
-    report.info(f"resolved final clock SDC: {clock_sdc_path.resolve() if clock_sdc_path else '<from meta or unavailable>'}")
-    report.info(f"resolved timing form: {form_path.resolve()}")
-    report.info(f"resolved output SDC: {output_path.resolve()}")
-    report.info(f"resolved report: {report_path.resolve()}")
+    if not args.diagnose_only and completion_path.exists():
+        completion_path.unlink()
+        report.info("invalidated prior completion meta before formal rerun")
 
-    try:
-        inventory = load_inventory_context(
-            inventory_path,
-            report,
-            expected_scenario=scenario,
-            meta_path=meta_path,
-            clock_sdc_path=clock_sdc_path,
-            require_meta=target_layout,
-        )
-    except Exception as exc:
-        print("Run completeness: unknown")
-        report.error(str(exc))
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path)
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-    if report.error_count:
-        print(f"Run completeness: {inventory.completeness}")
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-        print(f"ERROR: failed to load clean 01 clock inventory. Report: {report_path}", file=sys.stderr)
-        return 1
-    print(f"Run completeness: {inventory.completeness}")
-    print(f"Clock inventory: {inventory.path.resolve()}")
-    if args.require_complete_harden_sdc and inventory.completeness != "complete":
-        report.error(
-            "01 assembled inventory is partial and --require-complete-harden-sdc was requested"
-        )
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-        print(f"ERROR: incomplete harden SDC availability. Report: {report_path}", file=sys.stderr)
+    if view is not None and not view.require_02 and not args.diagnose_only:
+        report.error("view %s (%s/%s) has require_02=no; use --diagnose-only" % (view.view_id, stage, corner))
+
+    if report.error_count or view is None or inventory is None:
+        atomic_write_text(report_path, render_report(report, run, view, inventory, args.diagnose_only, form_path, output_path, completion_path))
+        print("Report: %s" % report_path)
         return 1
 
     if not form_path.is_file():
-        create_new_workbook(form_path, scenario, stage, corner, inventory)
+        create_workbook(form_path, run, view, inventory)
         report.sync_changed = True
-        report.warn(f"created new stage workbook: {form_path}")
-        report.warn("fill timing budget values and set sync_status to OK before generating SDC")
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-        print(f"Created new workbook: {form_path}")
-        print(f"Report: {report_path}")
-        print("SDC was not generated because the workbook needs review.")
+        report.warn("created new stage workbook; fill timing values and review NEW_FROM_01 rows")
+        atomic_write_text(report_path, render_report(report, run, view, inventory, args.diagnose_only, form_path, output_path, completion_path))
+        print("Workbook: %s" % form_path)
+        print("Report: %s" % report_path)
         return 1
 
     try:
-        wb = load_workbook(form_path)
-        ws, header_row, mapping, rows = sync_workbook(
-            wb, form_path, scenario, stage, corner, inventory, report
-        )
-        metadata_changed = update_runtime_metadata_sheet(wb, scenario, stage, corner, inventory)
-        if metadata_changed:
-            report.info(f"updated {RUNTIME_METADATA_SHEET} sheet for current runtime view")
-        if report.sync_changed or metadata_changed:
-            atomic_save_workbook(wb, form_path)
-            if report.sync_blocking_changed:
-                write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-                print(f"Updated workbook: {form_path}")
-                print(f"Report: {report_path}")
-                print("SDC was not generated because clock list sync changed the workbook.")
-                return 1
-            rows = read_budget_rows(ws, header_row, mapping)
-
-        validate_rows(rows, mapping, inventory.clocks, scenario, stage, corner, report)
-        if report.error_count:
-            write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-            print(f"ERROR: validation failed. Report: {report_path}", file=sys.stderr)
-            return 1
-
-        lines = generate_sdc(rows, scenario, stage, corner, inventory)
-        atomic_write_text(output_path, "\n".join(lines).rstrip() + "\n")
-        report.info(f"wrote SDC: {output_path}")
-        if resolved_manifest_path is not None:
-            write_resolved_manifest(
-                resolved_manifest_path,
-                rows,
-                scenario,
-                stage,
-                corner,
-                inventory,
-                form_path,
-                output_path,
-            )
-            report.info(f"wrote resolved manifest: {resolved_manifest_path}")
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
+        wb = load_workbook(str(form_path))
     except Exception as exc:
-        report.error(str(exc))
-        write_report(report_path, report, scenario, stage, corner, form_path, output_path, inventory)
-        print(f"ERROR: {exc}", file=sys.stderr)
-        print(f"Report: {report_path}", file=sys.stderr)
-        return 2
+        report.error("cannot load workbook %s: %s" % (form_path, exc))
+        atomic_write_text(report_path, render_report(report, run, view, inventory, args.diagnose_only, form_path, output_path, completion_path))
+        return 1
 
-    print(f"Form  : {form_path}")
-    print(f"SDC   : {output_path}")
-    print(f"Report: {report_path}")
-    if resolved_manifest_path is not None and resolved_manifest_path.is_file():
-        print(f"Manifest: {resolved_manifest_path}")
-    print(f"Warnings: {report.warning_count}")
-    print(f"Errors  : {report.error_count}")
+    ws, mapping, rows = sync_workbook(wb, form_path, view, inventory, report)
+    metadata_changed = update_metadata(wb, run, view, inventory)
+    validate_aux_sheets(wb, inventory, view, report)
+    if report.sync_changed or metadata_changed:
+        save_workbook_atomic(wb, form_path)
+    if report.sync_changed:
+        report.warn("workbook changed during synchronization; review and rerun before generation")
+        atomic_write_text(report_path, render_report(report, run, view, inventory, args.diagnose_only, form_path, output_path, completion_path))
+        print("Workbook: %s" % form_path)
+        print("Report: %s" % report_path)
+        return 1
+
+    current_rows = validate_budget_rows(rows, inventory, view, report)
+    if report.error_count:
+        atomic_write_text(report_path, render_report(report, run, view, inventory, args.diagnose_only, form_path, output_path, completion_path))
+        print("Report: %s" % report_path)
+        return 1
+
+    workbook_digest = workbook_semantic_digest(wb)
+    if args.diagnose_only:
+        report.info("diagnose-only completed; formal SDC, manifest, and completion were not published")
+        atomic_write_text(report_path, render_report(report, run, view, inventory, True, form_path, output_path, completion_path))
+        print("Diagnostic validation passed.")
+        print("Report: %s" % report_path)
+        return 0
+
+    sdc_text = generate_sdc(current_rows, run, view, inventory)
+    output_digest = sha256_bytes(sdc_text.encode("utf-8"))
+    manifest = resolved_manifest_payload(current_rows, run, view, inventory, workbook_digest, output_digest)
+    atomic_write_text(output_path, sdc_text)
+    atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    completion = {
+        "schema_version": "1.0",
+        "author": author_name(),
+        "stage_name": "02_soc_clock_timing",
+        "run_id": run.run_id,
+        "mode_label": run.mode_label,
+        "design_revision": run.design_revision,
+        "view_id": view.view_id,
+        "stage": stage,
+        "corner": corner,
+        "completion_status": "complete",
+        "error_count": 0,
+        "sync_changed": "no",
+        "structure_digest": inventory.structure_digest,
+        "upstream_01_inventory_path": str(inventory.path.resolve()),
+        "upstream_01_inventory_digest": inventory.inventory_digest,
+        "upstream_01_completion_path": str(inventory.completion_path.resolve()),
+        "upstream_01_completion_digest": inventory.completion_digest,
+        "run_completeness": inventory.completeness,
+        "workbook_path": str(form_path.resolve()),
+        "workbook_semantic_digest": workbook_digest,
+        "resolved_manifest_path": str(manifest_path.resolve()),
+        "resolved_manifest_digest": sha256_file(manifest_path),
+        "output_sdc_path": str(output_path.resolve()),
+        "output_sdc_digest": output_digest,
+        "port_accounting": "not_applicable",
+        "added_bits": 0,
+        "port_accounting_summary": "Port accounting: not_applicable; added_bits=0",
+    }
+    atomic_write_text(completion_path, json.dumps(completion, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+    report.info("published formal SDC, resolved manifest, and completion meta")
+    atomic_write_text(report_path, render_report(report, run, view, inventory, False, form_path, output_path, completion_path))
+    print("SDC: %s" % output_path)
+    print("Manifest: %s" % manifest_path)
+    print("Completion: %s" % completion_path)
+    print("Report: %s" % report_path)
     return 0
 
 
