@@ -14,13 +14,16 @@ Current scope:
 import argparse
 import csv
 import hashlib
+import importlib.util
+import json
 import os
 import re
+import shutil
 import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     from dataclasses import dataclass, field
@@ -1425,7 +1428,7 @@ def build_pad_records(instances: Dict[str, InstInfo]) -> List[PadRecord]:
             if top:
                 add(PadRecord(top, top, inst.inst_name, port.name, "output", source_sdc_status=inst.sdc_status))
         for port in inst.inouts.values():
-            top = clean_top_name(port.inout_name) or top_port_from_connection(port.connectivity) or port.name
+            top = top_port_from_connection(port.connectivity) or clean_top_name(port.inout_name) or port.name
             add(
                 PadRecord(
                     top,
@@ -3048,13 +3051,350 @@ def write_report(
     atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
+def _load_accounting_runtime():
+    """Load the shared 00 workbook/accounting implementation for flat runs."""
+    script_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        script_root / "00_harden_port_inventory" / "00_harden_port_inventory.py",
+        script_root / "00_harden_port_inventory.py",
+        Path(__file__).resolve().with_name("00_harden_port_inventory.py"),
+    ]
+    runtime_path = next((path for path in candidates if path.is_file()), None)
+    if runtime_path is None:
+        raise RuntimeError("shared accounting runtime 00_harden_port_inventory.py was not found")
+    spec = importlib.util.spec_from_file_location("soc_sdc_accounting_runtime_for_04", str(runtime_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load accounting runtime: {runtime_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.STAGE_NAME = "04_soc_io_pads"
+    return module
+
+
+def _read_flat_manifest(path: Path, run_root: Path, instances: Dict[str, InstInfo], report: Report) -> RunCompleteness:
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    if not path.is_file():
+        report.error(f"{path}: HARDEN_SDC_MANIFEST_MISSING")
+        return RunCompleteness(status="invalid", manifest_path=str(path.resolve()))
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        required = {"inst_name", "module_name", "availability_status"}
+        missing_fields = sorted(required - set(reader.fieldnames or []))
+        if missing_fields:
+            report.error(f"{path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing field(s): {', '.join(missing_fields)}")
+        entries: Dict[str, Dict[str, str]] = {}
+        for row_idx, row in enumerate(reader, start=2):
+            name = clean_cell(row.get("inst_name"))
+            if not name:
+                report.error(f"{path.name} row {row_idx}: empty inst_name")
+                continue
+            if name in entries:
+                report.error(f"{path.name} row {row_idx}: duplicate inst_name {name}")
+                continue
+            entries[name] = {key: clean_cell(value) for key, value in row.items()}
+    for name, inst in sorted(instances.items()):
+        entry = entries.get(name)
+        if entry is None:
+            inst.sdc_status = "missing"
+            missing.append(name)
+            report.error(f"{path.name}: manifest missing instance {name}")
+            continue
+        module_name = entry.get("module_name", "")
+        if module_name and module_name != inst.module_name:
+            report.error(f"{path.name}: module mismatch for {name}: info_all={inst.module_name} manifest={module_name}")
+        status = normalize_key(entry.get("availability_status"))
+        inst.sdc_status = status
+        inst.sdc_note = entry.get("note", "")
+        if status == "available":
+            raw_path = entry.get("sdc_path", "") or entry.get("resolved_sdc_path", "")
+            if not raw_path:
+                report.error(f"{path.name}: available instance {name} has no sdc_path")
+                continue
+            sdc_path = Path(raw_path).expanduser()
+            if not sdc_path.is_absolute():
+                sdc_path = run_root / sdc_path
+            if not sdc_path.is_file():
+                report.error(f"{path.name}: available SDC missing for {name}: {sdc_path}")
+            else:
+                inst.sdc_path = sdc_path.resolve()
+                available.append(name)
+                report.info(f"manifest selected {name}: status=available path={inst.sdc_path}")
+        elif status == "missing":
+            missing.append(name)
+            report.warn(f"{path.name}: harden SDC missing for {name}: {inst.sdc_note or '<no note>'}")
+        elif status == "not_required":
+            not_required.append(name)
+        else:
+            report.error(f"{path.name}: invalid availability_status for {name}: {status or '<empty>'}")
+    for name in sorted(set(entries) - set(instances)):
+        report.error(f"{path.name}: orphan manifest instance {name}")
+    status = "partial" if missing and report.error_count == 0 else ("invalid" if report.error_count else "complete")
+    return RunCompleteness(status=status, available_instances=available, missing_instances=missing, not_required_instances=not_required, manifest_path=str(path.resolve()))
+
+
+def _flat_owner_updates(
+    runtime,
+    records: Sequence[Any],
+    rows: Sequence[FormRow],
+    stage: str,
+    corner: str,
+    report: Report,
+) -> List[Dict[str, Any]]:
+    updates: List[Dict[str, Any]] = []
+    by_key: Dict[Tuple[str, str, str], List[Any]] = defaultdict(list)
+    for record in records:
+        by_key[(record.inst_name, record.direction, record.shape.base)].append(record)
+    for row in rows:
+        if not row_selected_for_assembled(row, "common", stage, corner):
+            continue
+        if not (is_apply_approved(row) or is_approved_na(row)):
+            continue
+        values = row.values
+        instance = clean_cell(values.get("subsys_instance"))
+        port = clean_cell(values.get("subsys_port"))
+        direction = normalize_key(values.get("direction")) or normalize_key(values.get("direction_from_integration"))
+        match = re.fullmatch(r"(?P<base>[^\[\]]+)(?:\[(?P<bit>-?\d+)\])?", port)
+        if not match or not instance:
+            report.warn(f"io_constraints row {row.row_idx}: cannot derive accounting port from {instance}/{port}")
+            continue
+        base = match.group("base")
+        bit = int(match.group("bit")) if match.group("bit") is not None else 0
+        candidates = by_key.get((instance, direction, base), [])
+        if not candidates:
+            report.error(f"io_constraints row {row.row_idx}: accounting port not found: {instance}/{direction}/{port}")
+            continue
+        record = candidates[0]
+        if not record.shape.contains(bit):
+            report.error(f"io_constraints row {row.row_idx}: bit {bit} is outside {record.location()}")
+            continue
+        added = {bit} - set(record.used_bits)
+        record.used_bits.add(bit)
+        record.added_bits |= added
+        if added:
+            cell = record.model.workbook[record.sheet].cell(record.row, record.used_col)
+            cell.value = runtime.format_bits(record.used_bits)
+            cell.number_format = "@"
+            record.modified = True
+            record.model.modified = True
+        owner = "PAD_" + hashlib.sha256((clean_cell(values.get("pad_name")) + "|" + instance + "|" + port + "|" + direction).encode("utf-8")).hexdigest()[:16]
+        updates.append({"record": record, "added_bits": added, "owner_object_id": owner, "row": row, "reason": "approved SoC IO/pad constraint" if is_apply_approved(row) else "approved NA disposition"})
+    return updates
+
+
+def run_target_flat(args: argparse.Namespace) -> int:
+    run_root = Path(args.run_root).expanduser().resolve()
+    input_root = run_root / "inputs"
+    middle = run_root / "04_middle"
+    result = run_root / "04_result"
+    form_path = middle / "04_soc_io_pads.xlsx"
+    clock_path = run_root / "01_middle" / "clock_inventory.csv"
+    manifest_path = run_root / "00_middle" / "harden_sdc_manifest.csv"
+    stage, corner = args.stage, args.corner
+    report = Report()
+    runtime = _load_accounting_runtime()
+    runtime.recover_transactions(run_root, report)
+    run_context = runtime.read_run_context(input_root / "run_context.csv", report)
+    required_views = runtime.read_required_views(input_root / "required_views.csv", report)
+    if stage == "all" and corner == "all" and required_views:
+        stage, corner = required_views[0]["stage"], required_views[0]["corner"]
+    current_view = next(
+        (view for view in required_views if view["stage"] == stage and view["corner"] == corner),
+        None,
+    )
+    output_path = result / ("04_soc_io_pads.sdc" if stage == "all" and corner == "all" else f"04_soc_io_pads_{stage}_{safe_filename_token(corner)}.sdc")
+    report_path = result / "reports" / f"io_pad_check_report_{stage}_{safe_filename_token(corner)}.txt"
+
+    info_entries, info_semantic = runtime.read_info_all(input_root / "info_all.xlsx", report)
+    instances: Dict[str, InstInfo] = {}
+    for name, entry in info_entries.items():
+        instances[name] = InstInfo(
+            module_name=entry.get("module_name", name),
+            inst_name=name,
+            owner=entry.get("owner", ""),
+            sdc_hint=entry.get("sdc_path", ""),
+        )
+    completeness = _read_flat_manifest(manifest_path, run_root, instances, report)
+    if args.require_complete_harden_sdc and completeness.missing_instances:
+        report.error(
+            "HARDEN_SDC_COMPLETENESS_REQUIRED: missing harden SDC instance(s): "
+            + ", ".join(completeness.missing_instances)
+        )
+    port_paths = runtime.discover_port_workbooks(input_root, report)
+    models, records = runtime.read_port_workbooks(port_paths, run_root, info_entries, True, report)
+    runtime.validate_connections(records, info_entries, report)
+    structure = runtime.structure_digest(run_context, required_views, info_semantic, records)
+    accounting_before = runtime.accounting_digest(records)
+    port_sheets = read_port_workbooks(port_paths, report)
+    attach_port_data(instances, port_sheets, report)
+    pads = build_pad_records(instances)
+    extracted: List[ExtractedConstraint] = []
+    for inst in instances.values():
+        extracted.extend(extract_constraints_from_instance(inst, "common", report))
+    if report.error_count == 0:
+        sync_workbook(form_path, pads, extracted, report)
+    common_inventory = read_clock_inventory(clock_path, report, "common", required=True)
+    rows = read_form_rows(form_path) if form_path.is_file() else []
+    if rows:
+        validate_rows(
+            rows,
+            pads,
+            "common",
+            stage,
+            corner,
+            common_inventory,
+            {},
+            collect_current_sdc_digests(instances),
+            "",
+            "",
+            "sta",
+            report,
+        )
+    coverage = build_coverage_lines(rows, pads, "common", stage, corner)
+    if report.sync_changed or report.error_count:
+        write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+        return 1
+
+    generated = generate_sdc(rows, "common", stage, corner, "sta", completeness)
+    updates = _flat_owner_updates(runtime, records, rows, stage, corner, report)
+    accounting_after = runtime.accounting_digest(records)
+    if report.error_count:
+        write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+        return 1
+
+    output_payload = ("\n".join(generated).rstrip() + "\n").encode("utf-8")
+    pad_rows = []
+    for pad in pads:
+        pad_rows.append({
+            "pad_name": pad.pad_name,
+            "soc_top_port": pad.soc_top_port,
+            "subsys_instance": pad.subsys_instance,
+            "subsys_port": pad.subsys_port,
+            "direction_from_integration": pad.direction,
+            "is_gpio_or_inout": pad.is_gpio_or_inout,
+            "related_scenarios": pad.related_scenarios,
+            "source_sdc_status": pad.source_sdc_status,
+            "connection_id": pad.connection_id,
+            "scenario_scope": pad.scenario_scope,
+            "connection_type": pad.connection_type,
+            "source_workbook": pad.source_workbook,
+            "source_sheet": pad.source_sheet,
+            "source_row": pad.source_row,
+            "note": pad.note,
+        })
+    flat_pad_headers = PAD_HEADERS + ["direction", "bit_index"]
+    for item in pad_rows:
+        item["direction"] = item["direction_from_integration"]
+        match = re.search(r"\[(-?\d+)\]$", clean_cell(item["subsys_port"]))
+        item["bit_index"] = match.group(1) if match else ""
+    pad_payload = runtime.csv_text(flat_pad_headers, pad_rows).encode("utf-8")
+    pad_meta = {
+        "schema_version": "1.0", "stage_name": "04_soc_io_pads",
+        "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
+        "design_revision": run_context.get("design_revision", ""), "completion_status": "complete",
+        "structure_digest": structure, "accounting_digest_before": accounting_before,
+        "accounting_digest_after": accounting_after, "inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
+        "pad_inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
+    }
+    delta_path = middle / "port_accounting_delta.csv"
+    delta_meta_path = middle / "port_accounting_delta.meta"
+    old_delta_rows = runtime.load_delta_rows(delta_path, report)
+    transaction_id = "04_" + hashlib.sha256((structure + accounting_after + runtime.utc_timestamp()).encode("utf-8")).hexdigest()[:16]
+    new_delta_rows = []
+    for item in updates:
+        record = item["record"]
+        new_delta_rows.append({
+            "schema_version": "1.0", "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
+            "stage_name": "04_soc_io_pads", "transaction_id": transaction_id,
+            "view_id": current_view["view_id"] if current_view else "", "stage": stage, "corner": corner,
+            "structure_digest": structure, "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after,
+            "workbook": record.workbook, "sheet": record.sheet, "row": record.row, "direction": record.direction,
+            "port": record.shape.raw, "legal_bits": runtime.format_bits(set(record.shape.bits())),
+            "added_bits": runtime.format_bits(item["added_bits"]), "final_used_bits": runtime.format_bits(record.used_bits),
+            "owner_object_id": item["owner_object_id"], "reason": item["reason"], "evidence_status": "approved",
+        })
+    delta_payload = runtime.csv_text(runtime.DELTA_HEADERS, old_delta_rows + new_delta_rows).encode("utf-8")
+    old_meta = {}
+    if delta_meta_path.is_file():
+        try:
+            old_meta = json.loads(delta_meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report.warn(f"ignoring malformed prior delta meta: {delta_meta_path}")
+    transaction = {
+        "transaction_id": transaction_id, "committed_at": runtime.utc_timestamp(),
+        "structure_digest": structure, "accounting_digest_before": accounting_before,
+        "accounting_digest_after": accounting_after, "delta_rows_digest": runtime.delta_rows_digest(new_delta_rows),
+    }
+    delta_meta = {
+        "schema_version": "1.0", "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
+        "design_revision": run_context.get("design_revision", ""), "stage_name": "04_soc_io_pads",
+        "completion_status": "complete", "structure_digest": structure,
+        "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after,
+        "delta_csv_digest": hashlib.sha256(delta_payload).hexdigest(),
+        "transactions": list(old_meta.get("transactions", [])) + [transaction],
+    }
+    write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+    completion = {
+        "schema_version": "1.0", "author": author_name(), "stage_name": "04_soc_io_pads", "stage": stage, "corner": corner,
+        "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""), "design_revision": run_context.get("design_revision", ""),
+        "completion_status": "complete", "error_count": 0, "sync_changed": "no", "structure_digest": structure,
+        "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after, "port_accounting": "enabled",
+        "upstream_artifact_digests": {"00_stage_completion": runtime.sha256_file(run_root / "00_middle" / "stage_completion.meta") if (run_root / "00_middle" / "stage_completion.meta").is_file() else "", "01_clock_inventory": runtime.sha256_file(clock_path) if clock_path.is_file() else ""},
+        "output_sdc_digest": hashlib.sha256(output_payload).hexdigest(), "pad_inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
+        "accounting_delta_digest": hashlib.sha256(delta_payload).hexdigest(), "review_workbook_digest": runtime.sha256_file(form_path), "transaction_id": transaction_id,
+    }
+    view_id = current_view["view_id"] if current_view else f"{stage}_{corner}"
+    view_completion = dict(completion)
+    view_completion.update({"view_id": view_id, "output_sdc_digest": hashlib.sha256(output_payload).hexdigest(), "completion_status": "complete"})
+    view_completion_payload = (json.dumps(view_completion, indent=2) + "\n").encode("utf-8")
+    prior_view_digests: Dict[str, str] = {}
+    completion_path = middle / "stage_completion.meta"
+    if completion_path.is_file():
+        try:
+            prior_completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            if prior_completion.get("structure_digest") == structure:
+                prior_view_digests = dict(prior_completion.get("required_view_completions", {}))
+        except (OSError, ValueError, TypeError):
+            prior_view_digests = {}
+    prior_view_digests[view_id] = hashlib.sha256(view_completion_payload).hexdigest()
+    completion["required_view_completions"] = prior_view_digests
+    required_04_ids = {view["view_id"] for view in required_views if view.get("require_04") == "yes"}
+    if required_04_ids and set(prior_view_digests) != required_04_ids:
+        completion["completion_status"] = "review_required"
+    artifact_payloads = [
+        (output_path, output_payload), (report_path, report_path.read_bytes()),
+        (middle / "pad_inventory.csv", pad_payload), (middle / "pad_inventory.meta", (json.dumps(pad_meta, indent=2) + "\n").encode("utf-8")),
+        (delta_path, delta_payload), (delta_meta_path, (json.dumps(delta_meta, indent=2) + "\n").encode("utf-8")),
+        (completion_path, (json.dumps(completion, indent=2) + "\n").encode("utf-8")),
+        (middle / "completion" / f"{safe_filename_token(stage)}_{safe_filename_token(corner)}.meta", view_completion_payload),
+    ]
+    candidate_root = run_root / ".04_candidates"
+    if candidate_root.exists():
+        shutil.rmtree(str(candidate_root))
+    candidate_root.mkdir(parents=True)
+    prepared: Dict[str, Path] = {}
+    for model in models:
+        if model.modified:
+            candidate = candidate_root / model.relative_name
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            model.workbook.save(str(candidate))
+            prepared[model.relative_name] = candidate
+    try:
+        runtime.execute_transaction(run_root, models, prepared, artifact_payloads, transaction_id, run_context, structure, accounting_before, accounting_after, report)
+    finally:
+        if candidate_root.exists():
+            shutil.rmtree(str(candidate_root))
+    return 0
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate 04 SoC IO/pad SDC from extracted/reviewed constraints.")
     parser.add_argument(
         "--run-root",
         help="target runtime root; reads inputs/00_middle/01_middle and writes 04_middle/04_result",
     )
-    parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS), help="target scenario")
+    parser.add_argument("-scenario", "--scenario", default="common", choices=sorted(SCENARIOS), help="legacy scenario; flat target runs are single-run")
     parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES), help="target stage/view")
     parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
     parser.add_argument("-input", "--input", help="common 01 assembled clock inventory CSV")
@@ -3092,6 +3432,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.run_root:
+        flat_manifest = Path(args.run_root).expanduser().resolve() / "00_middle" / "harden_sdc_manifest.csv"
+        if flat_manifest.is_file():
+            return run_target_flat(args)
     cwd = Path.cwd()
     report = Report()
     print(f"Author: {author_name()}")

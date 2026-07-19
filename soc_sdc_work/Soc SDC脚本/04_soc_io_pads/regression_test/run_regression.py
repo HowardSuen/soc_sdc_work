@@ -19,6 +19,8 @@ from openpyxl import Workbook, load_workbook
 
 BASE = Path(__file__).resolve().parent
 SOC = BASE.parent.parent
+EX00 = SOC / "00_harden_port_inventory" / "00_harden_port_inventory.py"
+EX01 = SOC / "01_soc_clocks" / "01_extract_soc_clocks.py"
 EX04 = SOC / "04_soc_io_pads" / "04_extract_soc_io_pads.py"
 WORK = BASE / "work_complex"
 
@@ -568,6 +570,56 @@ def run_target_connection_contract_case():
     require("Pending update: disabled" in report, "no-update-pending status missing from report")
 
 
+def run_flat_target_case():
+    root = WORK / "flat_target"
+    clean_dir(root)
+    inputs = root / "inputs"
+    inputs.mkdir(parents=True)
+    write_info_all(inputs / "info_all.xlsx")
+    write_ports(inputs / "port_u_io.xlsx")
+    wb = load_workbook(str(inputs / "port_u_io.xlsx"))
+    ws = wb["u_io"]
+    columns = header_map(ws)
+    for row in range(2, ws.max_row + 1):
+        ws.cell(row, columns["Input Used Width"], "")
+    ws.delete_rows(4, 1)
+    wb.save(str(inputs / "port_u_io.xlsx"))
+    (inputs / "u_io.sdc").write_text(
+        "set_input_delay -clock [get_clocks dqs_clk] -max 1.25 [get_ports {dq_i[0]}]\n"
+        "set_false_path -from [get_ports {pad_fp[0]}]\n",
+        encoding="utf-8",
+    )
+    with (inputs / "run_context.csv").open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.writer(file_obj)
+        writer.writerow(["run_id", "mode_label", "design_revision", "note"])
+        writer.writerow(["RUN_04_FLAT", "func", "rev_a", "04 flat target regression"])
+    with (inputs / "required_views.csv").open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.writer(file_obj)
+        writer.writerow(["view_id", "stage", "corner", "require_02", "require_04", "require_20", "require_30", "note"])
+        writer.writerow(["prects_ss_125", "prects", "ss_125", "no", "yes", "no", "no", "04 flat view"])
+    with (inputs / "virtual_clocks.csv").open("w", encoding="utf-8", newline="") as file_obj:
+        writer = csv.writer(file_obj)
+        writer.writerow(["clock_name", "period", "waveform", "note"])
+        writer.writerow(["dqs_clk", "10", "0 5", "04 IO reference"])
+
+    stage_00 = sh([EX00, "--run-root", root], BASE)
+    require(stage_00.returncode == 0, "flat 00 setup failed:\n%s\n%s" % (stage_00.stdout, stage_00.stderr))
+    stage_01 = sh([EX01, "--run-root", root], BASE)
+    require(stage_01.returncode == 0, "flat 01 setup failed:\n%s\n%s" % (stage_01.stdout, stage_01.stderr))
+    first = sh([EX04, "--run-root", root], BASE)
+    require(first.returncode == 1, "flat 04 first run should synchronize the review workbook")
+    form = root / "04_middle" / "04_soc_io_pads.xlsx"
+    approve_bit_row(form)
+    second = sh([EX04, "--run-root", root], BASE)
+    require(second.returncode == 0, "flat 04 generation failed:\n%s\n%s" % (second.stdout, second.stderr))
+    require((root / "04_result" / "04_soc_io_pads_prects_ss_125.sdc").is_file(), "flat 04 SDC missing")
+    require((root / "04_middle" / "pad_inventory.csv").is_file(), "flat pad inventory missing")
+    require((root / "04_middle" / "port_accounting_delta.meta").is_file(), "flat accounting meta missing")
+    require((root / "04_middle" / "completion" / "prects_ss_125.meta").is_file(), "flat view completion missing")
+    require(not (root / "00_middle" / "scenario").exists(), "flat 04 unexpectedly required a scenario adapter")
+    require(not (root / "00_middle" / "connection_inventory.csv").exists(), "flat 04 unexpectedly required connection_inventory.csv")
+
+
 def main():
     clean_dir(WORK)
     run_bit_pending_case()
@@ -579,9 +631,10 @@ def main():
     run_target_approved_na_case()
     run_target_delay_conflict_case()
     run_target_connection_contract_case()
+    run_flat_target_case()
     print("04 complex regression: PASS")
     print("  legacy cases: bit_pending, empty_command, noncanonical_port")
-    print("  target cases: machine artifact, partial+strict, scenario, approved NA, conflict, contract gates")
+    print("  target cases: flat direct, machine artifact, partial+strict, scenario, approved NA, conflict, contract gates")
     return 0
 
 

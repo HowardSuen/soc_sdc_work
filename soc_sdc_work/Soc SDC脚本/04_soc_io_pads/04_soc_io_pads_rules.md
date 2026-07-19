@@ -1,257 +1,144 @@
 # 04_soc_io_pads.sdc Rules
 
-本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。target Python 入口已使用 `04_middle/` / `04_result/` 和 00 machine artifacts，不再读取 integration workbook 或重新展开 range；未指定 `--run-root` 时继续保留 legacy cwd 兼容模式。
-
-本文档记录 `04_soc_io_pads.sdc` 的规则边界、输入来源、建议表单格式和后续脚本机制。
-
-当前 target runtime 固定读取：
-
-```text
-00_middle/connection_inventory.csv
-00_middle/scenario/<scenario>/harden_sdc_manifest.csv
-01_middle/assembled/common/clock_inventory.csv
-01_middle/assembled/<scenario>/clock_inventory.csv
-00_middle/scenario/<scenario>/pending/
-```
-
-target 运行入口：
-
-```text
-04_extract_soc_io_pads.py --run-root <run_root> --scenario <scenario>
-```
-
-CLI 显式路径参数可以覆盖固定默认值，但 resolved absolute path 必须写入 report。target 模式不扫描 cwd 猜测 harden SDC，也不把 common clock inventory 当成 scenario effective clock universe。
+本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。04 的 SoC IO/pad 主体功能不变；一个 run root 只有一个场景，04 不接收 scenario，并直接从 port workbook 解析 pad 连接和写销账状态。
 
 ## 1. 目标
 
-`04_soc_io_pads.sdc` 定义 SoC 顶层 IO/pad timing environment。
-
-04 不是单纯搬运下级 iobuffer/module SDC，也不是只维护人工填写的 IO budget。04 的目标是：
-
-- 从 00 connection inventory 识别 SoC pad 与下级 module/subsys port 的连接关系。
-- 从下级 iobuffer/module SDC 中提取已有的 pad 相关约束。
-- 把下级约束提升到 SoC 层级对象。
-- 通过表单记录约束来源、适用范围、review 结论和最终生成状态。
-- 对缺失、冲突、不适用于 SoC 的 IO 约束给出检查报告。
-- 生成 `common/04_soc_io_pads.sdc` 以及后续可能的 scenario 专属 IO SDC。
-
-04 依赖：
-
-- 00 bit-level connection inventory 中的 SoC 架构连接信息。
-- 下级 iobuffer/module SDC。
-- `01_soc_clocks.sdc` 中已经创建好的 clock object，包括 IO delay 使用的 virtual clock、real clock、generated/forwarded clock。
-
-04 不创建 clock。所有供 SoC 层级引用的 `create_clock` / `create_generated_clock`，包括 SoC IO virtual clock，都归属 `01_soc_clocks.sdc`；harden internal/private clock 不属于 04，也不因此提升到 01。
-
-## 2. 放什么
-
-04 可以放：
-
-- SoC 顶层 pad/port 分组。
-- 固定方向、所有相关 scenario 都成立的 `set_input_delay` / `set_output_delay`。
-- input pad 的外部驱动模型，例如 `set_driving_cell` / `set_drive`。
-- input pad 的输入 slew，例如 `set_input_transition`。
-- output pad 的外部负载，例如 `set_load`。
-- 作用于 top IO port 的 IO design rule，例如 `set_max_transition` / `set_max_capacitance`。
-- 与 pad 直接相关、经 review 后确认适用于 SoC 的 `set_false_path`。
-- 与 pad net 直接相关、经 review 后确认适用于综合的 `set_dont_touch_network`。
-- GPIO/inout pad 的方向依赖记录，为 `gpio_in` / `gpio_out` 拆分做准备。
-
-04 不放：
-
-- `create_clock` / `create_generated_clock`。
-- clock timing budget，例如 `set_clock_uncertainty` / `set_clock_latency` / `set_clock_transition`。
-- clock group。
-- harden 内部接口约束。
-- harden-to-harden path exception。
-- 与 pad 无关的普通内部 false path / multicycle / max delay。
-- 全芯片内部 design rule 约束；这类后续如有需要可单独规划。
-
-## 3. 输入来源
-
-### 3.1 00 connection inventory
-
-target 模式使用 00 connection inventory 确定 SoC 层级的 pad 连接关系，例如：
+04 只管理 SoC top IO/pad environment：
 
 ```text
-soc_top_port <-> subsys_instance/module_port
-```
-
-脚本应从 00 machine artifact 获取：
-
-- SoC 下有哪些 subsys/module instance。
-- 哪些下级 port 是 SoC pad 相关 port。
-- SoC top port 名称。
-- 下级 instance path。
-- module port 名称。
-- pad 方向或方向线索。
-- inout/GPIO 是否需要 scenario 拆分。
-
-target 模式不得自动扫描 port workbook。legacy cwd 若仍直接读取表单，只允许 `port_*.xlsx` / `ports_*.xlsx`，并必须与 legacy 00 connection inventory 的 endpoint/`connection_id` 一致。
-
-04 的 coverage 和 pending 消账必须使用 00 canonical bit key。00 中 pad bus/range 已展开为 bit-to-bit edge，例如 `soc_pad_gpio[3] <-> u_iobuf/gpio_i[3]`。生成 SDC 时可以合并同质 bit，但 coverage、conflict check 和 removed log 必须保留 per-bit 明细。脚本解析下级 SDC collection 时必须支持 `[get_ports {dq_i[0]}]`。
-
-04 不重新猜测 bus/range bit order。target 00 inventory 的 `src_port` / `dst_port` 必须是 scalar 或 exact bit key；出现 range/wildcard 或一个 `connection_id` 代表多个 bit 时必须 error。
-
-04 必须按 `scenario_scope = common 或当前 --scenario` 过滤 00 edge；foreign-scenario edge 不得进入 pad inventory、SDC 或销账。
-
-### 3.2 下级 iobuffer/module SDC
-
-下级 SDC 中可能已经包含 pad 相关约束。04 脚本不能默认这些约束缺失。
-
-如果下级 SDC 中存在以下命令，应先提取到 04 表单中作为 candidate：
-
-```tcl
 set_input_delay
 set_output_delay
+set_input_transition / set_driving_cell / set_drive
 set_load
-set_driving_cell
-set_drive
-set_input_transition
-set_false_path
-set_dont_touch_network
-set_max_transition
-set_max_capacitance
+set_max_transition 等明确 IO electrical rule
 ```
 
-提取时必须保留原始来源：
+04 不创建 clock、不定义 clock group、不处理 harden-to-harden normal channel、feedthrough edge 或 exception。
 
-- 原始 SDC 文件。
-- 原始行号。
-- 原始命令。
-- 原始 target object。
-- 提升后的 SoC target object。
+输出：
 
-下级 SDC 中的约束可能有三种情况：
-
-- 已经是 SoC pad environment，可提升后复用。
-- 是 block signoff 环境，不一定适用于 SoC，需要 review。
-- 是内部实现保护或临时 exception，不应进入 SoC 04。
-
-因此，从下级 SDC 提取到的约束默认只作为候选记录；是否最终生成，由表单中的 `apply` / `review_status` 决定。
-
-下级 SDC 中命中支持命令、但 target 00 connection inventory 无 pad edge 可映射的对象，不得进入 `io_constraints`；脚本只在 `extraction_log` 中记录为 `out_of_scope_non_pad`，避免把 20/30 或内部实现约束误归属到 04。
-
-#### 3.2.1 下级 SDC 缺失时
-
-04 默认允许部分 iobuffer/module SDC 未交付。脚本只扫描 harden-SDC manifest 中 `available` 的文件；`missing` 对象的 pad/port 仍根据 00 connection inventory 进入 `pad_inventory`，但 extraction 状态标记为 `missing_sdc` / `incomplete_evidence`。
-
-- 不能因未扫描到下级 SDC 就自动判定该 pad 没有 delay/load/driver/false-path 约束。
-- 依赖下级 SDC 证据的 candidate 保持 pending，不消账。
-- 若人工 IO 表单已给出不依赖缺失 SDC 的完整 approved 约束和 basis，04 可以正常生成并消账。
-- coverage/report 必须区分 `missing because SDC not delivered` 和 `available SDC scanned but constraint not found`。
-
-partial mode 下其它 available harden 继续生成；`--require-complete-harden-sdc` 开启后 missing 才全局阻断。
-
-### 3.3 人工 IO 约束表单
-
-人工表单不是只补缺项，而是 04 的统一约束归集表。
-
-表单中同时记录：
-
-- 从下级 SDC 提取到的已有约束。
-- 人工新增或修正的约束。
-- 明确不需要的 `NA` 项。
-- 被 review 后拒绝生成的约束。
-
-只有扫描完相关下级 SDC 后仍未找到的必要约束，才标记为缺失，等待人工填写或明确标记 `NA`。
-
-## 4. SoC 层级提升规则
-
-下级 SDC 中的 object 不能直接原样进入 SoC SDC，必须根据集成表单提升到 SoC 视角。
-
-### 4.1 SoC top pad port
-
-如果下级 module port 对应 SoC top pad port，则外部 IO environment 应优先作用在 SoC top port 上：
-
-```tcl
-set_load 0.05 [get_ports {soc_pad_uart0_sout}]
-set_input_transition 0.20 [get_ports {soc_pad_uart0_sin}]
+```text
+04_result/04_soc_io_pads[_<stage>_<corner>].sdc
+04_result/reports/io_pad_check_report_<stage>_<corner>.txt
+04_middle/pad_inventory.csv
+04_middle/pad_inventory.meta
+04_middle/port_accounting_delta.csv
+04_middle/port_accounting_delta.meta
+04_middle/stage_completion.meta
+04_middle/completion/<stage>_<corner>.meta
 ```
 
-### 4.2 下级 instance pin
+## 2. 输入来源
 
-如果约束描述的是 SoC 内部 module boundary 的一侧，需要提升为 instance pin：
+### 2.1 Integration forms
 
-```tcl
-set_false_path -from [get_pins {u_iobuf/uart0_sout}] \
-               -to   [get_ports {soc_pad_uart0_sout}]
+04 直接读取：
+
+```text
+inputs/run_context.csv
+inputs/required_views.csv
+inputs/info_all.xlsx
+inputs/port_*.xlsx
+00_middle/harden_sdc_manifest.csv
+00_middle/stage_completion.meta
+01_middle/clock_inventory.csv
+01_middle/stage_completion.meta
+03_middle/stage_completion.meta
 ```
 
-具体使用 `get_ports` 还是 `get_pins`，必须由集成表单中的连接关系决定，不能只靠命令文本猜测。
+pad connection 由以下字段建立：
 
-### 4.3 Net 约束
+- `From Whom = top.<pad>`：top input/inout pad 驱动 harden input。
+- `To Top = top.<pad>` 或 `<pad>`：harden output 驱动 top output pad。
+- `Inout Connectivity = top.<pad>`：harden inout 与 top inout pad 相连。
 
-`set_dont_touch_network [get_nets ...]` 需要特别谨慎。
+04 必须按 actual HDL bit 展开 range。一个 top pad bit 对应多 destination harden input 时可以 fanout，但每条 direct mapping 单独记录。
 
-下级 module 内的 net name 在 SoC 层级未必稳定，脚本应：
+04 不读取 00 connection inventory。
 
-- 尝试根据连接关系找到 SoC 层级 net。
-- 如果无法稳定解析，保留记录但不生成，报告给 reviewer。
-- 区分综合使用和 STA 使用；`set_dont_touch_network` 主要服务综合结构保护，不是 timing environment。
-- 在 STA-only 输出中默认不生成 `set_dont_touch_network`。
-- 未来如果综合结构保护约束变多，可以把这类命令从 04 拆到独立 synthesis constraint 文件；当前放入 04 是为了 SoC 综合/STA 共用规划阶段便于归集 review。
+### 2.2 Harden SDC
 
-## 5. IO 方向和约束类型
+对 manifest 中 `available` 的 harden SDC，04 可提取 boundary IO evidence：
 
-### 5.1 Input pad
-
-input pad 可以使用：
-
-```tcl
+```text
 set_input_delay
+set_output_delay
+set_input_transition
 set_driving_cell
 set_drive
-set_input_transition
-```
-
-说明：
-
-- `set_input_delay` 描述外部 launch/capture timing 与 SoC 接收端之间的时序关系。
-- `set_driving_cell` / `set_drive` 描述外部驱动模型。
-- `set_input_transition` 直接描述输入 slew。
-- `set_driving_cell` 和 `set_input_transition` 一般二选一；若 flow 同时使用，必须在表单中明确原因。
-- `set_driving_cell` 不建议只用自由文本描述，表单应结构化记录 lib cell、pin、from pin 等关键信息；如果下级 SDC 命令过于复杂，允许按原始命令透传，但必须标记并进入 review。
-
-### 5.2 Output pad
-
-output pad 可以使用：
-
-```tcl
-set_output_delay
 set_load
 ```
 
-说明：
+harden internal pin/net 约束不提升。
 
-- `set_output_delay` 描述 SoC 输出到外部接收端之间的时序要求。
-- `set_load` 描述外部负载，例如封装、PCB trace、接收端输入电容。
-- 即使某些 async/untimed output 使用 `set_false_path` 不做常规 setup/hold，`set_load` 仍可能影响 slew、cap、功耗和综合优化质量。
+### 2.3 Missing SDC
 
-### 5.3 Inout / GPIO pad
+- missing harden 只跳过其 SDC evidence，继续处理其它对象。
+- missing 不能解释为 pad 无需约束。
+- 可由人工 IO 表单和明确 board/pad basis 独立批准的 rule 可以生成并销账。
+- 没有足够 evidence 的 pad bit 保持 Used 状态不变。
 
-inout/GPIO pad 的方向通常依赖 scenario。
-
-建议拆分：
+### 2.4 Manual IO workbook
 
 ```text
-scenarios/gpio_in.sdc
-scenarios/gpio_out.sdc
+04_middle/04_soc_io_pads.xlsx
 ```
 
-规则：
+人工值、board/library reference 和 NA basis 均在该 workbook review。
 
-- `gpio_in` 场景使用 input timing 约束，例如 input delay。
-- `gpio_out` 场景使用 output timing 约束，例如 output delay。
-- `set_load`、`set_input_transition`、`set_driving_cell` 等电气环境不完全等同于 input/output timing delay。某些物理负载、板级 cap 或输入 slew 在不同方向场景中仍有意义，可以放 common 或 view-specific 04，但必须在表单中说明适用方向和依据。
-- 如果方向由 `set_case_analysis` 或 mode select 决定，该 case analysis 应在 scenario pre-setup 阶段注入。
-- 不要把方向相关的 input/output 约束都放进 common。
+## 3. SoC 层级对象
 
-## 6. Timed / Async / Untimed 分类
+### 3.1 Top pad port
 
-每个 pad/interface 应在表单中明确 timing classification。
+SDC target 应是 SoC top port：
 
-建议取值：
+```tcl
+[get_ports {pad_name}]
+[get_ports {pad_name[3]}]
+```
+
+### 3.2 Harden instance pin
+
+harden boundary pin 只用于 traceability 和 mapping，不应把 IO environment 约束留在 `[get_pins u_harden/...]`，除非项目明确要求 block-boundary exception 且不属于 04。
+
+### 3.3 Net
+
+第一版不以 `get_nets` 作为常规 IO target；无法映射到 top port 时进入 review，不自动扩大 collection。
+
+## 4. 方向和约束类型
+
+### 4.1 Input pad
+
+可能需要：
+
+```text
+input_delay max/min
+input_transition 或 driving_cell/drive
+```
+
+### 4.2 Output pad
+
+可能需要：
+
+```text
+output_delay max/min
+load
+max_transition
+```
+
+### 4.3 Inout / GPIO
+
+inout 必须明确当前 run 的方向和 case 条件。实际连接来自 `Inout Connectivity`；`Inout Name` 是销账状态列。
+
+- 当前 run 作为 input：按 input rule 生成。
+- 当前 run 作为 output：按 output rule 生成。
+- 方向未确定：保持 review，不生成 broad 双向约束。
+- `bidirectional` 不属于单场景 runtime 的合法 effective direction；若硬件需要同一分析中双向计时，必须拆成独立 run。本规则只要求当前 run 的 input 或 output 一类覆盖。
+
+## 5. Timing 分类
+
+建议 `io_class`：
 
 ```text
 timed
@@ -260,542 +147,196 @@ untimed
 config
 ```
 
-### 6.1 `timed`
+- `timed`：有 clock/reference 和 input/output delay。
+- `async`：不走普通 synchronous IO delay；若需要 false path/CDC rule，交 30。
+- `untimed`：必须有 approved NA basis。
+- `config`：根据协议决定 timing 或 exception owner。
 
-需要 STA 分析的外部接口，例如同步 SPI、SDIO、DDR-like interface 或其它有明确 timing budget 的接口。
+分类不能只靠名字。
 
-要求：
+## 6. Stage / Corner
 
-- 应有 `set_input_delay` 或 `set_output_delay`。
-- delay 命令引用的 clock 必须在 01 中存在。
-- 不应被下级 SDC 中的 broad `set_false_path` 静默切掉。
-- 如果下级 SDC 同时给出 false path 和 delay，必须报冲突，人工确认。
+一个 run 可有多个 timing stage/corner row。生成时按 `--stage` / `--corner` 选择当前 view；不再按 scenario 分层。
 
-### 6.2 `async`
+04 只允许正式生成 `required_views.csv` 中 `require_04=yes` 的 view；非 required view 只能显式 diagnostic 运行。
 
-异步接口，例如常见 UART、异步 GPIO、外部中断等。
+view-independent electrical rule（如 load、input_transition）如果重复出现在多个 view，assembled 结果必须唯一且数值一致。
 
-规则：
+## 7. Review Workbook
 
-- 可以使用 `set_false_path` 切断普通同步 STA。
-- 可以没有 input/output delay，但必须在表单中明确 `timing_class = async` 并写明依据。
-- 仍建议根据综合/DRC 需要填写 input transition、driving model 或 output load；若不需要，标记 `NA`。
-
-### 6.3 `untimed`
-
-不参与 STA timing 的结构性 pad、模拟 pad、strap、test-only pad 等。
-
-规则：
-
-- 可以没有 input/output delay。
-- 必须有明确用途说明。
-- 若保留 `set_false_path`，必须说明适用范围，不能作为清 timing violation 的临时手段。
-
-### 6.4 `config`
-
-配置类 pad 或控制信号。
-
-规则：
-
-- 若在某 scenario 中被固定，应由 scenario pre-setup 的 `set_case_analysis` 表达。
-- 若只是异步配置输入，可按 `async` 或 `untimed` 处理，但必须写明依据。
-
-## 7. Common 与 Scenario
-
-04 采用 common + scenario 叠加模型。
-
-04 中所有 `clock_name` / virtual clock / source-synchronous clock 检查必须使用 01 assembled inventory。common 行使用 `01_middle/assembled/common/clock_inventory.csv`；scenario 行使用 `01_middle/assembled/<scenario>/clock_inventory.csv`。不得只读 common inventory 生成 scenario-specific IO 约束，也不得由 04 自行合并 common/scenario clock。legacy cwd 模式继续接受 `--input` + optional `--scenario-input`，只用于旧流程兼容。
-
-输出建议：
-
-```text
-common/04_soc_io_pads.sdc
-scenarios/<scenario>_io_pads.sdc
-```
-
-归属规则：
-
-- `scenario = common`：只放所有相关 mode 都成立的 IO/pad 约束。
-- `scenario != common`：只放该 scenario 下才成立的 IO/pad 约束。
-- GPIO/inout 方向相关约束应下沉到 `gpio_in` / `gpio_out` 等 scenario。
-- scan/mbist/test 专属 IO 约束应下沉到对应 scenario。
-- 如果某条 common IO 约束在某个 scenario 下不成立，说明它不应在 common。
-
-04 不采用 02 的 resolved-single-file 模型；scenario 04 文件用于追加 scenario 专属约束，不应依赖后 source 覆盖 common 中的同一对象。
-
-### 7.1 Stage / Corner / View 维度
-
-04 需要显式保留 stage/corner 维度，但不要求所有 IO 约束都强制按 stage/corner 拆分。
-
-原因：
-
-- `set_input_delay` / `set_output_delay` 多数来自板级 timing budget 或接口协议，通常可以视为 corner-independent。
-- `set_load`、`set_driving_cell`、`set_drive`、`set_input_transition`、`set_max_transition`、`set_max_capacitance` 属于电气/DRC 环境，在 signoff MMMC 下可能随 PVT/corner、library view 或综合/STA stage 变化。
-- SDC 本身没有 corner 条件化能力；如果同一 scenario 下同一 pad 的电气约束在不同 corner 有不同取值，不能平铺到同一个 04 SDC 文件中。
-
-建议第一版采用两类输出：
-
-```text
-View-independent:
-  common/04_soc_io_pads.sdc
-  scenarios/<scenario>_io_pads.sdc
-
-View-specific, when needed:
-  common/04_soc_io_pads_<stage>_<corner>.sdc
-  scenarios/<scenario>_io_pads_<stage>_<corner>.sdc
-```
-
-归属规则：
-
-- 板级 delay 若项目确认 corner/stage 无关，可放入 view-independent 04。
-- 电气类约束若项目确认所有 view 共用，也可以放入 view-independent 04，但必须在表单中显式标记 `stage = all`、`corner = all` 或等价取值。
-- 电气类约束若随 stage/corner/view 变化，必须输出到带 `<stage>_<corner>` 的 04 文件。
-- 同一个 assembled view 中不能同时存在 view-independent 和 view-specific 的同类冲突约束；必须通过表单裁决，不能靠 source 顺序覆盖。
-
-Stage 5 装配时，建议按当前 scenario/stage/corner 选择性 source：
-
-```tcl
-source common/04_soc_io_pads.sdc
-source common/04_soc_io_pads_<stage>_<corner>.sdc          ;# if exists
-source scenarios/<scenario>_io_pads.sdc                    ;# if exists
-source scenarios/<scenario>_io_pads_<stage>_<corner>.sdc    ;# if exists
-```
-
-### 7.2 Assembled-view 检查
-
-04 虽然采用 common + scenario 叠加模型，但每个具体 STA/综合 view 都必须形成一个可检查的 assembled view：
-
-```text
-assembled_04_view = common rows
-                  + common stage/corner rows
-                  + current scenario rows
-                  + current scenario stage/corner rows
-```
-
-脚本必须按 `scenario + stage + corner` 建立 assembled view，并做跨层冲突和覆盖检查。
-
-以下情况不能静默通过：
-
-- common 与 scenario 对同一 pad、同一 constraint_type 生成互相冲突的 approved 约束。
-- view-independent 与 view-specific 对同一 pad、同一 constraint_type 生成互相冲突的 approved 约束。
-- scenario 约束试图靠后 source 覆盖 common 约束。
-- 同一个 pad 的 timed delay 与 false path 在 assembled view 中同时生效，且没有显式裁决。
-- `apply = yes` 且 `review_status = approved` 的当前输出行必须能实际 emit 至少一条 SDC 命令；例如 `false_path` 缺少可透传的 `rewritten_command` / `original_command`、或 `set_load` 缺少 value 时，应报 error，不能静默跳过。
-
-coverage report 也应按 assembled view 输出，而不是只基于静态 pad inventory。
-
-### 7.3 Pending 消账
-
-04 完成生成后可以从 target runtime 的 `00_middle/scenario/<scenario>/pending/*.ports` 删除已被 04 覆盖的 pad-related harden port，并写入：
-
-```text
-04_middle/scenario/<scenario>/removed_log/04_soc_io_pads.removed
-```
-
-legacy cwd 兼容模式仍使用：
-
-```text
---pending-root 00_harden_port_inventory
---no-update-pending
-```
-
-target 模式默认不需要传 `--pending-root`；该参数只用于显式覆盖 00 pending root。`--no-update-pending` 在两种模式下都可用。
-
-删除规则：
-
-- 只删除 assembled view 中已有 approved 04 记录的 pad 对应 harden port，或有 approved `source_type = na` 明确说明的 pad。
-- 纯粹出现在 `pad_inventory`、但缺少必要 timing/electrical/NA review 记录的 port 不能删除。
-- 删除必须使用 exact canonical key，例如 `input dq_i[0]`；不能用整 bus、range 或 pattern 删除。
-- 若 port 已被更早 stage 删除，脚本可通过 previous removed log 豁免重复删除；若既不在 pending、也没有 previous removed 记录，应报 error。
-
-## 8. 建议表单
-
-建议第一版使用一个 workbook：
-
-```text
-04_soc_io_pads.xlsx
-```
-
-建议包含以下 sheet：
+建议 sheets：
 
 ```text
 io_constraints
 pad_inventory
 extraction_log
+run_metadata
 ```
 
-第一版脚本可以强制支持 `io_constraints`，其它 sheet 作为 review 辅助。
-
-### 8.1 Sheet: `io_constraints`
-
-一行描述一条候选或最终 IO/pad 约束。
+### 7.1 `io_constraints`
 
 建议字段：
 
 ```text
-scenario
+constraint_id
 stage
 corner
 pad_name
-soc_object
-subsys_instance
-subsys_port
 direction
-timing_class
+io_class
 constraint_type
 clock_name
-value
 min_value
 max_value
-rise_value
-fall_value
-delay_edge
-delay_polarity
-add_delay
-drive_lib_cell
-drive_pin
-drive_from_pin
-drive_input_transition_rise
-drive_input_transition_fall
-object_granularity
-unit_time
-unit_cap
-extra_options
-source_type
-source_sdc_status
-source_sdc_file
-source_line
-source_digest
-extraction_time
-original_command
-original_object
+value
+from_collection
+to_collection
 apply
 review_status
 owner
 basis
+source_type
+source_file
+source_line
+source_digest
 note
 ```
 
-字段含义：
+### 7.2 `pad_inventory`
+
+每个 exact pad bit 一行，记录：
 
 ```text
-scenario          common / func / scan / mbist / gpio_in / gpio_out
-stage             all / synth / prects / postcts / postroute；view-independent 行建议填 all
-corner            all 或项目 corner/view 名，例如 ss_125 / ff_m40；view-independent 行建议填 all
-pad_name          稳定 pad 名，建议使用 SoC top pad 名或项目 pad ID
-soc_object        生成 SDC 时使用的 SoC 层级 object，例如 get_ports/get_pins 的 object 名
-subsys_instance   下级 subsys/module instance path
-subsys_port       下级 module canonical port key；bus bit 使用 port[index]
-direction         input / output / inout / unknown
-timing_class      timed / async / untimed / config
-constraint_type   input_delay / output_delay / load / driving_cell / drive / input_transition / false_path / dont_touch_network / max_transition / max_capacitance
-clock_name        约束引用的 clock；必须引用 01 已创建的 clock，非 clock 约束可为空；不限 virtual clock
-value             单值约束，例如 load、input_transition、drive
-min_value         min delay / min transition 等
-max_value         max delay / max transition 等
-rise_value        rise 数据边沿特定值
-fall_value        fall 数据边沿特定值
-delay_edge        data_rise / data_fall / both；用于 input/output delay 的 -rise / -fall
-delay_polarity    clock_rise / clock_fall；clock_fall 生成 -clock_fall
-add_delay         yes/no；yes 时生成 -add_delay
-drive_lib_cell    set_driving_cell 使用的 -lib_cell
-drive_pin         set_driving_cell 使用的 -pin
-drive_from_pin    set_driving_cell 使用的 -from_pin
-drive_input_transition_rise  set_driving_cell 可选输入 rise transition
-drive_input_transition_fall  set_driving_cell 可选输入 fall transition
-object_granularity  single_pad / port_list / pattern；表单建议 single_pad，生成时可合并
-unit_time         原始约束时间单位，例如 ns；用于检查与 SoC flow 单位一致
-unit_cap          原始约束电容单位，例如 pF；用于检查与 SoC flow 单位一致
-extra_options     只放暂未结构化支持的额外 SDC 选项；不能承载已定义字段的语义
-source_type       extracted / manual / na
-source_sdc_status available / missing / not_required；manual 行可为 not_required
-source_sdc_file   从下级 SDC 提取时的原始文件
-source_line       从下级 SDC 提取时的原始行号
-source_digest     原始 SDC 文件 hash/digest；用于判断重抽后记录是否失效
-extraction_time   提取时间戳
-original_command  原始 SDC 命令文本
-original_object   原始命令中的 target/source object
-apply             yes / no
-review_status     pending / approved / rejected
-owner             约束 owner 或确认人
-basis             约束依据，例如 IO spec、board spec、subsys owner review、CDC/STA methodology
-note              人工备注
-```
-
-### 8.2 Sheet: `pad_inventory`
-
-记录从 00 connection inventory 推导出的 pad 清单，并保留 00 source workbook/sheet/row trace。
-
-建议字段：
-
-```text
-pad_name
-soc_top_port
-subsys_instance
-subsys_port
-direction_from_integration
-is_gpio_or_inout
-related_scenarios
-source_sdc_status
-connection_id
-scenario_scope
-connection_type
+pad_id
+view_id
+stage
+corner
+top_port
+direction
 source_workbook
 source_sheet
 source_row
+harden_instance
+harden_port
+harden_bit_index
+connection_status
+sdc_status
+coverage_status
 note
 ```
 
-该 sheet 用于检查哪些 SoC pad 已有约束、哪些 pad 完全没有记录。
+该 sheet 是 04 owner inventory，不替代原始 port workbook。多 view row 按 `pad_id/view_id` 共存，resolved CSV 不得在后续 view 运行时删除其它已 committed view。
 
-### 8.3 Sheet: `extraction_log`
-
-记录脚本从下级 SDC 中提取到的原始命令和解析状态。
-
-建议字段：
+04 必须把该 sheet 的 resolved machine view 发布为：
 
 ```text
-source_sdc_file
-source_sdc_status
-source_line
-command_type
-original_command
-parse_status
-mapped_soc_object
-source_digest
-extraction_time
-message
+04_middle/pad_inventory.csv
+04_middle/pad_inventory.meta
 ```
 
-该 sheet 用于 debug 和人工追溯，不直接生成 SDC。
+除上述字段外，machine view 还必须记录 `pad_disposition`、`apply/review_status`、`related_exception_intent`、structure digest、source digest 和当前 exact endpoint。`pad_id` 使用 canonical pad tuple 的完整 SHA-256，不得使用易碰撞的可读字符串替换。
 
-## 9. 生成规则
-
-脚本生成 SDC 时只使用：
-
-- `apply = yes`
-- `review_status = approved`
-- `source_type != na`
-
-如果项目希望 draft 阶段允许 `pending` 行生成，必须通过脚本选项显式打开，不能作为默认行为。
-
-生成时先按当前目标文件筛选：
-
-- view-independent 文件只生成 `stage = all` 且 `corner = all` 的行。
-- view-specific 文件只生成当前 `stage + corner` 的行。
-- scenario 文件只生成对应 scenario 的行。
-- `scenario = common` 只输出到 `common/`。
-- `scenario != common` 只输出到 `scenarios/`。
-
-### 9.1 数值字段优先级
-
-生成器必须按以下规则解释数值字段：
-
-- 对 delay 类约束，`min_value` / `max_value` 优先于 `value`。
-- 如果 `min_value` 非空，生成一条 `-min` delay。
-- 如果 `max_value` 非空，生成一条 `-max` delay。
-- 如果 `min_value` 和 `max_value` 都为空、`value` 非空，生成不带 `-min/-max` 的单值命令；是否允许该用法由项目 flow 决定，默认 warning。
-- `value` 不应与 `min_value` / `max_value` 同时填写；同时填写时应 warning 或 error。
-- `rise_value` / `fall_value` 用于 data edge 特定值。若填写 rise/fall，应结合 `delay_edge` 生成 `-rise` / `-fall` 命令；不能再把同一语义写进 `extra_options`。
-- `rise_value` / `fall_value` 不应与 `value` / `min_value` / `max_value` 在同一行混填；需要同时表达 rise/fall 和 min/max 时，应拆成多行。
-
-### 9.2 多边沿 / source-synchronous delay
-
-真实 source-synchronous 或 DDR-like 接口允许同一 pad 多行表达不同边沿和 min/max：
+`pad_disposition` 使用：
 
 ```text
-pad_name | constraint_type | clock_name | delay_edge | delay_polarity | add_delay | min_value | max_value
-dq0      | input_delay     | dqs_clk    | data_rise  | clock_rise     | no        | 0.10      |
-dq0      | input_delay     | dqs_clk    | data_rise  | clock_rise     | yes       |           | 0.80
-dq0      | input_delay     | dqs_clk    | data_fall  | clock_fall     | yes       | 0.12      |
-dq0      | input_delay     | dqs_clk    | data_fall  | clock_fall     | yes       |           | 0.85
+constrained
+not_applicable
+route_to_30
+pending
 ```
 
-生成时：
+- async/config pad path 需要 exception 时必须是 `route_to_30`；04 不为该 path 销账。
+- `route_to_30` 必须 `apply=yes + review_status=approved`，并保留 pad electrical owner 状态供 30 引用。
 
-- `delay_edge = data_rise` 生成 `-rise`。
-- `delay_edge = data_fall` 生成 `-fall`。
-- `delay_edge = both` 或空值不生成 data edge option。
-- `delay_polarity = clock_fall` 生成 `-clock_fall`。
-- 对每个 `(pad_name, constraint_type, clock_name)` emit group，第一条实际生成的 delay 命令必须作为 base delay，不带 `-add_delay`；之后所有 delay 命令都必须带 `-add_delay`。
-- 如果一行会生成多条 delay 命令，例如同时填写 `rise_value` 和 `fall_value`，或同时填写 `min_value` 和 `max_value`，则该行内也按命令级处理：该 group 的第一条命令不带 `-add_delay`，同一行的后续命令强制带 `-add_delay`。
-- 如果表单中该 group 的所有行都填了 `add_delay = yes`，生成器应把第一条实际 emit 命令作为 base delay，不带 `-add_delay`，并在 report 中 warning。
-- 如果表单中多条行都填了 `add_delay = no`，生成器应报 warning 或 error，要求 reviewer 明确哪一条是 base delay。
-- 同一 pad 上多条 delay 行是合法表达，不应被当成重复冲突；冲突判断应把 `constraint_type + clock_name + min/max + delay_edge + delay_polarity + add_delay` 一起纳入 key。
+### 7.3 `extraction_log`
 
-### 9.3 `set_driving_cell`
+记录每条 harden SDC evidence 的原命令、解析状态、映射 pad 和忽略原因。
 
-`set_driving_cell` 应优先由结构化字段生成：
+## 8. 生成规则
 
-```tcl
-set_driving_cell -lib_cell <drive_lib_cell> \
-                 -pin <drive_pin> \
-                 -from_pin <drive_from_pin> \
-                 [get_ports {...}]
-```
+- 只生成 `apply=yes + review_status=approved` 的 row。
+- `clock_name` 必须存在于 `01_middle/clock_inventory.csv`，virtual clock 也必须由 01 创建。
+- max/min 配对按 constraint_type 明确，不能把 blank 当 0。
+- numeric value 必须 finite。
+- `set_driving_cell` 必须有 library cell/pin 信息。
+- 每条命令 target 必须是 exact top port/bit；不允许未 review 的 wildcard/range 扩大。
+- 同一 assembled view 的重复 rule 必须数值一致，否则 error。
 
-`drive_pin`、`drive_from_pin` 按 tool 支持情况可为空。若使用 rise/fall input transition 选项，应来自 `drive_input_transition_rise` / `drive_input_transition_fall`。
+## 9. Port Accounting
 
-如果下级 SDC 的 `set_driving_cell` 命令包含项目第一版暂不支持的复杂选项，可以：
-
-- 把原始命令放入 `original_command`。
-- `constraint_type = driving_cell`。
-- `source_type = extracted`。
-- 在 `note` 中标记 `passthrough_required`。
-- 生成器只在人工 review approved 后做受控透传；不能把复杂选项拆进自由文本后无检查拼接。
-
-### 9.4 Object 粒度
-
-表单建议按 single pad 拆行，便于 coverage 和冲突检查。
-
-允许 `soc_object` 表示 port list 或 pattern，但必须设置：
+04 对 approved terminal pad bit 更新对应 harden row：
 
 ```text
-object_granularity = port_list / pattern
+input  -> Input Used Width
+output -> Output Used Width
+inout  -> Inout Name
 ```
 
-生成器可以在输出 SDC 时把多个等价 single-pad 行合并为一个 port list，以提高可读性；coverage report 仍应按单个 pad 展开。
+允许 terminal：
 
-生成命令示例：
+- 已生成所需 IO timing/electrical constraint。
+- 已批准 `untimed/not_applicable`，且 owner/basis/reviewer 完整。
+- missing SDC 情况下存在独立的 board/pad architecture basis。
 
-```tcl
-set_input_delay -clock [get_clocks {v_uart_rx}] -max 5.000 [get_ports {pad_uart0_sin}]
-set_output_delay -clock [get_clocks {v_uart_tx}] -max 4.000 [get_ports {pad_uart0_sout}]
-set_load 0.050 [get_ports {pad_uart0_sout}]
-set_input_transition 0.200 [get_ports {pad_uart0_sin}]
+不销账：
+
+- pending/rejected row。
+- 仅存在 candidate 或自动名称分类。
+- async/config 但 exception 尚未由 30 批准。
+- mapping unresolved 或 direction 未确定。
+
+`route_to_30` intent 即使已 approved 也不由 04 销账；30 正式 exception 成功后负责该 exception-only endpoint。
+
+写回采用 exact bit union，不再生成 pending/removed log。若 top pad fanout 到多个 harden sink，每个 sink bit 分别更新。04 必须通过共享 transaction 提交，并输出：
+
+```text
+04_middle/port_accounting_delta.csv
+04_middle/port_accounting_delta.meta
+04_middle/completion/<stage>_<corner>.meta
 ```
 
-对于 `false_path` 和 `dont_touch_network`：
+delta 的 owner ID 必须引用 `pad_id`。completion 只允许在 required view、无 error/sync change、SDC/pad inventory/delta 全部发布后标 complete。
 
-```tcl
-set_false_path -from [get_pins {u_iobuf/uart0_sout}] -to [get_ports {pad_uart0_sout}]
-set_dont_touch_network [get_nets {pad_uart0_sout}]
-```
-
-生成时必须在输出 SDC 中保留简短注释，说明约束来自 extracted 还是 manual，以及来源文件/行号或表单依据，便于 review。
+所有 required 04 view complete 后，04 发布 run-wide `04_middle/stage_completion.meta`，证明 pad inventory resolved view 已稳定。即使本 run 没有 active IO timing view，04 仍须执行 pad classification/audit 并发布空或 reviewed pad inventory，供 10/20/30 排除 pad edge。
 
 ## 10. 检查规则
 
-### 10.1 结构完整性检查
+### Error
 
-以下情况应报 error：
+- port workbook 缺失或 direct pad mapping 不可解析。
+- top port/direction 与表单冲突。
+- duplicate pad mapping 语义冲突。
+- rule 引用未知 clock。
+- apply row 缺 value/owner/basis/review。
+- inout 仍把 connection 放在 `Inout Name`。
+- Used 状态包含非法/越界 bit。
+- workbook 在写回期间被外部修改。
+- required view、structure/accounting digest、transaction/delta/completion 校验失败。
+- `route_to_30` row 缺 pad_id、owner/basis/review，或仍由 04 销账。
 
-- `apply = yes` 但 `scenario` 为空。
-- 非 NA 行 `apply = yes` 但 `pad_name` 或 `soc_object` 为空。
-- 非 NA 行 `apply = yes` 但 `constraint_type` 为空。
-- approved NA 行缺少 `basis`，或不能匹配 exact `(pad_name, subsys_instance, subsys_port)` inventory key。
-- approved single-pad 非 NA 行不能匹配 exact `(pad_name, subsys_instance, subsys_port)` inventory key；旧表单残留的非 pad 行不得绕过当前 00 pad inventory。
-- target 00 connection inventory schema 不完整、endpoint key 不一致、`validation_status != matched`，或 `src_port` / `dst_port` 不是 canonical scalar/bit key。
-- target CLI 传入 `--info-all` / `--port-files`，试图绕过 00 machine artifact 真源。
-- `apply = yes` 且 `review_status = approved` 的当前输出行无法生成任何 SDC 命令，例如 `false_path` 既无 `rewritten_command` 也无 `set_false_path` 原始命令，或电气约束缺少 `value`。
-- `constraint_type = input_delay/output_delay` 但 `clock_name` 为空。
-- `clock_name` 不存在于 `01_middle/assembled/<scenario>/clock_inventory.csv`。
-- `scenario = common` 的 04 约束引用了 scenario-only clock；common 04 只能引用 common 01 中创建的 clock。
-- scenario 04 引用 scenario-only clock 时，没有对应 scenario clock inventory 证据。
-- `timing_class = timed` 但既没有 input/output delay，也没有明确说明该接口由其它机制约束。
-- assembled view 中同一个 pad/constraint_type 出现多个互相冲突的 approved 约束。
-- assembled view 中 delay 的 `pad + type + clock + edge + polarity + add_delay + value-kind` semantic slot 重复。
-- assembled view 中 timed IO 同时存在 approved delay 和 approved false path，且没有显式冲突裁决。
-- `value` 与 `min_value` / `max_value` 同时填写且语义冲突。
-- `rise_value` / `fall_value` 与 `value` / `min_value` / `max_value` 同时填写且语义冲突。
-- `extra_options` 中重复表达了已经结构化的 `delay_edge`、`delay_polarity`、`add_delay` 或 driving cell 字段。
-- input-only 约束用于 output direction，或 output-only 约束用于 input direction。
+### Warning
 
-### 10.2 方法学检查
+- missing harden SDC。
+- pad 缺 electrical environment 或 delay intent。
+- input 只给 delay 没给 transition/drive，或 output 只给 delay 没给 load。
+- bit-level rule 只覆盖 bus 的一部分。
+- async/config classification 需要 30 follow-up。
 
-以下情况应报 warning 或 error，具体严重程度可由项目配置：
+## 11. 与其它 Stage 的边界
 
-- input pad 同时 approved `set_driving_cell` 和 `set_input_transition`，但没有 basis 说明。
-- output pad 在 assembled view 中缺少 `set_load`，且没有标记 `NA` 或说明。
-- input pad 在 assembled view 中缺少 `set_driving_cell` / `set_drive` / `set_input_transition`，且没有标记 `NA` 或说明。
-- timed pad 只有 `-max` delay、没有对应 `-min` delay，且没有 `NA` 或 basis 说明；这通常意味着 hold 侧外部约束缺失。
-- async/untimed IO 缺少 timing_class 依据。
-- 从下级 SDC 提取到的 `set_false_path` 作用于 timed IO。
-- 从下级 SDC 提取到的 `set_dont_touch_network` 无法稳定映射到 SoC 层级 net。
-- GPIO/inout pad 的 input/output 方向约束被放入 common。
-- `set_input_delay` / `set_output_delay` 的 target pad 本身是 01 中的 clock source/clock target port；clock pad 通常应由 01 建 clock，不应当成普通 data IO 加 delay，除非 basis 明确说明。
-- 电气类约束使用 `stage = all` / `corner = all`，但项目 signoff methodology 要求按 view 区分外部 driver/load/slew。
-- `unit_time` / `unit_cap` 与 SoC flow 当前单位不一致或为空且无法推断。
-- `source_digest` 与当前下级 SDC 文件 digest 不一致，说明 extracted 记录可能已经失效，需要重抽或人工确认。
-- `object_granularity = pattern` 的行应提示 reviewer 确认 pattern 展开结果，避免误约束非 pad port。
-- `set_dont_touch_network` 行应标记为 synthesis-only；STA-only 输出中默认不生成。
-- 若命令行提供 expected unit，例如 `--time-unit ns` 或 `--cap-unit pF`，对应 `unit_time` / `unit_cap` 为空也应 warning，不能只检查“不一致”的情况。
+- 01 创建 IO delay 引用的 clock。
+- 02 设置 clock 自身 timing property，不拥有 pad。
+- 03 定义 clock relation，不拥有 pad。
+- 10/20 排除所有 pad-related direct edge。
+- 30 处理 04 明确 `route_to_30` 的 async/config pad path exception，并必须引用 `related_04_pad_id`；04 仍拥有 pad electrical/IO 环境。其它 active 04 timing 不得被 30 冲突覆盖。
 
-### 10.3 覆盖率检查
+## 12. 命令行
 
-脚本应基于 `pad_inventory` 和 assembled view 输出 coverage report：
-
-- 每个 SoC pad 是否在 04 表单中有记录。
-- 每个 timed pad 是否有对应 delay 约束。
-- 每个 output pad 是否有 load 或明确 `NA`。
-- 每个 input pad 是否有 driving/input transition 或明确 `NA`。
-- 每个 async/untimed pad 是否有 timing_class 依据。
-- 每个 inout/GPIO pad 在相关 scenario 中是否有方向匹配的 timing 约束，以及是否有必要的物理/电气约束。
-- common + scenario 叠加后有哪些约束来自 common、哪些来自 scenario、哪些来自 stage/corner view-specific 文件。
-- 下级 SDC 中提取到但未被生成的约束列表和原因。
-
-## 11. 与其它 SDC 的关系
-
-### 11.1 与 01
-
-04 只引用已经由 01 或 scenario clock overlay 创建好的 clock。
-
-- IO virtual clock 必须在 01 创建。
-- common 04 中的 delay 只能引用 `01_middle/assembled/common/clock_inventory.csv` 中存在的 clock。
-- scenario 04 中的 delay 可以引用 common clock，也可以引用该 scenario overlay clock，但统一通过 `01_middle/assembled/<scenario>/clock_inventory.csv` 查询。
-- 如果某条 IO delay 引用 scenario-only clock，该约束必须下沉到对应 scenario 04，不能放在 common 04。
-- 04 不扫描其它 SDC 创建 clock，也不在本文件补 create_clock。
-
-### 11.2 与 02
-
-02 描述 clock timing budget。
-
-04 描述 IO/pad environment。
-
-不要把 `set_clock_uncertainty` / `set_clock_latency` / `set_clock_transition` 放进 04。
-
-### 11.3 与 03
-
-03 描述 clock relationship。
-
-04 中的 `set_false_path` 只应处理 pad/IO path 相关 exception，不处理 clock domain 关系。跨 clock domain 的 broad async/exclusive 关系应放 03。
-
-### 11.4 与 10
-
-10 描述与 harden `fti_*` / `fto_*` boundary 相邻的 SoC-visible direct interconnect edge。
-
-04 与 10/20 的边界：
-
-- 04 = SoC top pad 对外部世界的环境，包括 board delay、external driver/load/slew、top pad 相关 IO DRC。
-- 10 = 非 pad 优先归属下，与 harden/subsys `fti_*` / `fto_*` boundary 相邻的 SoC-visible direct edge。
-- 20 = harden/subsys/iobuffer 边界 pin 的普通内部 interface timing budget，包括 harden integration SDC 中对 SoC 可见的非 pad 边界约束。
-
-如果 IO buffer / pad ring 本身是 harden：
-
-- top pad port 对外的 `set_input_delay` / `set_output_delay` / `set_load` / `set_input_transition` 属于 04。
-- harden IO buffer 内部侧 pin 到 SoC core/subsys 的普通边界 timing 属于 20。
-- IO buffer/harden 内部路径由该 block owner 约束，不进入 SoC 10；只有其外部、SoC-visible 的 `source -> fti` 或 `fto -> destination` direct edge 才归 10。
-- 一条约束不能同时在 04、10、20 生成；脚本应在 report 中标记可能重复的 boundary constraint。
-
-### 11.5 与 20 / 30
-
-20 放普通 harden/subsys interface timing budget。
-
-30 放 harden-to-harden path exception / override。
-
-如果某条 false path 实际描述的是 harden-to-harden exception，而不是 IO/pad environment，应放入 30；若它是一条 feedthrough-related direct edge，则先由 10 `route_to_30` 后再由 30 review，不应混入 04。
-
-## 12. 当前结论
-
-04 的核心机制是：
-
-```text
-集成表单识别 pad 连接
-  + 下级 SDC 提取已有 pad 约束
-  + 表单记录 extracted/manual/NA
-  + review 决定 apply
-  + 检查缺失与冲突
-  -> 生成 SoC 级 04 IO/pad SDC
+```bash
+python3 04_extract_soc_io_pads.py \
+  --run-root <run_root> \
+  --stage <stage> \
+  --corner <corner>
 ```
 
-因此，04 不应假设下级 subsys 的 pad 约束都缺失；如果下级 SDC 已经提供 `set_input_delay`、`set_output_delay`、`set_load`、`set_driving_cell` 或 `set_input_transition`，必须提取并记录到表单中。只有确认下级 SDC 没有、或者已有约束不适用于 SoC 时，才由人工补齐或标记 `NA`。
+`stage/corner` 可按项目需要默认 `all/all`。不接受 scenario 选择。
