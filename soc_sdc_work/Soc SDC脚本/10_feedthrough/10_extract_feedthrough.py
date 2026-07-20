@@ -5,16 +5,21 @@ from __future__ import print_function
 
 import argparse
 import csv
+import datetime
 import hashlib
+import importlib.util
+import io
 import itertools
 import json
 import math
 import os
 import re
+import shutil
+import socket
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     from dataclasses import dataclass, field
@@ -88,6 +93,7 @@ except ImportError as exc:  # pragma: no cover - environment guard
 
 
 SCHEMA_VERSION = "1"
+TARGET_SCHEMA_VERSION = "1.0"
 SCENARIOS = {"common", "func", "scan", "mbist", "gpio_in", "gpio_out"}
 STAGES = {"all", "synth", "prects", "postcts", "postroute"}
 TOOLS = {"dc", "sta"}
@@ -114,7 +120,10 @@ EXCLUDED_CONNECTION_TYPES = {
     "no_connect",
 }
 DISPOSITIONS = {"emit_budget", "no_soc_budget_required", "route_to_30", "not_applicable", "pending"}
-BUDGET_MODELS = {"", "interconnect_budget", "manual_budget", "clock_relative_io_delay", "unknown"}
+BUDGET_MODELS = {
+    "", "interconnect_budget", "manual_budget", "reviewed_two_side_budget",
+    "clock_relative_io_delay", "unknown",
+}
 REVIEW_STATUSES = {"", "pending", "approved", "rejected"}
 YES_NO = {"", "yes", "no"}
 TOOL_SURFACES = {"", "dc", "sta", "both"}
@@ -129,9 +138,9 @@ CANONICAL_RELATION_SOURCES = {"explicit_rule", "default_synchronous"}
 PSEUDO_INSTANCES = {"top", "fabric", "unknown", "constant", "const", "nc", "no_connect"}
 VERSIONED_POLICY_RE = re.compile(r"(?:^|[^A-Za-z0-9])(?:v|version)[._-]?\d+(?:[._-]\d+)*", re.IGNORECASE)
 
-PORT_BIT_RE = re.compile(r"^[^\s\[\]]+(?:\[\d+\])?$")
-PORT_RANGE_RE = re.compile(r"^(.+)\[(\d+)\s*:\s*(\d+)\]$")
-PORT_EXACT_BIT_RE = re.compile(r"^(.+)\[(\d+)\]$")
+PORT_BIT_RE = re.compile(r"^[^\s\[\]]+(?:\[-?\d+\])?$")
+PORT_RANGE_RE = re.compile(r"^(.+)\[(-?\d+)\s*:\s*(-?\d+)\]$")
+PORT_EXACT_BIT_RE = re.compile(r"^(.+)\[(-?\d+)\]$")
 FEEDTHROUGH_RE = re.compile(r"^(fti|fto)_(?:(\d+)_)?(.+)$")
 
 EDGE_HEADERS = [
@@ -207,6 +216,113 @@ EDGE_HEADERS = [
     "machine_note",
     "note",
 ]
+
+TARGET_EDGE_HEADERS = [
+    "schema_version",
+    "run_id",
+    "mode_label",
+    "design_revision",
+    "run_completeness",
+    "structure_digest",
+    "accounting_digest_before",
+    "accounting_digest_after",
+    "feedthrough_edge_id",
+    "connection_id",
+    "edge_role",
+    "src_instance",
+    "src_direction",
+    "src_port",
+    "src_bit_index",
+    "src_endpoint",
+    "src_soc_object",
+    "dst_instance",
+    "dst_direction",
+    "dst_port",
+    "dst_bit_index",
+    "dst_endpoint",
+    "dst_soc_object",
+    "source_workbook",
+    "source_sheet",
+    "source_row",
+    "feedthrough_instance",
+    "feedthrough_port",
+    "feedthrough_side",
+    "classification_source",
+    "classification_status",
+    "feedthrough_confirmed",
+    "src_sdc_status",
+    "dst_sdc_status",
+    "evidence_status",
+    "src_output_delay_max",
+    "src_output_delay_min",
+    "dst_input_delay_max",
+    "dst_input_delay_min",
+    "src_clock",
+    "dst_clock",
+    "clock_relation",
+    "source_sdc_file",
+    "source_line",
+    "source_digest",
+    "source_command",
+    "machine_digest",
+    "channel_disposition",
+    "budget_model",
+    "budget_required",
+    "converted_max",
+    "converted_min",
+    "emit_max",
+    "emit_min",
+    "datapath_only",
+    "tool_surface",
+    "apply",
+    "review_status",
+    "owner",
+    "reviewer",
+    "review_date",
+    "approved_machine_digest",
+    "basis",
+    "sdc_independent_basis",
+    "relationship_override_basis",
+    "min_sign_review",
+    "validation_status",
+    "machine_note",
+    "note",
+]
+
+TARGET_MACHINE_HEADERS = {
+    "schema_version", "run_id", "mode_label", "design_revision",
+    "run_completeness", "structure_digest", "accounting_digest_before",
+    "accounting_digest_after", "feedthrough_edge_id", "connection_id",
+    "edge_role", "src_instance", "src_direction", "src_port",
+    "src_bit_index", "src_endpoint", "src_soc_object", "dst_instance",
+    "dst_direction", "dst_port", "dst_bit_index", "dst_endpoint",
+    "dst_soc_object", "source_workbook", "source_sheet", "source_row",
+    "feedthrough_instance", "feedthrough_port", "feedthrough_side",
+    "classification_source", "classification_status", "src_sdc_status",
+    "dst_sdc_status", "evidence_status", "src_output_delay_max",
+    "src_output_delay_min", "dst_input_delay_max", "dst_input_delay_min",
+    "src_clock", "dst_clock", "clock_relation", "source_sdc_file",
+    "source_line", "source_digest", "source_command", "machine_digest",
+    "validation_status", "machine_note",
+}
+
+TARGET_REVIEW_INVALIDATING_HEADERS = {
+    "run_id", "mode_label", "design_revision", "structure_digest",
+    "feedthrough_edge_id", "connection_id", "edge_role", "src_instance",
+    "src_direction", "src_port", "src_bit_index", "src_endpoint",
+    "src_soc_object", "dst_instance", "dst_direction", "dst_port",
+    "dst_bit_index", "dst_endpoint", "dst_soc_object", "source_workbook",
+    "source_sheet", "source_row", "feedthrough_instance", "feedthrough_port",
+    "feedthrough_side", "classification_source", "classification_status",
+    "src_sdc_status", "dst_sdc_status", "evidence_status",
+    "src_output_delay_max", "src_output_delay_min", "dst_input_delay_max",
+    "dst_input_delay_min", "source_sdc_file", "source_line", "source_digest",
+    "source_command", "validation_status",
+}
+
+TARGET_TERMINAL_DISPOSITIONS = {
+    "emit_budget", "no_soc_budget_required", "not_applicable"
+}
 
 LOG_HEADERS = [
     "instance",
@@ -409,6 +525,41 @@ class FeedthroughEdge:
 
 
 @dataclass
+class TargetFeedthroughEdge:
+    edge: ConnectionEdge
+    connection_hash: str
+    edge_role: str
+    feedthrough_instance: str
+    feedthrough_port: str
+    feedthrough_side: str
+    classification_source: str
+    classification_status: str
+    source_record: Any
+    src_record: Any
+    dst_record: Any
+
+
+@dataclass
+class TargetHardenSdc:
+    inst_name: str
+    module_name: str
+    sdc_path: str
+    availability_status: str
+    sdc_digest: str
+    note: str
+    source_row: int
+    resolved_path: Optional[Path] = None
+
+
+@dataclass
+class TargetDirectContext:
+    edge: ConnectionEdge
+    source_record: Any
+    src_record: Any
+    dst_record: Any
+
+
+@dataclass
 class TclCommand:
     raw: str
     line_no: int
@@ -497,9 +648,9 @@ def author_name() -> str:
 def clean_cell(value) -> str:
     if value is None:
         return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     text = str(value).strip()
-    if text.endswith(".0") and text.replace(".", "", 1).isdigit():
-        return text[:-2]
     return text
 
 
@@ -2377,6 +2528,8 @@ def terminal_disposition(row: FormRow) -> bool:
 
 def row_tool_matches(row: FormRow, tool: str) -> bool:
     surface = normalize_key(row.values.get("tool_surface"))
+    if tool == "all":
+        return surface in {"dc", "sta", "both"}
     return surface in {tool, "both"}
 
 
@@ -2452,8 +2605,11 @@ def compaction_policy_key(row: FormRow):
         normalize_key(values.get("apply")),
         normalize_key(values.get("review_status")),
         normalize_key(values.get("validation_status")),
-        clean_cell(values.get("disposition_basis")),
+        normalize_key(values.get("classification_status")),
+        normalize_key(values.get("feedthrough_confirmed")),
+        clean_cell(values.get("basis")) or clean_cell(values.get("disposition_basis")),
         clean_cell(values.get("sdc_independent_basis")),
+        clean_cell(values.get("relationship_override_basis")),
         normalize_key(values.get("min_sign_review")),
         clean_cell(values.get("owner")),
         clean_cell(values.get("reviewer")),
@@ -3427,10 +3583,2618 @@ def write_report(
     atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
+TARGET_SIGNAL_RE = re.compile(
+    r"^(?P<base>[A-Za-z_][A-Za-z0-9_$]*)(?:\[(?P<left>-?\d+)(?::(?P<right>-?\d+))?\])?$"
+)
+
+
+def load_accounting_runtime():
+    """Load the shared workbook/accounting implementation hosted by stage 00."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parent.parent / "00_harden_port_inventory" / "00_harden_port_inventory.py",
+        here.with_name("00_harden_port_inventory.py"),
+    ]
+    runtime_path = next((path for path in candidates if path.is_file()), None)
+    if runtime_path is None:
+        raise RuntimeError("shared accounting runtime 00_harden_port_inventory.py was not found")
+    spec = importlib.util.spec_from_file_location(
+        "soc_sdc_accounting_runtime_for_10", str(runtime_path)
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load shared accounting runtime from {0}".format(runtime_path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.STAGE_NAME = "10_feedthrough"
+    return module
+
+
+def target_json_digest(value) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def target_ordered_bits(shape) -> List[int]:
+    if shape.scalar:
+        return [0]
+    step = 1 if shape.right >= shape.left else -1
+    return list(range(shape.left, shape.right + step, step))
+
+
+def target_exact_port(shape, bit: int) -> str:
+    return shape.base if shape.scalar else "{0}[{1}]".format(shape.base, bit)
+
+
+def target_endpoint_key(inst_name: str, direction: str, port_name: str) -> str:
+    return "{0}:{1}:{2}".format(inst_name, direction, port_name)
+
+
+def target_endpoint_collection(inst_name: str, port_name: str) -> str:
+    if normalize_key(inst_name) == "top":
+        return "[get_ports {{{0}}}]".format(port_name)
+    return "[get_pins {{{0}/{1}}}]".format(inst_name, port_name)
+
+
+def target_parse_signal(value: str, location: str) -> Tuple[str, Optional[List[int]]]:
+    text = clean_cell(value)
+    match = TARGET_SIGNAL_RE.fullmatch(text)
+    if not match:
+        raise ValueError("{0}: invalid endpoint signal {1!r}".format(location, text))
+    base = match.group("base")
+    left = match.group("left")
+    right = match.group("right")
+    if left is None:
+        return base, None
+    left_value = int(left)
+    right_value = int(right) if right is not None else left_value
+    step = 1 if right_value >= left_value else -1
+    return base, list(range(left_value, right_value + step, step))
+
+
+def target_connection_ids(
+    src_instance: str,
+    src_direction: str,
+    src_base: str,
+    src_bit: int,
+    dst_instance: str,
+    dst_direction: str,
+    dst_base: str,
+    dst_bit: int,
+) -> Tuple[str, str, str]:
+    canonical_tuple = [
+        TARGET_SCHEMA_VERSION,
+        clean_cell(src_instance),
+        normalize_key(src_direction),
+        clean_cell(src_base),
+        int(src_bit),
+        clean_cell(dst_instance),
+        normalize_key(dst_direction),
+        clean_cell(dst_base),
+        int(dst_bit),
+    ]
+    digest = target_json_digest(canonical_tuple)
+    return "CONN_" + digest, "FTE_" + digest, digest
+
+
+def target_source_records(port_records) -> Dict[Tuple[str, str], List[Any]]:
+    result: Dict[Tuple[str, str], List[Any]] = defaultdict(list)
+    for record in port_records:
+        if record.direction in {"output", "inout"}:
+            result[(record.inst_name, record.shape.base)].append(record)
+    for key in result:
+        result[key].sort(key=lambda item: (item.workbook, item.sheet, item.row))
+    return result
+
+
+def target_select_source_bits(
+    source_records: Sequence[Any],
+    explicit_bits: Optional[List[int]],
+    destination_count: int,
+    location: str,
+) -> List[Tuple[Any, int]]:
+    if explicit_bits is None:
+        if len(source_records) != 1:
+            raise ValueError(
+                "{0}: source without selector maps to {1} port rows; use an exact bit/range".format(
+                    location, len(source_records)
+                )
+            )
+        selected_bits = target_ordered_bits(source_records[0].shape)
+    else:
+        selected_bits = list(explicit_bits)
+    if len(selected_bits) != destination_count:
+        raise ValueError(
+            "{0}: source width {1} does not match destination width {2}".format(
+                location, len(selected_bits), destination_count
+            )
+        )
+    selected: List[Tuple[Any, int]] = []
+    for bit in selected_bits:
+        matches = [record for record in source_records if record.shape.contains(bit)]
+        if len(matches) != 1:
+            raise ValueError(
+                "{0}: source bit {1} matches {2} declared port rows".format(
+                    location, bit, len(matches)
+                )
+            )
+        selected.append((matches[0], bit))
+    return selected
+
+
+def build_target_direct_edges(runtime, port_records, report: Report) -> List[TargetDirectContext]:
+    source_index = target_source_records(port_records)
+    contexts: List[TargetDirectContext] = []
+    seen_destinations: Dict[Tuple[str, str, str], str] = {}
+
+    for record in port_records:
+        if record.direction not in {"input", "inout"}:
+            continue
+        connection = clean_cell(record.connection_value)
+        structural = runtime.structural_reason(
+            connection, record.shape, record.location(), report
+        )
+        if structural:
+            continue
+        if not connection:
+            report.error("{0}: unresolved destination has empty From Whom/Inout Connectivity".format(record.location()))
+            continue
+        if "." not in connection:
+            report.error(
+                "{0}: direct driver must be <inst>.<port/range>, got {1!r}".format(
+                    record.location(), connection
+                )
+            )
+            continue
+        source_instance, source_signal = connection.split(".", 1)
+        try:
+            source_base, explicit_bits = target_parse_signal(
+                source_signal, record.location()
+            )
+        except ValueError as exc:
+            report.error(str(exc))
+            continue
+        destination_bits = target_ordered_bits(record.shape)
+        if source_instance == "top":
+            source_bits = explicit_bits if explicit_bits is not None else list(destination_bits)
+            if len(source_bits) != len(destination_bits):
+                report.error(
+                    "{0}: top source width {1} does not match destination width {2}".format(
+                        record.location(), len(source_bits), len(destination_bits)
+                    )
+                )
+                continue
+            selected_sources = [(None, bit) for bit in source_bits]
+        else:
+            source_rows = source_index.get((source_instance, source_base), [])
+            if not source_rows:
+                report.error(
+                    "{0}: unknown direct source {1}.{2}".format(
+                        record.location(), source_instance, source_base
+                    )
+                )
+                continue
+            try:
+                selected_sources = target_select_source_bits(
+                    source_rows, explicit_bits, len(destination_bits), record.location()
+                )
+            except ValueError as exc:
+                report.error(str(exc))
+                continue
+
+        for (source_record, source_bit), destination_bit in zip(
+            selected_sources, destination_bits
+        ):
+            src_direction = source_record.direction if source_record is not None else "input"
+            src_port = (
+                target_exact_port(source_record.shape, source_bit)
+                if source_record is not None
+                else (source_base if len(selected_sources) == 1 and source_bit == 0 else "{0}[{1}]".format(source_base, source_bit))
+            )
+            dst_port = target_exact_port(record.shape, destination_bit)
+            destination_key = (record.inst_name, record.direction, dst_port)
+            if destination_key in seen_destinations:
+                report.error(
+                    "{0}: destination bit has multiple drivers; previous={1}".format(
+                        record.location(), seen_destinations[destination_key]
+                    )
+                )
+                continue
+            connection_id, _, _ = target_connection_ids(
+                source_instance,
+                src_direction,
+                source_base,
+                source_bit,
+                record.inst_name,
+                record.direction,
+                record.shape.base,
+                destination_bit,
+            )
+            seen_destinations[destination_key] = connection_id
+            contexts.append(
+                TargetDirectContext(
+                    edge=ConnectionEdge(
+                        schema_version=TARGET_SCHEMA_VERSION,
+                        connection_id=connection_id,
+                        scenario_scope="",
+                        connection_type="port_workbook_direct",
+                        src_instance=source_instance,
+                        src_direction=src_direction,
+                        src_port=src_port,
+                        src_bit_index=str(source_bit),
+                        src_endpoint_key=target_endpoint_key(source_instance, src_direction, src_port),
+                        src_soc_object=(src_port if source_instance == "top" else "{0}/{1}".format(source_instance, src_port)),
+                        dst_instance=record.inst_name,
+                        dst_direction=record.direction,
+                        dst_port=dst_port,
+                        dst_bit_index=str(destination_bit),
+                        dst_endpoint_key=target_endpoint_key(record.inst_name, record.direction, dst_port),
+                        dst_soc_object="{0}/{1}".format(record.inst_name, dst_port),
+                        validation_status="matched",
+                        note="",
+                        source_row=record.row,
+                    ),
+                    source_record=record,
+                    src_record=source_record,
+                    dst_record=record,
+                )
+            )
+
+    for record in port_records:
+        if record.direction != "output":
+            continue
+        connection = clean_cell(record.connection_value)
+        if not connection or runtime.structural_reason(
+            connection, record.shape, record.location(), report
+        ):
+            continue
+        top_signal = record.shape.raw if connection.lower() in {"y", "yes", "true"} else connection
+        if top_signal.startswith("top."):
+            top_signal = top_signal[4:]
+        if "." in top_signal:
+            report.error("{0}: To Top must name a top port, got {1!r}".format(record.location(), connection))
+            continue
+        try:
+            top_base, explicit_bits = target_parse_signal(top_signal, record.location())
+        except ValueError as exc:
+            report.error(str(exc))
+            continue
+        source_bits = target_ordered_bits(record.shape)
+        top_bits = explicit_bits if explicit_bits is not None else list(source_bits)
+        if len(top_bits) != len(source_bits):
+            report.error("{0}: To Top width mismatch".format(record.location()))
+            continue
+        for source_bit, top_bit in zip(source_bits, top_bits):
+            src_port = target_exact_port(record.shape, source_bit)
+            dst_port = top_base if len(top_bits) == 1 and top_bit == 0 else "{0}[{1}]".format(top_base, top_bit)
+            connection_id, _, _ = target_connection_ids(
+                record.inst_name, "output", record.shape.base, source_bit,
+                "top", "output", top_base, top_bit,
+            )
+            contexts.append(
+                TargetDirectContext(
+                    edge=ConnectionEdge(
+                        schema_version=TARGET_SCHEMA_VERSION,
+                        connection_id=connection_id,
+                        scenario_scope="",
+                        connection_type="port_workbook_direct",
+                        src_instance=record.inst_name,
+                        src_direction="output",
+                        src_port=src_port,
+                        src_bit_index=str(source_bit),
+                        src_endpoint_key=target_endpoint_key(record.inst_name, "output", src_port),
+                        src_soc_object="{0}/{1}".format(record.inst_name, src_port),
+                        dst_instance="top",
+                        dst_direction="output",
+                        dst_port=dst_port,
+                        dst_bit_index=str(top_bit),
+                        dst_endpoint_key=target_endpoint_key("top", "output", dst_port),
+                        dst_soc_object=dst_port,
+                        validation_status="matched",
+                        note="",
+                        source_row=record.row,
+                    ),
+                    source_record=record,
+                    src_record=record,
+                    dst_record=None,
+                )
+            )
+    contexts.sort(key=lambda item: item.edge.connection_id)
+    report.info("built {0} exact direct bit edge(s) from port workbooks".format(len(contexts)))
+    return contexts
+
+
+def read_target_harden_manifest(
+    path: Path,
+    run_root: Path,
+    instances: Dict[str, Dict[str, object]],
+    require_complete: bool,
+    report: Report,
+) -> Tuple[Dict[str, TargetHardenSdc], RunCompleteness]:
+    if not path.is_file():
+        report.error("required harden SDC manifest is missing: {0}".format(path))
+        return {}, RunCompleteness(status="invalid", manifest_path=str(path.resolve()))
+    required = {
+        "inst_name", "module_name", "sdc_path", "availability_status",
+        "sdc_digest", "note",
+    }
+    entries: Dict[str, TargetHardenSdc] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        missing_headers = sorted(required - set(reader.fieldnames or []))
+        if missing_headers:
+            report.error("{0}: missing manifest field(s): {1}".format(path, ",".join(missing_headers)))
+        for row_idx, row in enumerate(reader, start=2):
+            inst_name = clean_cell(row.get("inst_name"))
+            if not inst_name:
+                report.error("{0} row {1}: empty inst_name".format(path.name, row_idx))
+                continue
+            if inst_name in entries:
+                report.error("{0} row {1}: duplicate inst_name {2}".format(path.name, row_idx, inst_name))
+                continue
+            entries[inst_name] = TargetHardenSdc(
+                inst_name=inst_name,
+                module_name=clean_cell(row.get("module_name")),
+                sdc_path=clean_cell(row.get("sdc_path")),
+                availability_status=normalize_key(row.get("availability_status")),
+                sdc_digest=normalize_key(row.get("sdc_digest")),
+                note=clean_cell(row.get("note")),
+                source_row=row_idx,
+            )
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    resolved_paths: Dict[str, str] = {}
+    for inst_name in sorted(instances):
+        info = instances[inst_name]
+        entry = entries.get(inst_name)
+        if entry is None:
+            report.error("{0}: manifest has no row for {1}".format(path.name, inst_name))
+            continue
+        if entry.module_name != clean_cell(info.get("module_name")):
+            report.error("{0} row {1}: module mismatch for {2}".format(path.name, entry.source_row, inst_name))
+        status = entry.availability_status
+        if status == "available":
+            if not entry.sdc_path or not entry.sdc_digest:
+                report.error("{0} row {1}: available SDC requires path and digest".format(path.name, entry.source_row))
+                continue
+            resolved = resolve_path(run_root, entry.sdc_path, entry.sdc_path).resolve()
+            if not resolved.is_file():
+                report.error("{0} row {1}: available SDC is missing: {2}".format(path.name, entry.source_row, resolved))
+                continue
+            actual_digest = digest_file(resolved)
+            if actual_digest != entry.sdc_digest:
+                report.error("{0} row {1}: available SDC digest mismatch for {2}".format(path.name, entry.source_row, inst_name))
+                continue
+            previous = resolved_paths.get(str(resolved))
+            if previous and previous != inst_name:
+                report.error("available SDC path is shared by {0} and {1}: {2}".format(previous, inst_name, resolved))
+                continue
+            resolved_paths[str(resolved)] = inst_name
+            entry.resolved_path = resolved
+            available.append(inst_name)
+        elif status == "missing":
+            missing.append(inst_name)
+            report.warn("missing harden SDC for {0}: {1}".format(inst_name, entry.note or "<no note>"))
+        elif status == "not_required":
+            if not entry.note:
+                report.error("{0} row {1}: not_required requires a basis in note".format(path.name, entry.source_row))
+            not_required.append(inst_name)
+        else:
+            report.error("{0} row {1}: invalid availability_status {2}".format(path.name, entry.source_row, status or "<empty>"))
+    extra = sorted(set(entries) - set(instances))
+    for inst_name in extra:
+        report.error("{0}: manifest contains unknown instance {1}".format(path.name, inst_name))
+    if require_complete and missing:
+        report.error("HARDEN_SDC_COMPLETENESS_REQUIRED: " + ",".join(missing))
+    status = "partial" if missing else "complete"
+    if report.error_count:
+        status = "invalid"
+    completeness = RunCompleteness(
+        status=status,
+        available_instances=available,
+        missing_instances=missing,
+        not_required_instances=not_required,
+        manifest_path=str(path.resolve()),
+    )
+    return entries, completeness
+
+
+def target_read_json(path: Path, label: str, report: Report) -> Dict[str, object]:
+    if not path.is_file():
+        report.error("required {0} is missing: {1}".format(label, path))
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        report.error("invalid {0} {1}: {2}".format(label, path, exc))
+        return {}
+    if not isinstance(payload, dict):
+        report.error("{0} must contain a JSON object: {1}".format(label, path))
+        return {}
+    return payload
+
+
+def target_validate_provenance(
+    payload: Dict[str, object],
+    path: Path,
+    run_context: Dict[str, str],
+    structure: str,
+    report: Report,
+    require_complete: bool = True,
+    require_gate_fields: bool = False,
+    expected_stage_name: str = "",
+) -> None:
+    if not payload:
+        return
+    if clean_cell(payload.get("run_id")) != clean_cell(run_context.get("run_id")):
+        report.error("{0}: run_id does not match inputs/run_context.csv".format(path))
+    if clean_cell(payload.get("mode_label")) != clean_cell(run_context.get("mode_label")):
+        report.error("{0}: mode_label does not match inputs/run_context.csv".format(path))
+    design = clean_cell(payload.get("design_revision"))
+    if design and design != clean_cell(run_context.get("design_revision")):
+        report.error("{0}: design_revision does not match inputs/run_context.csv".format(path))
+    if expected_stage_name and clean_cell(payload.get("stage_name")) != expected_stage_name:
+        report.error(
+            "{0}: stage_name must be {1}".format(path, expected_stage_name)
+        )
+    if clean_cell(payload.get("structure_digest")) != structure:
+        report.error("{0}: structure_digest is stale".format(path))
+    if require_complete:
+        if normalize_key(payload.get("completion_status")) != "complete":
+            report.error("{0}: completion_status is not complete".format(path))
+        if require_gate_fields and "sync_changed" not in payload:
+            report.error("{0}: sync_changed is required".format(path))
+        elif "sync_changed" in payload and normalize_key(payload.get("sync_changed")) != "no":
+            report.error("{0}: sync_changed must be no for a complete artifact".format(path))
+        if require_gate_fields and "error_count" not in payload:
+            report.error("{0}: error_count is required".format(path))
+        try:
+            error_count = int(clean_cell(payload.get("error_count")) or "0")
+        except ValueError:
+            error_count = -1
+        if error_count != 0:
+            report.error("{0}: error_count is not zero".format(path))
+
+
+def target_read_csv_rows(path: Path, label: str, report: Report) -> List[Dict[str, str]]:
+    if not path.is_file():
+        report.error("required {0} is missing: {1}".format(label, path))
+        return []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            if not reader.fieldnames:
+                report.error("{0} has no CSV header: {1}".format(label, path))
+                return []
+            return [dict(row) for row in reader]
+    except (OSError, csv.Error) as exc:
+        report.error("failed to read {0} {1}: {2}".format(label, path, exc))
+        return []
+
+
+def target_validate_output_digest(
+    payload: Dict[str, object],
+    meta_path: Path,
+    default_path: Path,
+    report: Report,
+    digest_key: str = "output_sdc_digest",
+    path_key: str = "output_sdc_path",
+    path_base: Optional[Path] = None,
+) -> None:
+    if not payload:
+        return
+    expected = clean_cell(payload.get(digest_key))
+    path_value = clean_cell(payload.get(path_key))
+    output_path = default_path
+    if path_value:
+        declared_path = Path(path_value).expanduser()
+        if not declared_path.is_absolute():
+            declared_path = (
+                path_base if path_base is not None else meta_path.parent
+            ) / declared_path
+        if declared_path.resolve() != default_path.resolve():
+            report.error(
+                "{0}: {1} must identify canonical output {2}".format(
+                    meta_path, path_key, default_path
+                )
+            )
+    if not expected:
+        report.error("{0}: {1} is required".format(meta_path, digest_key))
+        return
+    if not output_path.is_file():
+        report.error("{0}: declared output is missing: {1}".format(meta_path, output_path))
+        return
+    if digest_file(output_path) != expected:
+        report.error("{0}: {1} does not match {2}".format(meta_path, digest_key, output_path))
+
+
+def target_validate_artifact_digest(
+    payload: Dict[str, object],
+    meta_path: Path,
+    artifact_path: Path,
+    digest_key: str,
+    report: Report,
+) -> None:
+    if not payload:
+        return
+    expected = clean_cell(payload.get(digest_key))
+    if not expected:
+        report.error("{0}: {1} is required".format(meta_path, digest_key))
+        return
+    if not artifact_path.is_file():
+        report.error("{0}: required artifact is missing: {1}".format(meta_path, artifact_path))
+        return
+    if digest_file(artifact_path) != expected:
+        report.error("{0}: {1} does not match {2}".format(meta_path, digest_key, artifact_path))
+
+
+def target_validate_inventory_pair(
+    path: Path,
+    meta_path: Path,
+    label: str,
+    run_context: Dict[str, str],
+    structure: str,
+    report: Report,
+    digest_keys: Sequence[str],
+) -> Tuple[List[Dict[str, str]], Dict[str, object]]:
+    rows = target_read_csv_rows(path, label, report)
+    meta = target_read_json(meta_path, label + " meta", report)
+    target_validate_provenance(meta, meta_path, run_context, structure, report)
+    if path.is_file() and meta:
+        actual = digest_file(path)
+        expected = ""
+        for key in digest_keys:
+            expected = clean_cell(meta.get(key))
+            if expected:
+                break
+        if not expected:
+            report.error("{0}: no inventory digest field was found".format(meta_path))
+        elif expected != actual:
+            report.error("{0}: inventory digest is stale".format(meta_path))
+    for row_idx, row in enumerate(rows, start=2):
+        row_run_id = clean_cell(row.get("run_id"))
+        row_mode = clean_cell(row.get("mode_label"))
+        row_structure = clean_cell(row.get("structure_digest"))
+        if row_run_id and row_run_id != clean_cell(run_context.get("run_id")):
+            report.error("{0} row {1}: run_id is stale".format(path, row_idx))
+        if row_mode and row_mode != clean_cell(run_context.get("mode_label")):
+            report.error("{0} row {1}: mode_label is stale".format(path, row_idx))
+        if row_structure and row_structure != structure:
+            report.error("{0} row {1}: structure_digest is stale".format(path, row_idx))
+    return rows, meta
+
+
+def target_port_record_lookup(port_records) -> Dict[Tuple[str, str, str], List[Any]]:
+    result: Dict[Tuple[str, str, str], List[Any]] = defaultdict(list)
+    for record in port_records:
+        result[(record.inst_name, record.direction, record.shape.base)].append(record)
+    return result
+
+
+def target_resolve_inventory_endpoint(
+    inst_name: str,
+    direction: str,
+    port_value: str,
+    bit_value: str,
+    lookup: Dict[Tuple[str, str, str], List[Any]],
+) -> List[Tuple[str, str, str, int]]:
+    inst = clean_cell(inst_name)
+    direction_key = normalize_key(direction)
+    port_text = clean_cell(port_value)
+    if not inst or not direction_key or not port_text:
+        return []
+    try:
+        base, explicit = target_parse_signal(port_text, "machine inventory endpoint")
+    except ValueError:
+        return []
+    explicit_bit = clean_cell(bit_value)
+    if explicit_bit:
+        try:
+            bits = [int(explicit_bit)]
+        except ValueError:
+            return []
+    elif explicit is not None:
+        bits = explicit
+    else:
+        candidates = lookup.get((inst, direction_key, base), [])
+        if len(candidates) != 1:
+            return []
+        bits = target_ordered_bits(candidates[0].shape)
+    return [(inst, direction_key, base, bit) for bit in bits]
+
+
+def target_delta_owner_map(runtime, run_root: Path, port_records, report: Report):
+    record_by_key = runtime.record_index(port_records)
+    owners: Dict[Tuple[str, str, str, int], List[Tuple[str, str]]] = defaultdict(list)
+    for directory in ("00_middle", "01_middle", "04_middle", "10_middle"):
+        path = run_root / directory / "port_accounting_delta.csv"
+        if not path.is_file():
+            continue
+        for row in runtime.load_delta_rows(path, report):
+            key = (
+                clean_cell(row.get("workbook")),
+                clean_cell(row.get("sheet")),
+                int(clean_cell(row.get("row")) or "0"),
+                normalize_key(row.get("direction")),
+                clean_cell(row.get("port")),
+            )
+            record = record_by_key.get(key)
+            if record is None:
+                continue
+            try:
+                added = runtime.parse_bits_field(row.get("added_bits"))
+            except ValueError:
+                continue
+            for bit in added:
+                owners[(record.inst_name, record.direction, record.shape.base, bit)].append(
+                    (clean_cell(row.get("stage_name")), clean_cell(row.get("owner_object_id")))
+                )
+    return owners
+
+
+def validate_target_upstreams(
+    runtime,
+    run_root: Path,
+    run_context: Dict[str, str],
+    required_views: Sequence[Dict[str, str]],
+    structure: str,
+    accounting_before: str,
+    port_records,
+    report: Report,
+) -> Dict[str, object]:
+    upstream_digests: Dict[str, str] = {}
+    delta_meta: Dict[str, Dict[str, object]] = {}
+    stage_completions: Dict[str, Dict[str, object]] = {}
+    for directory, label in (
+        ("00_middle", "00"),
+        ("01_middle", "01"),
+        ("04_middle", "04"),
+    ):
+        expected_stage_name = {
+            "00": "00_harden_port_inventory",
+            "01": "01_soc_clocks",
+            "04": "04_soc_io_pads",
+        }[label]
+        middle = run_root / directory
+        delta_path = middle / "port_accounting_delta.csv"
+        delta_meta_path = middle / "port_accounting_delta.meta"
+        completion_path = middle / "stage_completion.meta"
+        meta = target_read_json(delta_meta_path, label + " accounting delta meta", report)
+        completion = target_read_json(completion_path, label + " stage completion", report)
+        target_validate_provenance(meta, delta_meta_path, run_context, structure, report)
+        target_validate_provenance(
+            completion,
+            completion_path,
+            run_context,
+            structure,
+            report,
+            require_gate_fields=True,
+            expected_stage_name=expected_stage_name,
+        )
+        if label == "01":
+            target_validate_output_digest(
+                completion,
+                completion_path,
+                run_root / "01_result" / "01_soc_clocks.sdc",
+                report,
+                path_base=run_root,
+            )
+        if not delta_path.is_file():
+            report.error("required {0} accounting delta is missing: {1}".format(label, delta_path))
+        elif meta and clean_cell(meta.get("delta_csv_digest")) != digest_file(delta_path):
+            report.error("{0}: delta_csv_digest is stale".format(delta_meta_path))
+        target_validate_artifact_digest(
+            completion,
+            completion_path,
+            delta_path,
+            "accounting_delta_digest",
+            report,
+        )
+        if meta and completion:
+            if clean_cell(completion.get("accounting_digest_before")) != clean_cell(meta.get("accounting_digest_before")):
+                report.error("{0}: completion/delta before-digest mismatch".format(label))
+            if clean_cell(completion.get("accounting_digest_after")) != clean_cell(meta.get("accounting_digest_after")):
+                report.error("{0}: completion/delta after-digest mismatch".format(label))
+        delta_meta[label] = meta
+        stage_completions[label] = completion
+        for path in (delta_path, delta_meta_path, completion_path):
+            upstream_digests["{0}:{1}".format(label, path.name)] = (
+                digest_file(path) if path.is_file() else ""
+            )
+
+    snapshot_path = run_root / "00_middle" / "input_snapshot.meta"
+    snapshot = target_read_json(snapshot_path, "00 input snapshot", report)
+    target_validate_provenance(
+        snapshot, snapshot_path, run_context, structure, report,
+        require_complete=False,
+    )
+    upstream_digests["00:input_snapshot.meta"] = (
+        digest_file(snapshot_path) if snapshot_path.is_file() else ""
+    )
+
+    after_00 = clean_cell(delta_meta.get("00", {}).get("accounting_digest_after"))
+    before_01 = clean_cell(delta_meta.get("01", {}).get("accounting_digest_before"))
+    after_01 = clean_cell(delta_meta.get("01", {}).get("accounting_digest_after"))
+    before_04 = clean_cell(delta_meta.get("04", {}).get("accounting_digest_before"))
+    after_04 = clean_cell(delta_meta.get("04", {}).get("accounting_digest_after"))
+    if after_00 and before_01 != after_00:
+        report.error("00->01 accounting digest chain is discontinuous")
+    if after_01 and before_04 != after_01:
+        report.error("01->04 accounting digest chain is discontinuous")
+
+    empty_digest = runtime.accounting_digest(port_records, empty=True)
+    runtime.validate_resume_evidence(
+        run_root,
+        port_records,
+        run_context,
+        structure,
+        accounting_before,
+        empty_digest,
+        report,
+    )
+    existing_10_meta_path = run_root / "10_middle" / "port_accounting_delta.meta"
+    existing_10_meta = (
+        target_read_json(existing_10_meta_path, "10 accounting delta meta", report)
+        if existing_10_meta_path.is_file() else {}
+    )
+    if existing_10_meta:
+        target_validate_provenance(
+            existing_10_meta, existing_10_meta_path, run_context, structure, report
+        )
+    expected_current = clean_cell(
+        existing_10_meta.get("accounting_digest_after") if existing_10_meta else after_04
+    )
+    if expected_current and expected_current != accounting_before:
+        report.error(
+            "accounting digest chain mismatch before 10: expected={0}, current={1}".format(
+                expected_current, accounting_before
+            )
+        )
+
+    clock_path = run_root / "01_middle" / "clock_inventory.csv"
+    clock_meta_path = run_root / "01_middle" / "clock_inventory.meta"
+    clock_rows, clock_meta = target_validate_inventory_pair(
+        clock_path,
+        clock_meta_path,
+        "01 clock inventory",
+        run_context,
+        structure,
+        report,
+        ("inventory_digest", "clock_inventory_digest"),
+    )
+    upstream_digests["01:clock_inventory.csv"] = digest_file(clock_path) if clock_path.is_file() else ""
+    upstream_digests["01:clock_inventory.meta"] = digest_file(clock_meta_path) if clock_meta_path.is_file() else ""
+
+    relation_path = run_root / "03_middle" / "relation_map.csv"
+    relation_meta_path = run_root / "03_middle" / "relation_map.meta"
+    relation_completion_path = run_root / "03_middle" / "stage_completion.meta"
+    relation_completion = target_read_json(
+        relation_completion_path, "03 stage completion", report
+    )
+    target_validate_provenance(
+        relation_completion,
+        relation_completion_path,
+        run_context,
+        structure,
+        report,
+        require_gate_fields=True,
+        expected_stage_name="03_soc_clock_groups",
+    )
+    target_validate_output_digest(
+        relation_completion,
+        relation_completion_path,
+        run_root / "03_result" / "03_soc_clock_groups.sdc",
+        report,
+        path_base=run_root,
+    )
+    relation_rows: List[Dict[str, str]] = []
+    relation_meta: Dict[str, object] = {}
+    if relation_path.is_file() or relation_meta_path.is_file():
+        if not relation_path.is_file() or not relation_meta_path.is_file():
+            report.warn("03 relation diagnostic requires paired CSV/meta")
+        else:
+            try:
+                with relation_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                    reader = csv.DictReader(file_obj)
+                    relation_rows = [dict(row) for row in reader] if reader.fieldnames else []
+                relation_meta_value = json.loads(relation_meta_path.read_text(encoding="utf-8"))
+                relation_meta = relation_meta_value if isinstance(relation_meta_value, dict) else {}
+            except (OSError, ValueError, csv.Error) as exc:
+                report.warn("03 relation diagnostic is invalid and will be ignored: {0}".format(exc))
+                relation_rows = []
+                relation_meta = {}
+            relation_valid = True
+            if clean_cell(relation_meta.get("run_id")) != clean_cell(run_context.get("run_id")):
+                relation_valid = False
+            if clean_cell(relation_meta.get("mode_label")) != clean_cell(run_context.get("mode_label")):
+                relation_valid = False
+            if clean_cell(relation_meta.get("structure_digest")) != structure:
+                relation_valid = False
+            if normalize_key(relation_meta.get("completion_status")) not in {"", "complete"}:
+                relation_valid = False
+            if not relation_valid:
+                report.warn("03 relation map provenance is invalid; relation diagnostic marked unavailable")
+                relation_rows = []
+            expected_relation_digest = clean_cell(
+                relation_meta.get("relation_map_digest") or relation_meta.get("inventory_digest")
+            )
+            if not expected_relation_digest:
+                report.warn("03 relation map digest is missing; relation diagnostic marked unavailable")
+                relation_rows = []
+            elif expected_relation_digest != digest_file(relation_path):
+                report.warn("03 relation map digest is stale; relation diagnostic marked unavailable")
+                relation_rows = []
+            expected_01_inventory = clean_cell(
+                relation_meta.get("upstream_01_inventory_digest")
+            )
+            if (
+                not expected_01_inventory
+                or not clock_path.is_file()
+                or expected_01_inventory != digest_file(clock_path)
+            ):
+                report.warn(
+                    "03 relation map does not authenticate the current 01 clock inventory; "
+                    "relation diagnostic marked unavailable"
+                )
+                relation_rows = []
+            expected_01_completion = clean_cell(
+                relation_meta.get("upstream_01_completion_digest")
+            )
+            completion_01_path = run_root / "01_middle" / "stage_completion.meta"
+            if (
+                not expected_01_completion
+                or not completion_01_path.is_file()
+                or expected_01_completion != digest_file(completion_01_path)
+            ):
+                report.warn(
+                    "03 relation map does not authenticate the current 01 completion; "
+                    "relation diagnostic marked unavailable"
+                )
+                relation_rows = []
+    else:
+        report.warn("optional 03 relation diagnostic is unavailable")
+    for path in (relation_path, relation_meta_path, relation_completion_path):
+        upstream_digests["03:{0}".format(path.name)] = digest_file(path) if path.is_file() else ""
+
+    pad_path = run_root / "04_middle" / "pad_inventory.csv"
+    pad_meta_path = run_root / "04_middle" / "pad_inventory.meta"
+    pad_rows, pad_meta = target_validate_inventory_pair(
+        pad_path,
+        pad_meta_path,
+        "04 pad inventory",
+        run_context,
+        structure,
+        report,
+        ("inventory_digest", "pad_inventory_digest"),
+    )
+    upstream_digests["04:pad_inventory.csv"] = digest_file(pad_path) if pad_path.is_file() else ""
+    upstream_digests["04:pad_inventory.meta"] = digest_file(pad_meta_path) if pad_meta_path.is_file() else ""
+    completion_04 = stage_completions.get("04", {})
+    target_validate_artifact_digest(
+        completion_04,
+        run_root / "04_middle" / "stage_completion.meta",
+        pad_path,
+        "pad_inventory_digest",
+        report,
+    )
+    required_04_ids = {
+        clean_cell(view.get("view_id"))
+        for view in required_views
+        if normalize_key(view.get("require_04")) == "yes"
+    }
+    parent_view_digests = completion_04.get("required_view_completions", {})
+    if required_04_ids:
+        if not isinstance(parent_view_digests, dict):
+            report.error(
+                "04 run-wide completion requires required_view_completions mapping"
+            )
+            parent_view_digests = {}
+        parent_ids = set(clean_cell(value) for value in parent_view_digests)
+        if parent_ids != required_04_ids:
+            report.error(
+                "04 run-wide required_view_completions does not exactly match "
+                "required_views.csv: expected={0}, actual={1}".format(
+                    ",".join(sorted(required_04_ids)),
+                    ",".join(sorted(parent_ids)),
+                )
+            )
+    for view in required_views:
+        if normalize_key(view.get("require_04")) != "yes":
+            continue
+        completion_path = (
+            run_root / "04_middle" / "completion" /
+            (safe_token(view.get("stage")) + "_" + safe_token(view.get("corner")) + ".meta")
+        )
+        completion = target_read_json(completion_path, "04 required view completion", report)
+        target_validate_provenance(
+            completion,
+            completion_path,
+            run_context,
+            structure,
+            report,
+            require_gate_fields=True,
+            expected_stage_name="04_soc_io_pads",
+        )
+        stage_token = safe_token(view.get("stage"))
+        corner_token = safe_token(view.get("corner"))
+        if normalize_key(view.get("stage")) == "all" and normalize_key(view.get("corner")) == "all":
+            view_sdc_path = run_root / "04_result" / "04_soc_io_pads.sdc"
+        else:
+            view_sdc_path = (
+                run_root / "04_result" /
+                "04_soc_io_pads_{0}_{1}.sdc".format(stage_token, corner_token)
+            )
+        target_validate_output_digest(
+            completion,
+            completion_path,
+            view_sdc_path,
+            report,
+            path_base=run_root,
+        )
+        if completion and clean_cell(completion.get("view_id")) != clean_cell(view.get("view_id")):
+            report.error("{0}: view_id does not match required_views.csv".format(completion_path))
+        if completion and clean_cell(completion.get("stage")) != clean_cell(view.get("stage")):
+            report.error("{0}: stage does not match required_views.csv".format(completion_path))
+        if completion and clean_cell(completion.get("corner")) != clean_cell(view.get("corner")):
+            report.error("{0}: corner does not match required_views.csv".format(completion_path))
+        actual_completion_digest = (
+            digest_file(completion_path) if completion_path.is_file() else ""
+        )
+        expected_completion_digest = clean_cell(
+            parent_view_digests.get(clean_cell(view.get("view_id")))
+            if isinstance(parent_view_digests, dict) else ""
+        )
+        if not expected_completion_digest:
+            report.error(
+                "{0}: run-wide 04 completion does not authenticate this view".format(
+                    completion_path
+                )
+            )
+        elif expected_completion_digest != actual_completion_digest:
+            report.error(
+                "{0}: run-wide 04 required-view digest is stale".format(
+                    completion_path
+                )
+            )
+        upstream_digests["04:view:{0}".format(clean_cell(view.get("view_id")))] = (
+            actual_completion_digest
+        )
+
+    lookup = target_port_record_lookup(port_records)
+    clock_endpoints: Set[Tuple[str, str, str, int]] = set()
+    clock_aliases: Dict[Tuple[str, str], str] = {}
+    alias_candidates: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    active_clocks: Set[str] = set()
+    known_clock_names: Set[str] = set()
+    trusted_clock_actions = ACTIVE_CLOCK_ACTIONS | {"check_only", "alias_only"}
+    for row in clock_rows:
+        action = normalize_key(row.get("final_action"))
+        clock_name = clean_cell(row.get("clock_name"))
+        if action in ACTIVE_CLOCK_ACTIONS or action == "check_only":
+            clock_endpoints.update(
+                target_resolve_inventory_endpoint(
+                    row.get("inst_name", ""), row.get("direction", ""),
+                    row.get("port_name", ""), row.get("bit_index", ""), lookup,
+                )
+            )
+        if action in ACTIVE_CLOCK_ACTIONS and clock_name:
+            active_clocks.add(clock_name)
+        if action in trusted_clock_actions and clock_name:
+            known_clock_names.add(clock_name)
+        inst_name = clean_cell(row.get("inst_name"))
+        if action in trusted_clock_actions:
+            for alias in (clean_cell(row.get("original_clock_name")), clock_name):
+                if inst_name and alias and clock_name:
+                    alias_candidates[(inst_name, alias)].add(clock_name)
+    for key, mapped_names in sorted(alias_candidates.items()):
+        if len(mapped_names) == 1:
+            clock_aliases[key] = next(iter(mapped_names))
+        else:
+            report.warn(
+                "01 clock inventory has conflicting alias mapping for {0}/{1}; "
+                "timing relation will remain unknown".format(key[0], key[1])
+            )
+
+    pad_endpoints: Set[Tuple[str, str, str, int]] = set()
+    pad_connection_ids: Set[str] = set()
+    for row in pad_rows:
+        connection_id = clean_cell(row.get("connection_id"))
+        if connection_id:
+            pad_connection_ids.add(connection_id)
+        inst_name = (
+            clean_cell(row.get("harden_instance"))
+            or clean_cell(row.get("subsys_instance"))
+            or clean_cell(row.get("inst_name"))
+        )
+        port_name = (
+            clean_cell(row.get("harden_port"))
+            or clean_cell(row.get("subsys_port"))
+            or clean_cell(row.get("port"))
+            or clean_cell(row.get("port_name"))
+        )
+        pad_endpoints.update(
+            target_resolve_inventory_endpoint(
+                inst_name, row.get("direction", ""), port_name,
+                row.get("bit_index", ""), lookup,
+            )
+        )
+
+    relations: Dict[Tuple[str, str], str] = {}
+    ambiguous_relations: Set[Tuple[str, str]] = set()
+    clock_universe_digest = clean_cell(clock_meta.get("clock_set_digest"))
+    for row_idx, row in enumerate(relation_rows, start=2):
+        clock_a = clean_cell(row.get("clock_a"))
+        clock_b = clean_cell(row.get("clock_b"))
+        relation = normalize_key(row.get("relation_type"))
+        row_universe = clean_cell(row.get("clock_universe_digest"))
+        if not clock_universe_digest or row_universe != clock_universe_digest:
+            report.warn(
+                "03 relation diagnostic row {0} has stale clock universe and was ignored".format(
+                    row_idx
+                )
+            )
+            continue
+        if clock_a not in known_clock_names or clock_b not in known_clock_names:
+            report.warn(
+                "03 relation diagnostic row {0} references clock outside 01 inventory and was ignored".format(
+                    row_idx
+                )
+            )
+            continue
+        if clock_a and clock_b and relation in CANONICAL_RELATIONS:
+            key = tuple(sorted((clock_a, clock_b)))
+            if key in ambiguous_relations:
+                continue
+            previous = relations.get(key)
+            if previous is not None and previous != relation:
+                relations.pop(key, None)
+                ambiguous_relations.add(key)
+                report.warn(
+                    "03 relation diagnostic has conflicting relations for {0}/{1}; "
+                    "timing relation will remain unknown".format(key[0], key[1])
+                )
+            else:
+                relations[key] = relation
+        elif clock_a or clock_b or relation:
+            report.warn(
+                "03 relation diagnostic row {0} is incomplete or has invalid relation_type".format(
+                    row_idx
+                )
+            )
+
+    return {
+        "upstream_digests": upstream_digests,
+        "upstream_accounting_after": after_04,
+        "existing_10_meta": existing_10_meta,
+        "clock_endpoints": clock_endpoints,
+        "clock_aliases": clock_aliases,
+        "active_clocks": active_clocks,
+        "relations": relations,
+        "pad_endpoints": pad_endpoints,
+        "pad_connection_ids": pad_connection_ids,
+        "owner_map": target_delta_owner_map(runtime, run_root, port_records, report),
+        "clock_meta": clock_meta,
+        "relation_meta": relation_meta,
+        "pad_meta": pad_meta,
+    }
+
+
+def target_instance_feedthrough_confirmed(instance: Dict[str, object]) -> bool:
+    semantic = instance.get("semantic", {}) if isinstance(instance, dict) else {}
+    if not isinstance(semantic, dict):
+        return False
+    for key, value in semantic.items():
+        normalized = normalize_key(value)
+        if any(token in normalize_key(key) for token in ("feedthrough", "blocktype", "classification", "hardenclass")):
+            if normalized in {"yes", "true", "1", "feedthrough", "ft", "dpg"} or "feedthrough" in normalized:
+                return True
+    return False
+
+
+def target_edge_endpoint_tuple(edge: ConnectionEdge, side: str) -> Tuple[str, str, str, int]:
+    inst = clean_cell(getattr(edge, side + "_instance"))
+    direction = normalize_key(getattr(edge, side + "_direction"))
+    port = clean_cell(getattr(edge, side + "_port"))
+    bit = int(clean_cell(getattr(edge, side + "_bit_index")) or "0")
+    try:
+        base, _ = target_parse_signal(port, "direct edge endpoint")
+    except ValueError:
+        base = port
+    return inst, direction, base, bit
+
+
+def classify_target_feedthrough_edges(
+    contexts: Sequence[TargetDirectContext],
+    manifest: Dict[str, TargetHardenSdc],
+    instances: Dict[str, Dict[str, object]],
+    upstream: Dict[str, object],
+    report: Report,
+) -> List[TargetFeedthroughEdge]:
+    result: List[TargetFeedthroughEdge] = []
+    clock_endpoints = upstream.get("clock_endpoints", set())
+    pad_endpoints = upstream.get("pad_endpoints", set())
+    pad_connection_ids = upstream.get("pad_connection_ids", set())
+    for context in contexts:
+        edge = context.edge
+        src_key = target_edge_endpoint_tuple(edge, "src")
+        dst_key = target_edge_endpoint_tuple(edge, "dst")
+        if src_key in clock_endpoints or dst_key in clock_endpoints:
+            continue
+        if normalize_key(edge.src_instance) == "top" or normalize_key(edge.dst_instance) == "top":
+            harden_key = dst_key if normalize_key(edge.src_instance) == "top" else src_key
+            if harden_key not in pad_endpoints and edge.connection_id not in pad_connection_ids:
+                report.error(
+                    "{0}: top/pad direct edge is absent from 04 pad inventory".format(
+                        edge.connection_id
+                    )
+                )
+            continue
+        src_ft = parse_feedthrough_port(edge.src_port)
+        dst_ft = parse_feedthrough_port(edge.dst_port)
+        src_is_fto = bool(src_ft and src_ft[0] == "fto")
+        dst_is_fti = bool(dst_ft and dst_ft[0] == "fti")
+        if not (src_is_fto or dst_is_fti):
+            continue
+        if edge.src_instance == edge.dst_instance:
+            report.error("{0}: harden-internal feedthrough edge is not SoC-visible".format(edge.connection_id))
+            continue
+        if src_is_fto and edge.src_direction != "output":
+            report.error("{0}: fto boundary must be output".format(edge.connection_id))
+        if dst_is_fti and edge.dst_direction != "input":
+            report.error("{0}: fti boundary must be input".format(edge.connection_id))
+        boundary_instances = []
+        if src_is_fto:
+            boundary_instances.append(edge.src_instance)
+        if dst_is_fti:
+            boundary_instances.append(edge.dst_instance)
+        if any(inst not in manifest or inst not in instances for inst in boundary_instances):
+            report.error("{0}: feedthrough boundary is not a manifest harden".format(edge.connection_id))
+            continue
+        confirmed = all(
+            target_instance_feedthrough_confirmed(instances[inst])
+            for inst in boundary_instances
+        )
+        classification_source = "info_all" if confirmed else "name_candidate"
+        classification_status = "confirmed" if confirmed else "needs_review"
+        if not confirmed:
+            report.warn(
+                "{0}: feedthrough classification comes only from fti_/fto_ naming; explicit review confirmation is required".format(
+                    edge.connection_id
+                )
+            )
+        if src_is_fto and dst_is_fti:
+            edge_role = "between_feedthroughs"
+            ft_instance = edge.src_instance + "," + edge.dst_instance
+            ft_port = edge.src_port + "," + edge.dst_port
+        elif dst_is_fti:
+            edge_role = "ingress"
+            ft_instance = edge.dst_instance
+            ft_port = edge.dst_port
+        else:
+            edge_role = "egress"
+            ft_instance = edge.src_instance
+            ft_port = edge.src_port
+        _, _, digest = target_connection_ids(
+            edge.src_instance,
+            edge.src_direction,
+            src_key[2],
+            src_key[3],
+            edge.dst_instance,
+            edge.dst_direction,
+            dst_key[2],
+            dst_key[3],
+        )
+        result.append(
+            TargetFeedthroughEdge(
+                edge=edge,
+                connection_hash=digest,
+                edge_role=edge_role,
+                feedthrough_instance=ft_instance,
+                feedthrough_port=ft_port,
+                feedthrough_side=edge_role,
+                classification_source=classification_source,
+                classification_status=classification_status,
+                source_record=context.source_record,
+                src_record=context.src_record,
+                dst_record=context.dst_record,
+            )
+        )
+    result.sort(key=lambda item: item.edge.connection_id)
+    report.info("classified {0} feedthrough-adjacent direct edge(s)".format(len(result)))
+    return result
+
+
+def target_machine_digest(values: Dict[str, object]) -> str:
+    payload = "\n".join(
+        "{0}={1}".format(header, clean_cell(values.get(header)))
+        for header in sorted(TARGET_REVIEW_INVALIDATING_HEADERS)
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def target_sdc_status(inst_name: str, manifest: Dict[str, TargetHardenSdc]) -> str:
+    if normalize_key(inst_name) == "top":
+        return "not_required"
+    entry = manifest.get(inst_name)
+    return entry.availability_status if entry is not None else "missing"
+
+
+def target_resolve_evidence_clock(
+    inst_name: str, clock_name: str, upstream: Dict[str, object]
+) -> str:
+    local = clean_cell(clock_name)
+    if not local:
+        return ""
+    mapped = upstream.get("clock_aliases", {}).get((inst_name, local))
+    relation_clocks: Set[str] = set()
+    for pair in upstream.get("relations", {}):
+        relation_clocks.update(pair)
+    if mapped and (
+        mapped in upstream.get("active_clocks", set()) or mapped in relation_clocks
+    ):
+        return mapped
+    return "unresolved:" + local
+
+
+def target_clock_relation(
+    src_clocks: Sequence[str],
+    dst_clocks: Sequence[str],
+    upstream: Dict[str, object],
+) -> str:
+    if any(
+        item and item.startswith("unresolved:")
+        for item in list(src_clocks) + list(dst_clocks)
+    ):
+        return "unknown"
+    src = sorted(set(item for item in src_clocks if item and not item.startswith("unresolved:")))
+    dst = sorted(set(item for item in dst_clocks if item and not item.startswith("unresolved:")))
+    if len(src) != 1 or len(dst) != 1:
+        return "unknown"
+    if src[0] == dst[0]:
+        return "synchronous"
+    return upstream.get("relations", {}).get(tuple(sorted((src[0], dst[0]))), "unknown")
+
+
+def target_edge_seed(
+    item: TargetFeedthroughEdge,
+    manifest: Dict[str, TargetHardenSdc],
+    completeness: RunCompleteness,
+    evidence_by_key: Dict[Tuple[str, str, str], List[DelayEvidence]],
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    upstream: Dict[str, object],
+) -> Dict[str, object]:
+    edge = item.edge
+    src_evidence = matching_evidence(
+        evidence_by_key, edge.src_instance, edge.src_port, "output_delay"
+    )
+    dst_evidence = matching_evidence(
+        evidence_by_key, edge.dst_instance, edge.dst_port, "input_delay"
+    )
+    related = src_evidence + dst_evidence
+    src_status = target_sdc_status(edge.src_instance, manifest)
+    dst_status = target_sdc_status(edge.dst_instance, manifest)
+    if "missing" in {src_status, dst_status}:
+        evidence_status = "incomplete_missing_sdc"
+    elif any(entry.parse_status != "ok" for entry in related):
+        evidence_status = "needs_review"
+    elif related:
+        evidence_status = "complete"
+    else:
+        evidence_status = "complete_no_delay_candidate"
+    src_clocks = [
+        target_resolve_evidence_clock(edge.src_instance, entry.clock_name, upstream)
+        for entry in src_evidence if entry.clock_name
+    ]
+    dst_clocks = [
+        target_resolve_evidence_clock(edge.dst_instance, entry.clock_name, upstream)
+        for entry in dst_evidence if entry.clock_name
+    ]
+    relation = target_clock_relation(src_clocks, dst_clocks, upstream)
+    values: Dict[str, object] = {header: "" for header in TARGET_EDGE_HEADERS}
+    values.update(
+        {
+            "schema_version": TARGET_SCHEMA_VERSION,
+            "run_id": run_context.get("run_id", ""),
+            "mode_label": run_context.get("mode_label", ""),
+            "design_revision": run_context.get("design_revision", ""),
+            "run_completeness": completeness.status,
+            "structure_digest": structure,
+            "accounting_digest_before": accounting_before,
+            "accounting_digest_after": accounting_before,
+            "feedthrough_edge_id": "FTE_" + item.connection_hash,
+            "connection_id": edge.connection_id,
+            "edge_role": item.edge_role,
+            "src_instance": edge.src_instance,
+            "src_direction": edge.src_direction,
+            "src_port": edge.src_port,
+            "src_bit_index": edge.src_bit_index,
+            "src_endpoint": edge.src_endpoint_key,
+            "src_soc_object": target_endpoint_collection(edge.src_instance, edge.src_port),
+            "dst_instance": edge.dst_instance,
+            "dst_direction": edge.dst_direction,
+            "dst_port": edge.dst_port,
+            "dst_bit_index": edge.dst_bit_index,
+            "dst_endpoint": edge.dst_endpoint_key,
+            "dst_soc_object": target_endpoint_collection(edge.dst_instance, edge.dst_port),
+            "source_workbook": item.source_record.workbook,
+            "source_sheet": item.source_record.sheet,
+            "source_row": item.source_record.row,
+            "feedthrough_instance": item.feedthrough_instance,
+            "feedthrough_port": item.feedthrough_port,
+            "feedthrough_side": item.feedthrough_side,
+            "classification_source": item.classification_source,
+            "classification_status": item.classification_status,
+            "feedthrough_confirmed": "yes" if item.classification_status == "confirmed" else "no",
+            "src_sdc_status": src_status,
+            "dst_sdc_status": dst_status,
+            "evidence_status": evidence_status,
+            "src_output_delay_max": join_unique(entry.max_value or entry.bare_value for entry in src_evidence),
+            "src_output_delay_min": join_unique(entry.min_value for entry in src_evidence),
+            "dst_input_delay_max": join_unique(entry.max_value or entry.bare_value for entry in dst_evidence),
+            "dst_input_delay_min": join_unique(entry.min_value for entry in dst_evidence),
+            "src_clock": join_unique(src_clocks),
+            "dst_clock": join_unique(dst_clocks),
+            "clock_relation": relation,
+            "source_sdc_file": join_unique(entry.source_sdc_file for entry in related),
+            "source_line": join_unique(entry.source_line for entry in related),
+            "source_digest": join_unique(entry.source_digest for entry in related),
+            "source_command": join_unique((entry.original_command for entry in related), " || "),
+            "channel_disposition": "pending",
+            "budget_model": "unknown",
+            "budget_required": "",
+            "emit_max": "no",
+            "emit_min": "no",
+            "datapath_only": "yes",
+            "tool_surface": "dc",
+            "apply": "no",
+            "review_status": "pending",
+            "validation_status": "matched",
+            "machine_note": (
+                "feedthrough classification requires explicit review confirmation"
+                if item.classification_status != "confirmed" else ""
+            ),
+        }
+    )
+    if not related:
+        values["machine_note"] = join_unique(
+            [values.get("machine_note", ""), "no boundary input/output delay evidence"]
+        )
+    values["machine_digest"] = target_machine_digest(values)
+    return values
+
+
+def build_target_seeds(
+    owned: Sequence[TargetFeedthroughEdge],
+    manifest: Dict[str, TargetHardenSdc],
+    completeness: RunCompleteness,
+    evidence: Sequence[DelayEvidence],
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    upstream: Dict[str, object],
+) -> List[Dict[str, object]]:
+    index = evidence_index(evidence)
+    return [
+        target_edge_seed(
+            item, manifest, completeness, index, run_context, structure,
+            accounting_before, upstream,
+        )
+        for item in owned
+    ]
+
+
+def target_workbook_row_values(sheet, row_idx: int) -> Dict[str, object]:
+    return sheet_row_values(sheet, row_idx, TARGET_EDGE_HEADERS)
+
+
+def target_run_metadata_rows(
+    run_context: Dict[str, str], structure: str, accounting_before: str
+) -> List[Tuple[str, str]]:
+    return [
+        ("schema_version", TARGET_SCHEMA_VERSION),
+        ("author", author_name()),
+        ("stage_name", "10_feedthrough"),
+        ("run_id", run_context.get("run_id", "")),
+        ("mode_label", run_context.get("mode_label", "")),
+        ("design_revision", run_context.get("design_revision", "")),
+        ("structure_digest", structure),
+        ("accounting_digest_before", accounting_before),
+    ]
+
+
+def sync_target_workbook(
+    path: Path,
+    seeds: Sequence[Dict[str, object]],
+    evidence: Sequence[DelayEvidence],
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    report: Report,
+) -> None:
+    workbook, created = create_or_load_workbook(path)
+    ensure_sheet(workbook, "feedthrough_edges", TARGET_EDGE_HEADERS)
+    ensure_sheet(workbook, "extraction_log", LOG_HEADERS)
+    ensure_sheet(workbook, "run_metadata", ["key", "value"])
+    sheet = workbook["feedthrough_edges"]
+    mapping = header_map(sheet)
+    existing: Dict[str, int] = {}
+    for row_idx in range(2, sheet.max_row + 1):
+        connection_id = clean_cell(sheet.cell(row_idx, mapping["connection_id"]).value)
+        if not connection_id:
+            continue
+        if connection_id in existing:
+            report.error("review workbook duplicates connection_id {0}".format(connection_id))
+        else:
+            existing[connection_id] = row_idx
+    changed = created
+    seed_ids: Set[str] = set()
+    for seed in seeds:
+        connection_id = clean_cell(seed.get("connection_id"))
+        seed_ids.add(connection_id)
+        row_idx = existing.get(connection_id)
+        if row_idx is None:
+            append_row(sheet, TARGET_EDGE_HEADERS, seed, NEW_FILL)
+            existing[connection_id] = sheet.max_row
+            changed = True
+            report.info("added target review row {0}".format(connection_id))
+            continue
+        material_changed = False
+        for header in sorted(TARGET_MACHINE_HEADERS):
+            old_value = clean_cell(sheet.cell(row_idx, mapping[header]).value)
+            new_value = clean_cell(seed.get(header))
+            if old_value == new_value:
+                continue
+            sheet.cell(row_idx, mapping[header], seed.get(header, ""))
+            if header in TARGET_REVIEW_INVALIDATING_HEADERS:
+                material_changed = True
+        if material_changed:
+            sheet.cell(row_idx, mapping["apply"], "no").fill = NEW_FILL
+            sheet.cell(row_idx, mapping["review_status"], "pending").fill = NEW_FILL
+            sheet.cell(row_idx, mapping["approved_machine_digest"], "")
+            changed = True
+            report.warn(
+                "{0}: material machine evidence changed; approval reset".format(
+                    connection_id
+                )
+            )
+        if (
+            normalize_key(sheet.cell(row_idx, mapping["apply"]).value) == "yes"
+            and normalize_key(sheet.cell(row_idx, mapping["review_status"]).value) == "approved"
+        ):
+            approved_cell = sheet.cell(row_idx, mapping["approved_machine_digest"])
+            digest = clean_cell(seed.get("machine_digest"))
+            if clean_cell(approved_cell.value) != digest:
+                approved_cell.value = digest
+
+    for connection_id, row_idx in existing.items():
+        if connection_id not in seed_ids:
+            report.error(
+                "review workbook contains obsolete target connection row {0} at row {1}".format(
+                    connection_id, row_idx
+                )
+            )
+
+    log_sheet = workbook["extraction_log"]
+    if log_sheet.max_row > 1:
+        log_sheet.delete_rows(2, log_sheet.max_row - 1)
+    for values in evidence_log_rows(evidence):
+        append_row(log_sheet, LOG_HEADERS, values)
+
+    metadata_sheet = workbook["run_metadata"]
+    if metadata_sheet.max_row > 1:
+        metadata_sheet.delete_rows(2, metadata_sheet.max_row - 1)
+    for key, value in target_run_metadata_rows(
+        run_context, structure, accounting_before
+    ):
+        append_row(metadata_sheet, ["key", "value"], {"key": key, "value": value})
+
+    add_target_workbook_validations(workbook)
+    ensure_sheet(workbook, "feedthrough_edges", TARGET_EDGE_HEADERS)
+    ensure_sheet(workbook, "extraction_log", LOG_HEADERS)
+    ensure_sheet(workbook, "run_metadata", ["key", "value"])
+    atomic_save_workbook(workbook, path)
+    report.sync_changed = changed
+    if changed:
+        report.warn("review workbook synchronized; formal SDC/accounting requires re-review")
+
+
+def add_target_workbook_validations(workbook: Workbook) -> None:
+    sheet = workbook["feedthrough_edges"]
+    mapping = header_map(sheet)
+    sheet.data_validations.dataValidation = []
+    choices = {
+        "channel_disposition": sorted(DISPOSITIONS),
+        "budget_model": sorted(item for item in BUDGET_MODELS if item),
+        "budget_required": ["yes", "no"],
+        "emit_max": ["yes", "no"],
+        "emit_min": ["yes", "no"],
+        "datapath_only": ["yes", "no"],
+        "tool_surface": ["dc", "sta", "both"],
+        "feedthrough_confirmed": ["yes", "no"],
+        "apply": ["yes", "no"],
+        "review_status": ["pending", "approved", "rejected"],
+    }
+    for header, values in choices.items():
+        if header not in mapping:
+            continue
+        validation = DataValidation(
+            type="list", formula1='"{0}"'.format(",".join(values)), allow_blank=True
+        )
+        sheet.add_data_validation(validation)
+        letter = get_column_letter(mapping[header])
+        validation.add("{0}2:{0}1048576".format(letter))
+
+
+def read_target_form_rows(path: Path) -> List[FormRow]:
+    workbook = load_workbook(str(path), data_only=False)
+    if "feedthrough_edges" not in workbook.sheetnames:
+        raise RuntimeError("{0}: missing feedthrough_edges sheet".format(path))
+    sheet = workbook["feedthrough_edges"]
+    mapping = header_map(sheet)
+    rows = [
+        FormRow(row_idx, target_workbook_row_values(sheet, row_idx))
+        for row_idx in range(2, sheet.max_row + 1)
+        if clean_cell(sheet.cell(row_idx, mapping.get("connection_id", 1)).value)
+    ]
+    workbook.close()
+    return rows
+
+
+def validate_target_rows(
+    rows: Sequence[FormRow],
+    seeds: Sequence[Dict[str, object]],
+    report: Report,
+) -> None:
+    seed_by_id = {clean_cell(seed.get("connection_id")): seed for seed in seeds}
+    seen: Set[str] = set()
+    for row in rows:
+        values = row.values
+        connection_id = clean_cell(values.get("connection_id"))
+        if connection_id in seen:
+            report.error("feedthrough_edges row {0}: duplicate connection_id".format(row.row_idx))
+            continue
+        seen.add(connection_id)
+        seed = seed_by_id.get(connection_id)
+        if seed is None:
+            report.error("feedthrough_edges row {0}: connection is not owned by current 10 run".format(row.row_idx))
+            continue
+        for header in TARGET_REVIEW_INVALIDATING_HEADERS.union({"machine_digest"}):
+            if clean_cell(values.get(header)) != clean_cell(seed.get(header)):
+                report.error(
+                    "feedthrough_edges row {0}: machine field {1} is stale".format(
+                        row.row_idx, header
+                    )
+                )
+        disposition = normalize_key(values.get("channel_disposition"))
+        apply_value = normalize_key(values.get("apply"))
+        review_status = normalize_key(values.get("review_status"))
+        emit_max = normalize_key(values.get("emit_max"))
+        emit_min = normalize_key(values.get("emit_min"))
+        budget_required = normalize_key(values.get("budget_required"))
+        budget_model = normalize_key(values.get("budget_model"))
+        if disposition not in DISPOSITIONS:
+            report.error("feedthrough_edges row {0}: invalid channel_disposition".format(row.row_idx))
+        if apply_value not in YES_NO or review_status not in REVIEW_STATUSES:
+            report.error("feedthrough_edges row {0}: invalid apply/review_status".format(row.row_idx))
+        if emit_max not in YES_NO or emit_min not in YES_NO:
+            report.error("feedthrough_edges row {0}: emit flags must be yes/no".format(row.row_idx))
+        if disposition != "emit_budget" and (emit_max == "yes" or emit_min == "yes"):
+            report.error("feedthrough_edges row {0}: only emit_budget may emit commands".format(row.row_idx))
+        approved = apply_value == "yes" and review_status == "approved"
+        if not approved:
+            if disposition == "route_to_30" and not clean_cell(values.get("basis")):
+                report.warn("feedthrough_edges row {0}: route_to_30 lacks follow-up basis".format(row.row_idx))
+            continue
+        if disposition == "pending":
+            report.error("feedthrough_edges row {0}: pending cannot be approved/applied".format(row.row_idx))
+            continue
+        missing_review = [
+            name for name in ("owner", "reviewer", "review_date", "basis")
+            if not clean_cell(values.get(name))
+        ]
+        if missing_review:
+            report.error(
+                "feedthrough_edges row {0}: terminal review missing {1}".format(
+                    row.row_idx, ",".join(missing_review)
+                )
+            )
+        approved_digest = clean_cell(values.get("approved_machine_digest"))
+        if not approved_digest or approved_digest != clean_cell(values.get("machine_digest")):
+            report.error("feedthrough_edges row {0}: approved machine digest is stale".format(row.row_idx))
+        if (
+            normalize_key(values.get("classification_status")) != "confirmed"
+            and normalize_key(values.get("feedthrough_confirmed")) != "yes"
+        ):
+            report.error("feedthrough_edges row {0}: name-only feedthrough candidate requires explicit confirmation".format(row.row_idx))
+        if disposition == "emit_budget":
+            if budget_required != "yes":
+                report.error("feedthrough_edges row {0}: emit_budget requires budget_required=yes".format(row.row_idx))
+            if budget_model not in {"manual_budget", "interconnect_budget", "reviewed_two_side_budget"}:
+                report.error("feedthrough_edges row {0}: emit_budget requires a reviewed budget model".format(row.row_idx))
+            if emit_max != "yes" and emit_min != "yes":
+                report.error("feedthrough_edges row {0}: emit_budget must emit max and/or min".format(row.row_idx))
+            if normalize_key(values.get("datapath_only")) != "yes":
+                report.error("feedthrough_edges row {0}: emit_budget requires datapath_only=yes".format(row.row_idx))
+            if normalize_key(values.get("tool_surface")) not in {"dc", "sta", "both"}:
+                report.error("feedthrough_edges row {0}: emit_budget requires tool_surface".format(row.row_idx))
+            if emit_max == "yes" and parse_number(values.get("converted_max")) is None:
+                report.error("feedthrough_edges row {0}: emit_max requires finite converted_max".format(row.row_idx))
+            if emit_min == "yes":
+                if parse_number(values.get("converted_min")) is None:
+                    report.error("feedthrough_edges row {0}: emit_min requires finite converted_min".format(row.row_idx))
+                if normalize_key(values.get("min_sign_review")) not in {"yes", "approved", "reviewed"}:
+                    report.error("feedthrough_edges row {0}: emit_min requires min_sign_review".format(row.row_idx))
+            if "missing" in {
+                normalize_key(values.get("src_sdc_status")),
+                normalize_key(values.get("dst_sdc_status")),
+            } and not clean_cell(values.get("sdc_independent_basis")):
+                report.error("feedthrough_edges row {0}: emit with missing SDC requires sdc_independent_basis".format(row.row_idx))
+            if normalize_key(values.get("clock_relation")) in {
+                "asynchronous", "logically_exclusive", "physically_exclusive"
+            } and not clean_cell(values.get("relationship_override_basis")):
+                report.error("feedthrough_edges row {0}: async/exclusive normal budget requires override basis".format(row.row_idx))
+            if normalize_key(values.get("clock_relation")) == "unknown":
+                report.warn("feedthrough_edges row {0}: clock relation is unknown; budget basis must not assume synchronous timing".format(row.row_idx))
+        elif disposition in {"no_soc_budget_required", "not_applicable"}:
+            if emit_max != "no" or emit_min != "no":
+                report.error("feedthrough_edges row {0}: non-emitting terminal requires emit_max=no and emit_min=no".format(row.row_idx))
+            if disposition == "no_soc_budget_required" and budget_required != "no":
+                report.error("feedthrough_edges row {0}: no-budget terminal requires budget_required=no".format(row.row_idx))
+        elif disposition == "route_to_30":
+            if emit_max == "yes" or emit_min == "yes":
+                report.error("feedthrough_edges row {0}: route_to_30 cannot emit normal budget".format(row.row_idx))
+    for connection_id in sorted(set(seed_by_id) - seen):
+        report.error("review workbook is missing current edge {0}".format(connection_id))
+    bus_groups: Dict[Tuple[str, ...], List[FormRow]] = defaultdict(list)
+    for row in rows:
+        key = compaction_cohort_key(row)
+        if key is not None:
+            bus_groups[key].append(row)
+    for key, group in bus_groups.items():
+        if len(group) < 2:
+            continue
+        terminal_count = sum(1 for row in group if terminal_disposition(row))
+        if 0 < terminal_count < len(group):
+            report.warn(
+                "feedthrough bus cohort is only partially terminal: {0}/{1} bit edge(s)".format(
+                    terminal_count, len(group)
+                )
+            )
+
+
+def target_form_rows(rows: Sequence[FormRow]) -> List[FormRow]:
+    return sorted(rows, key=lambda row: clean_cell(row.values.get("connection_id")))
+
+
+def build_target_emission_blocks(
+    rows: Sequence[FormRow], all_edges: Sequence[ConnectionEdge]
+) -> List[EmissionBlock]:
+    cohorts: Dict[Tuple[str, ...], List[FormRow]] = defaultdict(list)
+    standalone: List[FormRow] = []
+    for row in target_form_rows(rows):
+        key = compaction_cohort_key(row)
+        if key is None:
+            standalone.append(row)
+        else:
+            cohorts[key].append(row)
+    blocks: List[EmissionBlock] = []
+    for cohort in cohorts.values():
+        merged = compacted_emission_block(cohort, all_edges, "all")
+        if merged is not None:
+            blocks.append(merged)
+        else:
+            for row in cohort:
+                commands = commands_for_row(row, "all")
+                if commands:
+                    blocks.append(EmissionBlock(rows=[row], commands=commands))
+    for row in standalone:
+        commands = commands_for_row(row, "all")
+        if commands:
+            blocks.append(EmissionBlock(rows=[row], commands=commands))
+    return sorted(blocks, key=lambda block: min(row.row_idx for row in block.rows))
+
+
+def target_record_for_endpoint(
+    edge: ConnectionEdge,
+    side: str,
+    lookup: Dict[Tuple[str, str, str], List[Any]],
+    report: Report,
+) -> Optional[Tuple[Any, int]]:
+    inst, direction, base, bit = target_edge_endpoint_tuple(edge, side)
+    if normalize_key(inst) == "top":
+        return None
+    matches = [
+        record for record in lookup.get((inst, direction, base), [])
+        if record.shape.contains(bit)
+    ]
+    if len(matches) != 1:
+        report.error(
+            "{0}: accounting endpoint {1} matched {2} workbook row(s)".format(
+                edge.connection_id, target_endpoint_key(inst, direction, target_exact_port(matches[0].shape, bit)) if matches else "{0}:{1}:{2}[{3}]".format(inst, direction, base, bit), len(matches)
+            )
+        )
+        return None
+    return matches[0], bit
+
+
+def plan_target_feedthrough_accounting(
+    rows: Sequence[FormRow],
+    owned: Sequence[TargetFeedthroughEdge],
+    port_records,
+    upstream: Dict[str, object],
+    runtime,
+    report: Report,
+) -> List[Tuple[FormRow, TargetFeedthroughEdge, Any, int, str, bool]]:
+    lookup = target_port_record_lookup(port_records)
+    owned_by_connection = {
+        item.edge.connection_id: item for item in owned
+    }
+    owner_map = upstream.get("owner_map", {})
+    planned: List[Tuple[FormRow, TargetFeedthroughEdge, Any, int, str, bool]] = []
+    for row in target_form_rows(rows):
+        if not terminal_disposition(row):
+            continue
+        connection_id = clean_cell(row.values.get("connection_id"))
+        item = owned_by_connection.get(connection_id)
+        if item is None:
+            continue
+        for side in ("src", "dst"):
+            resolved = target_record_for_endpoint(
+                item.edge, side, lookup, report
+            )
+            if resolved is None:
+                continue
+            record, bit = resolved
+            owner_key = (record.inst_name, record.direction, record.shape.base, bit)
+            early_owners = [
+                owner for owner in owner_map.get(owner_key, [])
+                if owner[0] in {"00_harden_port_inventory", "01_soc_clocks", "04_soc_io_pads"}
+            ]
+            if early_owners:
+                report.info(
+                    "{0}: {1} endpoint already accounted by earlier owner(s) {2}; 10 keeps timing ownership without another Used claim".format(
+                        connection_id,
+                        side,
+                        ",".join("{0}:{1}".format(stage, owner_id) for stage, owner_id in early_owners),
+                    )
+                )
+                continue
+            added = bit not in record.used_bits
+            if added:
+                record.used_bits.add(bit)
+                record.added_bits.add(bit)
+                record.modified = True
+                record.model.modified = True
+            planned.append((row, item, record, bit, side, added))
+            report.info(
+                "accounting {0}:{1} row {2} {3} {4}: added_bits={5} final_used_bits={6}".format(
+                    record.workbook,
+                    record.sheet,
+                    record.row,
+                    record.direction,
+                    record.shape.raw,
+                    str(bit) if added else "<none>",
+                    runtime.format_bits(record.used_bits),
+                )
+            )
+    for record in port_records:
+        if record.modified:
+            cell = record.model.workbook[record.sheet].cell(record.row, record.used_col)
+            cell.value = runtime.format_bits(record.used_bits)
+            cell.number_format = "@"
+    return planned
+
+
+def make_target_10_transaction_id(run_id: str) -> str:
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    seed = "10|{0}|{1}|{2}|{3}".format(
+        run_id, timestamp, os.getpid(), socket.gethostname()
+    )
+    return "10_{0}_{1}".format(
+        timestamp, hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+    )
+
+
+def build_target_10_delta_rows(
+    planned: Sequence[Tuple[FormRow, TargetFeedthroughEdge, Any, int, str, bool]],
+    run_context: Dict[str, str],
+    transaction_id: str,
+    structure: str,
+    before: str,
+    after: str,
+    runtime,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for form_row, item, record, bit, side, added in planned:
+        rows.append(
+            {
+                "schema_version": TARGET_SCHEMA_VERSION,
+                "run_id": run_context.get("run_id", ""),
+                "mode_label": run_context.get("mode_label", ""),
+                "stage_name": "10_feedthrough",
+                "transaction_id": transaction_id,
+                "view_id": "",
+                "stage": "",
+                "corner": "",
+                "structure_digest": structure,
+                "accounting_digest_before": before,
+                "accounting_digest_after": after,
+                "workbook": record.workbook,
+                "sheet": record.sheet,
+                "row": record.row,
+                "direction": record.direction,
+                "port": record.shape.raw,
+                "legal_bits": runtime.format_bits(set(record.shape.bits())),
+                "added_bits": str(bit) if added else "",
+                "final_used_bits": runtime.format_bits(record.used_bits),
+                "owner_object_id": clean_cell(form_row.values.get("feedthrough_edge_id")),
+                "reason": "feedthrough_{0}_{1}".format(
+                    normalize_key(form_row.values.get("channel_disposition")), side
+                ),
+                "evidence_status": "approved",
+            }
+        )
+    return rows
+
+
+def target_inventory_text(rows: Sequence[FormRow]) -> str:
+    stream = io.StringIO()
+    writer = csv.DictWriter(
+        stream, fieldnames=TARGET_EDGE_HEADERS, extrasaction="ignore", lineterminator="\n"
+    )
+    writer.writeheader()
+    for row in target_form_rows(rows):
+        writer.writerow(
+            {header: clean_cell(row.values.get(header)) for header in TARGET_EDGE_HEADERS}
+        )
+    return stream.getvalue()
+
+
+def render_target_10_sdc(
+    blocks: Sequence[EmissionBlock],
+    run_context: Dict[str, str],
+    completeness: RunCompleteness,
+    structure: str,
+    accounting_before: str,
+    accounting_after: str,
+    manifest_path: Path,
+) -> str:
+    lines = [
+        "################################################################################",
+        "# Auto-generated SoC feedthrough direct-edge constraints",
+        "# Author: {0}".format(author_name()),
+        "# Stage: 10_feedthrough",
+        "# Script: 10_extract_feedthrough.py",
+        "# Run ID: {0}".format(run_context.get("run_id", "")),
+        "# Mode label: {0}".format(run_context.get("mode_label", "")),
+        "# Design revision: {0}".format(run_context.get("design_revision", "")),
+        "# Port accounting: enabled",
+        "# Structure digest: {0}".format(structure),
+        "# Accounting digest before: {0}".format(accounting_before),
+        "# Accounting digest after: {0}".format(accounting_after),
+        "# Run completeness: {0}".format(completeness.status),
+        "# Harden SDC manifest: {0}".format(manifest_path.resolve()),
+        "# Direct edges only; no harden-internal traversal or stitched end-to-end path is emitted.",
+        "################################################################################",
+        "",
+    ]
+    emitted = 0
+    for block in blocks:
+        first = block.rows[0].values
+        if block.merged:
+            append_chunked_comment(
+                lines,
+                "Merged feedthrough_edge_ids",
+                [clean_cell(row.values.get("feedthrough_edge_id")) for row in block.rows],
+            )
+            append_chunked_comment(
+                lines,
+                "connection_ids",
+                [clean_cell(row.values.get("connection_id")) for row in block.rows],
+            )
+        else:
+            lines.append(
+                "# {0} connection_id={1} role={2}".format(
+                    comment_text(first.get("feedthrough_edge_id")),
+                    comment_text(first.get("connection_id")),
+                    comment_text(first.get("edge_role")),
+                )
+            )
+        if clean_cell(first.get("basis")):
+            lines.append("# Basis: " + comment_text(first.get("basis")))
+        for command in block.commands:
+            if " -through " in " " + command + " ":
+                raise RuntimeError("target 10 attempted to emit a -through command")
+            lines.append(command)
+            emitted += 1
+        lines.append("")
+    if emitted == 0:
+        lines.append("# No feedthrough direct-edge timing commands emitted for this run.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def target_inventory_meta_payload(
+    run_context: Dict[str, str],
+    completion_status: str,
+    structure: str,
+    before: str,
+    after: str,
+    inventory_path: Path,
+    inventory_digest: str,
+    form_path: Path,
+    output_path: Path,
+    output_digest: str,
+    completeness: RunCompleteness,
+    workbook_before: Dict[str, str],
+    workbook_after: Dict[str, str],
+    upstream_digests: Dict[str, str],
+) -> Dict[str, object]:
+    return {
+        "schema_version": TARGET_SCHEMA_VERSION,
+        "author": author_name(),
+        "stage_name": "10_feedthrough",
+        "run_id": run_context.get("run_id", ""),
+        "mode_label": run_context.get("mode_label", ""),
+        "design_revision": run_context.get("design_revision", ""),
+        "completion_status": completion_status,
+        "structure_digest": structure,
+        "accounting_digest_before": before,
+        "accounting_digest_after": after,
+        "inventory_path": str(inventory_path.resolve()),
+        "inventory_digest": inventory_digest,
+        "review_workbook_path": str(form_path.resolve()),
+        "review_workbook_digest": digest_file(form_path) if form_path.is_file() else "",
+        "output_sdc_path": str(output_path.resolve()) if output_digest else "",
+        "output_sdc_digest": output_digest,
+        "run_completeness": completeness.status,
+        "missing_instances": completeness.missing_instances,
+        "workbook_file_digest_before": workbook_before,
+        "workbook_file_digest_after": workbook_after,
+        "upstream_artifact_digests": upstream_digests,
+    }
+
+
+def render_target_10_report(
+    report: Report,
+    rows: Sequence[FormRow],
+    run_context: Dict[str, str],
+    completeness: RunCompleteness,
+    structure: str,
+    accounting_before: str,
+    accounting_after: str,
+    completion_status: str,
+    diagnostic: bool,
+    planned: Sequence[Tuple[FormRow, TargetFeedthroughEdge, Any, int, str, bool]],
+) -> str:
+    dispositions: Dict[str, int] = defaultdict(int)
+    for row in rows:
+        dispositions[normalize_key(row.values.get("channel_disposition")) or "<blank>"] += 1
+    lines = [
+        "10_feedthrough direct-edge report",
+        "=================================",
+        "",
+        "Author: {0}".format(author_name()),
+        "Stage: 10_feedthrough",
+        "Script: 10_extract_feedthrough.py",
+        "Run ID: {0}".format(run_context.get("run_id", "")),
+        "Mode label: {0}".format(run_context.get("mode_label", "")),
+        "Design revision: {0}".format(run_context.get("design_revision", "")),
+        "Completion status: {0}".format(completion_status),
+        (
+            "Port accounting: diagnostic/read-only"
+            if diagnostic else
+            ("Port accounting: enabled" if completion_status == "complete" else "Port accounting: not committed")
+        ),
+        (
+            "Accounting closure: not evaluated"
+            if diagnostic else "Accounting closure: stage terminal bits {0}".format(
+                "committed" if completion_status == "complete" else "not committed"
+            )
+        ),
+        "Run completeness: {0}".format(completeness.status),
+        "Structure digest: {0}".format(structure or "<unavailable>"),
+        "Accounting digest before: {0}".format(accounting_before or "<unavailable>"),
+        "Accounting digest after: {0}".format(accounting_after or "<unavailable>"),
+        "Warnings: {0}".format(report.warning_count),
+        "Errors: {0}".format(report.error_count),
+        "Sync changed: {0}".format("yes" if report.sync_changed else "no"),
+        "",
+        "Coverage:",
+        "  feedthrough direct bit edges: {0}".format(len(rows)),
+        "  terminal rows: {0}".format(sum(1 for row in rows if terminal_disposition(row))),
+        "  accounting endpoint claims: {0}".format(len(planned)),
+        "  newly added bits: {0}".format(sum(1 for item in planned if item[5])),
+        "  dispositions:",
+    ]
+    for disposition in sorted(dispositions):
+        lines.append("    {0}: {1}".format(disposition, dispositions[disposition]))
+    lines.extend(["", "Accounting details:"])
+    for form_row, item, record, bit, side, added in planned:
+        lines.append(
+            "  {0} {1} {2}:{3}:{4} bit={5} added={6} final={7}".format(
+                clean_cell(form_row.values.get("feedthrough_edge_id")),
+                side,
+                record.workbook,
+                record.sheet,
+                record.row,
+                bit,
+                "yes" if added else "no",
+                ",".join(str(value) for value in sorted(record.used_bits)),
+            )
+        )
+    lines.extend(["", "Messages:"])
+    lines.extend(report.lines or ["INFO: no messages"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def invalidate_prior_target_completion(
+    runtime,
+    input_root: Path,
+    completion_path: Path,
+    prior_completion_digest: str,
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    models: Sequence[Any],
+    upstream: Dict[str, object],
+    form_path: Path,
+    report_path: Path,
+    completeness: RunCompleteness,
+    report: Report,
+) -> None:
+    if not prior_completion_digest or not structure:
+        return
+    try:
+        with runtime.AccountingLock(input_root / ".port_accounting.lock", report):
+            runtime.recover_transactions(completion_path.parents[1], report)
+            if not completion_path.is_file():
+                return
+            if digest_file(completion_path) != prior_completion_digest:
+                report.warn(
+                    "10 completion changed while the failed run was active; "
+                    "the newer marker was not invalidated"
+                )
+                return
+            try:
+                prior = json.loads(completion_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                report.warn("could not inspect prior 10 completion marker: {0}".format(exc))
+                return
+            if not isinstance(prior, dict):
+                return
+            if normalize_key(prior.get("completion_status")) != "complete":
+                return
+            workbook_digests: Dict[str, str] = {}
+            workbook_changed = False
+            for model in models:
+                if not model.path.is_file():
+                    workbook_changed = True
+                    continue
+                current_digest = digest_file(model.path)
+                workbook_digests[model.relative_name] = current_digest
+                if current_digest != model.digest_before:
+                    workbook_changed = True
+            if workbook_changed:
+                completion_path.unlink()
+                report.warn(
+                    "port workbook state changed during the failed run; the prior complete "
+                    "marker was removed instead of publishing an unverifiable failed marker"
+                )
+                return
+            failed_completion = {
+                "schema_version": TARGET_SCHEMA_VERSION,
+                "author": author_name(),
+                "stage_name": "10_feedthrough",
+                "stage": "",
+                "corner": "",
+                "run_id": run_context.get("run_id", ""),
+                "mode_label": run_context.get("mode_label", ""),
+                "design_revision": run_context.get("design_revision", ""),
+                "completion_status": "failed",
+                "error_count": max(1, report.error_count),
+                "sync_changed": "yes" if report.sync_changed else "no",
+                "structure_digest": structure,
+                "accounting_digest_before": accounting_before,
+                "accounting_digest_after": accounting_before,
+                "port_accounting": "not_committed",
+                "added_bits": 0,
+                "workbook_file_digest_before": workbook_digests,
+                "workbook_file_digest_after": workbook_digests,
+                "upstream_artifact_digests": upstream.get("upstream_digests", {}),
+                "output_sdc_digest": "",
+                "feedthrough_inventory_digest": "",
+                "accounting_delta_digest": "",
+                "review_workbook_digest": (
+                    digest_file(form_path) if form_path.is_file() else ""
+                ),
+                "transaction_id": "",
+                "run_completeness": completeness.status,
+                "missing_instances": completeness.missing_instances,
+                "failed_at": runtime.utc_timestamp(),
+                "failure_report_path": str(report_path.resolve()),
+                "invalidated_completion_digest": prior_completion_digest,
+            }
+            atomic_write_text(
+                completion_path,
+                json.dumps(
+                    failed_completion,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ) + "\n",
+            )
+    except Exception as exc:
+        report.warn(
+            "could not invalidate prior complete 10 marker after failure: {0}".format(exc)
+        )
+
+
+def run_target_single_run(args: argparse.Namespace, argv: Sequence[str]) -> int:
+    report = Report()
+    runtime = load_accounting_runtime()
+    run_root = Path(args.run_root).expanduser().resolve()
+    input_root = run_root / "inputs"
+    middle_root = run_root / "10_middle"
+    result_root = run_root / "10_result"
+    form_path = middle_root / "10_feedthrough.xlsx"
+    inventory_path = middle_root / "feedthrough_edge_inventory.csv"
+    inventory_meta_path = middle_root / "feedthrough_edge_inventory.meta"
+    delta_path = middle_root / "port_accounting_delta.csv"
+    delta_meta_path = middle_root / "port_accounting_delta.meta"
+    completion_path = middle_root / "stage_completion.meta"
+    output_path = result_root / "10_feedthrough.sdc"
+    report_path = result_root / "reports" / "feedthrough_check_report.txt"
+    manifest_path = run_root / "00_middle" / "harden_sdc_manifest.csv"
+    run_context_path = input_root / "run_context.csv"
+    required_views_path = input_root / "required_views.csv"
+    info_path = input_root / "info_all.xlsx"
+    diagnostic = bool(args.diagnose_only)
+
+    run_context: Dict[str, str] = {}
+    required_views: List[Dict[str, str]] = []
+    instances: Dict[str, Dict[str, object]] = {}
+    models: List[Any] = []
+    port_records: List[Any] = []
+    owned: List[TargetFeedthroughEdge] = []
+    rows: List[FormRow] = []
+    planned: List[Tuple[FormRow, TargetFeedthroughEdge, Any, int, str, bool]] = []
+    completeness = RunCompleteness(status="invalid")
+    structure = ""
+    accounting_before = ""
+    accounting_after = ""
+    upstream: Dict[str, object] = {}
+    preview_dir: Optional[Path] = None
+    completion_status = "failed"
+    prior_completion_digest = ""
+    try:
+        if not input_root.is_dir():
+            report.error("required inputs directory is missing: {0}".format(input_root))
+            raise RuntimeError("target input layout validation failed")
+        with runtime.AccountingLock(input_root / ".port_accounting.lock", report):
+            runtime.recover_transactions(run_root, report)
+            prior_completion_digest = (
+                digest_file(completion_path) if completion_path.is_file() else ""
+            )
+            run_context = runtime.read_run_context(run_context_path, report)
+            required_views = runtime.read_required_views(required_views_path, report)
+            instances, info_semantic = runtime.read_info_all(info_path, report)
+            port_paths = runtime.discover_port_workbooks(input_root, report)
+            models, port_records = runtime.read_port_workbooks(
+                port_paths, run_root, instances, True, report
+            )
+            runtime.validate_connections(port_records, instances, report)
+            structure = runtime.structure_digest(
+                run_context, required_views, info_semantic, port_records
+            )
+            accounting_before = runtime.accounting_digest(port_records)
+            accounting_after = accounting_before
+            upstream = validate_target_upstreams(
+                runtime,
+                run_root,
+                run_context,
+                required_views,
+                structure,
+                accounting_before,
+                port_records,
+                report,
+            )
+            manifest, completeness = read_target_harden_manifest(
+                manifest_path,
+                run_root,
+                instances,
+                args.require_complete_harden_sdc,
+                report,
+            )
+            direct_contexts = build_target_direct_edges(runtime, port_records, report)
+            owned = classify_target_feedthrough_edges(
+                direct_contexts, manifest, instances, upstream, report
+            )
+            evidence = extract_delay_evidence(manifest, report)
+            seeds = build_target_seeds(
+                owned,
+                manifest,
+                completeness,
+                evidence,
+                run_context,
+                structure,
+                accounting_before,
+                upstream,
+            )
+
+            if report.error_count:
+                raise RuntimeError("target 10 input validation failed")
+
+            if diagnostic:
+                rows = [FormRow(index + 2, dict(seed)) for index, seed in enumerate(seeds)]
+                inventory_text = target_inventory_text(rows)
+                inventory_digest = hashlib.sha256(inventory_text.encode("utf-8")).hexdigest()
+                workbook_digests = {model.relative_name: model.digest_before for model in models}
+                diagnostic_inventory_path = (
+                    middle_root / "diagnostic" / "feedthrough_edge_inventory.csv"
+                )
+                diagnostic_inventory_meta_path = (
+                    middle_root / "diagnostic" / "feedthrough_edge_inventory.meta"
+                )
+                meta = target_inventory_meta_payload(
+                    run_context,
+                    "diagnostic",
+                    structure,
+                    accounting_before,
+                    accounting_before,
+                    diagnostic_inventory_path,
+                    inventory_digest,
+                    form_path,
+                    output_path,
+                    "",
+                    completeness,
+                    workbook_digests,
+                    workbook_digests,
+                    upstream.get("upstream_digests", {}),
+                )
+                report_text = render_target_10_report(
+                    report,
+                    rows,
+                    run_context,
+                    completeness,
+                    structure,
+                    accounting_before,
+                    accounting_before,
+                    "diagnostic",
+                    True,
+                    [],
+                )
+                atomic_write_text(diagnostic_inventory_path, inventory_text)
+                atomic_write_text(
+                    diagnostic_inventory_meta_path,
+                    json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                )
+                atomic_write_text(report_path, report_text)
+                completion_status = "diagnostic"
+            else:
+                sync_target_workbook(
+                    form_path,
+                    seeds,
+                    evidence,
+                    run_context,
+                    structure,
+                    accounting_before,
+                    report,
+                )
+                rows = read_target_form_rows(form_path)
+                if report.sync_changed:
+                    inventory_text = target_inventory_text(rows)
+                    inventory_digest = hashlib.sha256(inventory_text.encode("utf-8")).hexdigest()
+                    workbook_digests = {model.relative_name: model.digest_before for model in models}
+                    meta = target_inventory_meta_payload(
+                        run_context,
+                        "review_required",
+                        structure,
+                        accounting_before,
+                        accounting_before,
+                        inventory_path,
+                        inventory_digest,
+                        form_path,
+                        output_path,
+                        "",
+                        completeness,
+                        workbook_digests,
+                        workbook_digests,
+                        upstream.get("upstream_digests", {}),
+                    )
+                    report_text = render_target_10_report(
+                        report,
+                        rows,
+                        run_context,
+                        completeness,
+                        structure,
+                        accounting_before,
+                        accounting_before,
+                        "review_required",
+                        False,
+                        [],
+                    )
+                    atomic_write_text(inventory_path, inventory_text)
+                    atomic_write_text(
+                        inventory_meta_path,
+                        json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                    )
+                    atomic_write_text(report_path, report_text)
+                    if completion_path.exists():
+                        completion_path.unlink()
+                    completion_status = "review_required"
+                else:
+                    validate_target_rows(rows, seeds, report)
+                    if report.error_count:
+                        raise RuntimeError("target review validation failed")
+                    all_edges = [context.edge for context in direct_contexts]
+                    emission_blocks = build_target_emission_blocks(rows, all_edges)
+                    planned = plan_target_feedthrough_accounting(
+                        rows, owned, port_records, upstream, runtime, report
+                    )
+                    accounting_after = runtime.accounting_digest(port_records)
+                    for row in rows:
+                        row.values["accounting_digest_after"] = accounting_after
+                    if report.error_count:
+                        raise RuntimeError("target accounting plan validation failed")
+                    sdc_text = render_target_10_sdc(
+                        emission_blocks,
+                        run_context,
+                        completeness,
+                        structure,
+                        accounting_before,
+                        accounting_after,
+                        manifest_path,
+                    )
+                    sdc_payload = sdc_text.encode("utf-8")
+                    sdc_digest = hashlib.sha256(sdc_payload).hexdigest()
+                    preview_dir = middle_root / (".10_preview_{0}".format(os.getpid()))
+                    if preview_dir.exists():
+                        shutil.rmtree(str(preview_dir))
+                    preview_dir.mkdir(parents=True, exist_ok=False)
+                    prepared_candidates: Dict[str, Path] = {}
+                    workbook_before = {model.relative_name: model.digest_before for model in models}
+                    for model in models:
+                        if model.modified:
+                            candidate = preview_dir / model.path.name
+                            model.workbook.save(str(candidate))
+                            model.digest_after = digest_file(candidate)
+                            prepared_candidates[model.relative_name] = candidate
+                        else:
+                            model.digest_after = model.digest_before
+                    workbook_after = {model.relative_name: model.digest_after for model in models}
+
+                    transaction_id = make_target_10_transaction_id(
+                        run_context.get("run_id", "")
+                    )
+                    old_delta_rows = (
+                        runtime.load_delta_rows(delta_path, report)
+                        if delta_path.is_file() else []
+                    )
+                    old_delta_meta = upstream.get("existing_10_meta", {})
+                    new_delta_rows = build_target_10_delta_rows(
+                        planned,
+                        run_context,
+                        transaction_id,
+                        structure,
+                        accounting_before,
+                        accounting_after,
+                        runtime,
+                    )
+                    if delta_path.is_file():
+                        delta_text = delta_path.read_text(encoding="utf-8")
+                        if delta_text and not delta_text.endswith("\n"):
+                            delta_text += "\n"
+                        if new_delta_rows:
+                            delta_text += runtime.csv_text(
+                                runtime.DELTA_HEADERS,
+                                new_delta_rows,
+                                include_header=False,
+                            )
+                    else:
+                        delta_text = runtime.csv_text(
+                            runtime.DELTA_HEADERS, old_delta_rows + new_delta_rows
+                        )
+                    delta_payload = delta_text.encode("utf-8")
+                    transaction_entry = {
+                        "transaction_id": transaction_id,
+                        "committed_at": runtime.utc_timestamp(),
+                        "structure_digest": structure,
+                        "accounting_digest_before": accounting_before,
+                        "accounting_digest_after": accounting_after,
+                        "delta_rows_digest": runtime.delta_rows_digest(new_delta_rows),
+                    }
+                    delta_meta = {
+                        "schema_version": TARGET_SCHEMA_VERSION,
+                        "run_id": run_context.get("run_id", ""),
+                        "mode_label": run_context.get("mode_label", ""),
+                        "design_revision": run_context.get("design_revision", ""),
+                        "stage_name": "10_feedthrough",
+                        "completion_status": "complete",
+                        "structure_digest": structure,
+                        "accounting_digest_before": accounting_before,
+                        "accounting_digest_after": accounting_after,
+                        "workbook_file_digest_before": workbook_before,
+                        "workbook_file_digest_after": workbook_after,
+                        "delta_csv_digest": hashlib.sha256(delta_payload).hexdigest(),
+                        "transactions": list(old_delta_meta.get("transactions", [])) + [transaction_entry],
+                    }
+                    inventory_text = target_inventory_text(rows)
+                    inventory_payload = inventory_text.encode("utf-8")
+                    inventory_digest = hashlib.sha256(inventory_payload).hexdigest()
+                    inventory_meta = target_inventory_meta_payload(
+                        run_context,
+                        "complete",
+                        structure,
+                        accounting_before,
+                        accounting_after,
+                        inventory_path,
+                        inventory_digest,
+                        form_path,
+                        output_path,
+                        sdc_digest,
+                        completeness,
+                        workbook_before,
+                        workbook_after,
+                        upstream.get("upstream_digests", {}),
+                    )
+                    completion = {
+                        "schema_version": TARGET_SCHEMA_VERSION,
+                        "author": author_name(),
+                        "stage_name": "10_feedthrough",
+                        "stage": "",
+                        "corner": "",
+                        "run_id": run_context.get("run_id", ""),
+                        "mode_label": run_context.get("mode_label", ""),
+                        "design_revision": run_context.get("design_revision", ""),
+                        "completion_status": "complete",
+                        "error_count": 0,
+                        "sync_changed": "no",
+                        "structure_digest": structure,
+                        "accounting_digest_before": accounting_before,
+                        "accounting_digest_after": accounting_after,
+                        "port_accounting": "enabled",
+                        "added_bits": sum(1 for item in planned if item[5]),
+                        "workbook_file_digest_before": workbook_before,
+                        "workbook_file_digest_after": workbook_after,
+                        "upstream_artifact_digests": upstream.get("upstream_digests", {}),
+                        "output_sdc_digest": sdc_digest,
+                        "feedthrough_inventory_digest": inventory_digest,
+                        "accounting_delta_digest": hashlib.sha256(delta_payload).hexdigest(),
+                        "review_workbook_digest": digest_file(form_path),
+                        "transaction_id": transaction_id,
+                        "run_completeness": completeness.status,
+                        "missing_instances": completeness.missing_instances,
+                    }
+                    report_text = render_target_10_report(
+                        report,
+                        rows,
+                        run_context,
+                        completeness,
+                        structure,
+                        accounting_before,
+                        accounting_after,
+                        "complete",
+                        False,
+                        planned,
+                    )
+                    artifact_payloads = [
+                        (output_path, sdc_payload),
+                        (inventory_path, inventory_payload),
+                        (
+                            inventory_meta_path,
+                            (json.dumps(inventory_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+                        ),
+                        (delta_path, delta_payload),
+                        (
+                            delta_meta_path,
+                            (json.dumps(delta_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+                        ),
+                        (
+                            completion_path,
+                            (json.dumps(completion, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+                        ),
+                        (report_path, report_text.encode("utf-8")),
+                    ]
+                    for model in models:
+                        if (
+                            not model.path.is_file()
+                            or digest_file(model.path) != model.digest_before
+                        ):
+                            report.error(
+                                "concurrent workbook modification detected before 10 commit: {0}".format(
+                                    model.path
+                                )
+                            )
+                    if report.error_count:
+                        raise RuntimeError(
+                            "target workbook snapshot changed before transaction commit"
+                        )
+                    runtime.execute_transaction(
+                        run_root,
+                        models,
+                        prepared_candidates,
+                        artifact_payloads,
+                        transaction_id,
+                        run_context,
+                        structure,
+                        accounting_before,
+                        accounting_after,
+                        report,
+                    )
+                    completion_status = "complete"
+    except Exception as exc:
+        if not report.error_count:
+            report.error(str(exc))
+        if not diagnostic:
+            invalidate_prior_target_completion(
+                runtime,
+                input_root,
+                completion_path,
+                prior_completion_digest,
+                run_context,
+                structure,
+                accounting_before,
+                models,
+                upstream,
+                form_path,
+                report_path,
+                completeness,
+                report,
+            )
+        failure_text = render_target_10_report(
+            report,
+            rows,
+            run_context,
+            completeness,
+            structure,
+            accounting_before,
+            accounting_after or accounting_before,
+            "failed",
+            diagnostic,
+            planned,
+        )
+        atomic_write_text(report_path, failure_text)
+        completion_status = "failed"
+    finally:
+        for model in models:
+            try:
+                model.workbook.close()
+            except Exception:
+                pass
+        if preview_dir is not None and preview_dir.exists():
+            shutil.rmtree(str(preview_dir))
+
+    print("Author: {0}".format(author_name()))
+    print("Run ID: {0}".format(run_context.get("run_id", "")))
+    print("Mode label: {0}".format(run_context.get("mode_label", "")))
+    print("Design revision: {0}".format(run_context.get("design_revision", "")))
+    print(
+        "Port accounting: {0}".format(
+            "diagnostic/read-only" if diagnostic else (
+                "enabled" if completion_status == "complete" else "not committed"
+            )
+        )
+    )
+    print("Completion status: {0}".format(completion_status))
+    print("Report: {0}".format(report_path))
+    print("Warnings: {0}  Errors: {1}".format(report.warning_count, report.error_count))
+    if report.error_count:
+        return 1
+    if completion_status == "review_required":
+        return 1
+    return 0
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate SoC feedthrough direct-edge SDC.")
-    parser.add_argument("--run-root", help="target runtime root")
-    parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS))
+    parser = argparse.ArgumentParser(
+        description="Generate one run's SoC feedthrough direct-edge SDC and accounting artifacts."
+    )
+    parser.add_argument("--run-root", help="single-run target runtime root")
+    parser.add_argument("-scenario", "--scenario", default="common", choices=sorted(SCENARIOS))
     parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES))
     parser.add_argument("-corner", "--corner", default="all")
     parser.add_argument("--tool", default="dc", choices=sorted(TOOLS))
@@ -3447,11 +6211,61 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--report")
     parser.add_argument("--pending-root", help="directory containing scenario pending .ports files")
     parser.add_argument("--no-update-pending", action="store_true")
+    parser.add_argument(
+        "--diagnose-only",
+        action="store_true",
+        help="validate and publish diagnostic inventory/report without SDC or xlsx accounting writes",
+    )
     return parser.parse_args(argv)
+
+
+def cli_option_present(argv: Sequence[str], *names: str) -> bool:
+    for token in argv:
+        for name in names:
+            if token == name or token.startswith(name + "="):
+                return True
+    return False
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.run_root is None:
+        print(
+            "ERROR: --run-root is required by the target single-run runtime",
+            file=sys.stderr,
+        )
+        return 2
+    if args.run_root is not None:
+        forbidden = []
+        for label, names in (
+            ("--scenario", ("--scenario", "-scenario")),
+            ("--stage", ("--stage", "-stage")),
+            ("--corner", ("--corner", "-corner")),
+            ("--tool", ("--tool",)),
+            ("--connection-inventory", ("--connection-inventory",)),
+            ("--harden-sdc-manifest", ("--harden-sdc-manifest",)),
+            ("--clock-inventory", ("--clock-inventory",)),
+            ("--clock-inventory-meta", ("--clock-inventory-meta",)),
+            ("--relation-map", ("--relation-map",)),
+            ("--relation-map-meta", ("--relation-map-meta",)),
+            ("--form", ("--form",)),
+            ("--inventory", ("--inventory",)),
+            ("--output", ("--output",)),
+            ("--report", ("--report",)),
+            ("--pending-root", ("--pending-root",)),
+            ("--no-update-pending", ("--no-update-pending",)),
+        ):
+            if cli_option_present(argv, *names):
+                forbidden.append(label)
+        if forbidden:
+            print(
+                "ERROR: target single-run mode rejects scenario/view/path override(s): {0}".format(
+                    ",".join(forbidden)
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        return run_target_single_run(args, argv)
     cwd = Path.cwd()
     target_layout = args.run_root is not None
     run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
