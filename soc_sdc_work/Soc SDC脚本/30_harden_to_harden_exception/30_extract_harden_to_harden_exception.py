@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Generate 30 harden-to-harden path exception SDC from bit-level integration
-inventories and a reviewed exception workbook.
+Generate stage-30 object-level harden interface exception SDC.
 
-Current scope:
-  * 00 connection_inventory.csv is the source of direct bit-to-bit pairing
-  * 10 feedthrough_inventory.csv supplies bit-level feedthrough IDs
-  * 20_harden_x_if.xlsx is read when present to detect active normal budgets
-  * first run synchronizes candidates/rules, then stops for review
-  * only apply=yes + review_status=approved rows are emitted
+The formal entry point follows the single-run shared runtime contract: exact
+edges come directly from inputs/port_*.xlsx, 04/10/20 inventories provide
+ownership decisions, and stage 30 transactionally completes port accounting.
 """
 
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -138,9 +135,12 @@ PATH_CATEGORIES = {
     "handshake",
     "interrupt",
     "cdc_sync",
+    "cdc",
     "rdc_sync",
     "static",
     "unknown",
+    "other_reviewed",
+    "test_control",
 }
 TIMING_CONTRACT_STATUSES = {
     "",
@@ -161,6 +161,9 @@ SOURCE_TYPES = {
     "clock_relation_candidate",
     "manual_entry",
     "from_20_exception_path",
+    "protocol_spec",
+    "cdc_rdc_report",
+    "waiver",
 }
 CLOCK_RELATION_CANONICAL = {"synchronous", "asynchronous", "logically_exclusive", "physically_exclusive", "unknown"}
 CLOCK_RELATION_ALIASES = {
@@ -207,7 +210,11 @@ PORT_RANGE_RE = re.compile(r"^(.+)\[(\d+)\s*:\s*(\d+)\]$")
 PORT_EXACT_BIT_RE = re.compile(r"^(.+)\[(\d+)\]$")
 
 EXCEPTION_CANDIDATE_HEADERS = [
+    "schema_version",
     "author",
+    "run_id",
+    "mode_label",
+    "design_revision",
     "run_completeness",
     "port_accounting",
     "candidate_id",
@@ -215,6 +222,8 @@ EXCEPTION_CANDIDATE_HEADERS = [
     "stage",
     "corner",
     "channel_id",
+    "connection_id",
+    "related_04_pad_id",
     "source_type",
     "path_category",
     "timing_contract_status",
@@ -236,6 +245,12 @@ EXCEPTION_CANDIDATE_HEADERS = [
     "related_20_channel_id",
     "related_20_status",
     "related_10_feedthrough_edge_id",
+    "source_workbook",
+    "source_sheet",
+    "source_row",
+    "structure_digest",
+    "accounting_digest_before",
+    "machine_digest",
     "harden_clock_context_status",
     "sdc_evidence_status",
     "source_sdc_file",
@@ -260,6 +275,7 @@ EXCEPTION_RULE_HEADERS = [
     "exception_type",
     "path_category",
     "channel_id",
+    "related_04_pad_id",
     "related_20_channel_id",
     "related_10_feedthrough_edge_id",
     "src_bit_index",
@@ -289,6 +305,8 @@ EXCEPTION_RULE_HEADERS = [
     "source_line",
     "source_command",
     "source_digest",
+    "machine_digest",
+    "approved_machine_digest",
     "cdc_rdc_ref",
     "sta_waiver_ref",
     "protocol_ref",
@@ -3736,240 +3754,27 @@ def apply_pending_plan(cwd: Path, plan: PendingPlan, report: Report) -> None:
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate 30 SoC harden-to-harden exception SDC.")
-    parser.add_argument("--run-root", help="target runtime root")
-    parser.add_argument("-scenario", "--scenario", choices=sorted(SCENARIOS), help="target scenario; required with --run-root")
-    parser.add_argument("-stage", "--stage", default="all", choices=sorted(STAGES), help="target stage/view")
-    parser.add_argument("-corner", "--corner", default="all", help="target corner/view")
-    parser.add_argument("--info-all", help="integration summary xlsx")
-    parser.add_argument("--ports", help="port workbook")
-    parser.add_argument("--form", help="30 exception workbook")
-    parser.add_argument("--connection-inventory", help="00 bit-to-bit connection inventory")
-    parser.add_argument("--harden-sdc-manifest", help="00 harden SDC manifest")
-    parser.add_argument("--require-complete-harden-sdc", action="store_true")
-    parser.add_argument("--clock-inventory", help="01 assembled clock inventory")
-    parser.add_argument("--clock-inventory-meta", help="01 assembled clock inventory meta")
-    parser.add_argument("--relation-map", help="03 relation map")
-    parser.add_argument("--relation-map-meta", help="03 relation map meta")
-    parser.add_argument("--feedthrough-edge-inventory", "--feedthrough-inventory", dest="feedthrough_inventory", help="10 feedthrough direct-edge inventory")
-    parser.add_argument("--twenty-channel-inventory", help="20 channel inventory CSV")
-    parser.add_argument("--twenty-form", help="legacy 20 workbook used for active budget overlap checks")
-    parser.add_argument("--pending-root", help="target pending directory (legacy: 00 pending inventory root)")
-    parser.add_argument("--no-update-pending", action="store_true", help="do not remove emitted exception endpoints from pending")
-    parser.add_argument("--force-generate-after-sync", action="store_true", help="generate SDC even if workbook was synchronized")
-    parser.add_argument("--output", help="output SDC path")
-    parser.add_argument("--report", help="output report path")
+    parser = argparse.ArgumentParser(
+        description="Generate one required-view SoC harden interface exception SDC and finalize port accounting."
+    )
+    parser.add_argument("--run-root", required=True, help="single-scenario target runtime root")
+    parser.add_argument("--stage", default="all", help="required timing-view stage")
+    parser.add_argument("--corner", default="all", help="required timing-view corner")
+    parser.add_argument("--strict-port-closure", action="store_true", help="fail when final unused bits remain")
+    parser.add_argument("--defer-final-accounting", action="store_true", help="defer final tokens/styles")
+    parser.add_argument("--diagnose-only", action="store_true", help="read-only diagnostic run")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
-    cwd = Path.cwd()
-    target_layout = bool(args.run_root)
-    run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
-    if target_layout and not args.scenario:
-        raise RuntimeError("--scenario is required with --run-root")
-    if target_layout and args.force_generate_after_sync:
-        raise RuntimeError("--force-generate-after-sync is not allowed in target mode; review synchronized rows first")
-    args.scenario = args.scenario or "common"
-    port_accounting = "disabled" if args.no_update_pending else "enabled"
-    report = Report()
-    print("Author: %s" % author_name())
-
-    if target_layout:
-        info_all = resolve_path(run_root, args.info_all, "inputs/info_all.xlsx")
-        ports_path = resolve_path(run_root, args.ports, "inputs/ports.xlsx")
-        connection_path = resolve_path(run_root, args.connection_inventory, "00_middle/connection_inventory.csv")
-        manifest_path = resolve_path(run_root, args.harden_sdc_manifest, "00_middle/scenario/%s/harden_sdc_manifest.csv" % args.scenario)
-        clock_path = resolve_path(run_root, args.clock_inventory, "01_middle/assembled/%s/clock_inventory.csv" % args.scenario)
-        clock_meta_path = resolve_path(run_root, args.clock_inventory_meta, "01_middle/assembled/%s/clock_inventory.meta" % args.scenario)
-        relation_path = resolve_path(run_root, args.relation_map, "03_middle/relation_map/%s.csv" % args.scenario)
-        relation_meta_path = resolve_path(run_root, args.relation_map_meta, "03_middle/relation_map/%s.meta" % args.scenario)
-        feedthrough_path = resolve_path(run_root, args.feedthrough_inventory, "10_middle/scenario/%s/feedthrough_edge_inventory.csv" % args.scenario)
-        twenty_path = resolve_path(run_root, args.twenty_channel_inventory, "20_middle/scenario/%s/channel_inventory.csv" % args.scenario)
-        form_path = resolve_path(run_root, args.form, "30_middle/30_harden_to_harden_exception.xlsx")
-        candidate_path = run_root / "30_middle/exception_candidates.csv"
-        output_path = resolve_path(run_root, args.output, str(output_sdc_path(Path("30_result"), args.scenario, args.stage, args.corner)))
-        rpt_path = resolve_path(run_root, args.report, "30_result/reports/harden_to_harden_exception_check_report_%s_%s_%s.txt" % (args.scenario, args.stage, safe_filename_token(args.corner)))
-        pending_dir = resolve_path(run_root, args.pending_root, "00_middle/scenario/%s/pending" % args.scenario)
-        removed_log_path = run_root / "30_middle" / "scenario" / args.scenario / "removed_log" / "30_harden_to_harden_exception.removed"
-        previous_removed_dirs = [
-            run_root / stage / "scenario" / args.scenario / "removed_log"
-            for stage in ("01_middle", "04_middle", "10_middle", "20_middle")
-        ]
-    else:
-        info_all = resolve_path(cwd, args.info_all, "info_all.xlsx")
-        ports_path = resolve_path(cwd, args.ports, "ports.xlsx")
-        connection_path = resolve_path(cwd, args.connection_inventory, "00_harden_port_inventory/connection_inventory.csv")
-        manifest_path = None
-        clock_path = resolve_path(cwd, args.clock_inventory, "../01_soc_clocks/clock_inventory.csv")
-        clock_meta_path = resolve_path(cwd, args.clock_inventory_meta, "../01_soc_clocks/clock_inventory.meta")
-        relation_path = resolve_path(cwd, args.relation_map, "../03_soc_clock_groups/relation_map_common.csv")
-        relation_meta_path = resolve_path(cwd, args.relation_map_meta, "../03_soc_clock_groups/relation_map_common.meta")
-        feedthrough_path = resolve_path(cwd, args.feedthrough_inventory, "feedthrough_inventory.csv")
-        twenty_path = resolve_path(cwd, args.twenty_form, "20_harden_x_if.xlsx")
-        form_path = resolve_path(cwd, args.form, "30_harden_to_harden_exception.xlsx")
-        candidate_path = None
-        output_path = resolve_path(cwd, args.output, str(output_sdc_path(Path("."), args.scenario, args.stage, args.corner)))
-        rpt_path = resolve_path(cwd, args.report, "harden_to_harden_exception_check_report_%s_%s_%s.txt" % (args.scenario, args.stage, safe_filename_token(args.corner)))
-        legacy_pending_root = resolve_path(cwd, args.pending_root, "00_harden_port_inventory")
-        pending_dir = legacy_pending_root / "pending"
-        removed_log_path = legacy_pending_root / "removed_log" / "30_harden_to_harden_exception.removed"
-        previous_removed_dirs = [legacy_pending_root / "removed_log"]
-
-    for label, path in (
-        ("run root", run_root), ("info_all", info_all), ("ports", ports_path),
-        ("connection inventory", connection_path), ("harden SDC manifest", manifest_path),
-        ("clock inventory", clock_path), ("relation map", relation_path),
-        ("10 edge inventory", feedthrough_path), ("20 inventory", twenty_path),
-        ("form", form_path), ("output", output_path), ("report", rpt_path), ("pending directory", pending_dir),
-        ("30 removed log", removed_log_path),
-    ):
-        report.info("resolved %s: %s" % (label, path if path is not None else "<legacy inference>"))
-
-    if not info_all.is_file():
-        raise RuntimeError("integration file not found: %s" % info_all)
-
-    instances = read_info_all(info_all, report)
-    if target_layout:
-        if not ports_path.is_file():
-            report.error("port workbook not found: %s" % ports_path)
-        port_paths = [ports_path] if ports_path.is_file() else []
-    else:
-        port_paths = default_port_workbooks(cwd, info_all.name, form_path.name, report)
-    port_sheets = read_port_workbooks(port_paths, report)
-    attach_port_data(instances, port_sheets, report)
-    if target_layout:
-        completeness = read_harden_sdc_manifest(
-            manifest_path, run_root, args.scenario, args.require_complete_harden_sdc, instances, report
-        )
-    else:
-        resolve_sdc_paths(instances, cwd, report)
-        completeness = RunCompleteness(
-            status="partial" if any(inst.sdc_status == "missing" for inst in instances.values()) else "complete",
-            available_instances=sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "available"),
-            missing_instances=sorted(inst.inst_name for inst in instances.values() if inst.sdc_status == "missing"),
-            manifest_path="<legacy inference>",
-        )
-    current_digests = collect_current_sdc_digests(instances)
-
-    if target_layout:
-        relation_context = read_clock_relation_context(clock_path, clock_meta_path, relation_path, relation_meta_path, args.scenario, report)
-        if relation_context.run_completeness != completeness.status:
-            report.error(
-                "01/03 run_completeness=%s does not match current harden manifest %s"
-                % (relation_context.run_completeness, completeness.status)
-            )
-    else:
-        relation_context = RelationContext(scenario=args.scenario, run_completeness="unknown")
-        report.warn("legacy mode: clock relation map is not authoritative; keep clock_relation under manual review")
-    connections = read_connection_inventory(connection_path, args.scenario, report, require_scenario_scope=target_layout)
-    connection_inventory_digest = full_digest_file(connection_path) if connection_path.is_file() else ""
-    feedthroughs = read_feedthrough_edge_inventory(
-        feedthrough_path, args.scenario, completeness.status, report, require_metadata=target_layout
-    )
-    channels = build_channels_from_inventories(instances, connections, feedthroughs, report)
-    for channel in channels:
-        channel.scenario = args.scenario
-        channel.stage = "all"
-        channel.corner = "all"
-    if target_layout:
-        active20, twenty_states = read_20_channel_inventory_csv(
-            twenty_path, connection_inventory_digest, completeness.status,
-            args.scenario, args.stage, args.corner, report,
-        )
-    else:
-        active20 = read_20_active_budgets(twenty_path, args.scenario, args.stage, args.corner, report)
-        twenty_states = {}
-    feedthrough_inventory_digest = full_digest_file(feedthrough_path) if feedthrough_path.is_file() else "missing"
-    twenty_inventory_digest = full_digest_file(twenty_path) if twenty_path.is_file() else "missing"
-    report.info("10 feedthrough inventory SHA-256: %s" % feedthrough_inventory_digest)
-    report.info("20 channel inventory SHA-256: %s" % twenty_inventory_digest)
-    delays, exceptions = extract_sdc_evidence(instances, report)
-    candidate_seeds, rule_seeds, log_items = create_candidate_and_rule_seeds(
-        channels, delays, exceptions, active20, twenty_states, instances, relation_context,
-        completeness, port_accounting, report,
-    )
-
-    if report.error_count == 0:
-        sync_workbook(
-            form_path, candidate_seeds, rule_seeds, log_items,
-            {
-                "Author": author_name(),
-                "Scenario": args.scenario,
-                "Run completeness": completeness.status,
-                "Port accounting": port_accounting,
-                "Connection inventory": str(connection_path.resolve()),
-                "Harden SDC manifest": str(manifest_path.resolve()) if manifest_path is not None else "<legacy inference>",
-                "10 feedthrough inventory": str(feedthrough_path.resolve()),
-                "10 feedthrough inventory SHA-256": feedthrough_inventory_digest,
-                "20 channel inventory": str(twenty_path.resolve()),
-                "20 channel inventory SHA-256": twenty_inventory_digest,
-                "03 relation map": str(relation_path.resolve()),
-            },
-            report,
-        )
-        if candidate_path:
-            write_candidates_csv(candidate_path, form_path)
-            report.info("wrote candidate inventory %s" % candidate_path)
-
-    rows = read_rule_rows(form_path) if form_path.is_file() else []
-    candidate_rows = read_candidate_rows(form_path) if form_path.is_file() else []
-    if rows and report.error_count == 0:
-        validate_rows(
-            rows, channels, active20, twenty_states, feedthroughs, relation_context,
-            args.scenario, args.stage, args.corner, current_digests, target_layout, report,
-        )
-
-    owner_inventories_complete = feedthrough_path.is_file() and twenty_path.is_file()
-    if target_layout and not owner_inventories_complete:
-        report.error("formal 30 generation requires current 10 and 20 owner inventories; candidate artifacts only")
-    if target_layout and not args.no_update_pending and not pending_dir.is_dir():
-        report.error("pending directory not found: %s" % pending_dir)
-    if args.no_update_pending:
-        report.warn("--no-update-pending: diagnostic/candidate-only run; accounting closure is not complete")
-
-    pending_plan = PendingPlan(removed_log_path=removed_log_path)
-    if report.error_count == 0 and (not report.sync_changed or args.force_generate_after_sync) and not args.no_update_pending:
-        pending_plan = prepare_pending_for_30(
-            run_root, pending_dir, removed_log_path, previous_removed_dirs,
-            rows, channels, args.scenario, args.stage, args.corner, report,
-        )
-
-    generated = False
-    if report.sync_changed and not args.force_generate_after_sync:
-        report.warn("workbook changed during sync; review 30_harden_to_harden_exception.xlsx before SDC generation")
-    elif args.no_update_pending:
-        report.warn("formal SDC generation skipped because --no-update-pending is diagnostic-only")
-    elif report.error_count == 0:
-        atomic_write_text(output_path, "\n".join(generate_sdc(rows, args.scenario, args.stage, args.corner, completeness)).rstrip() + "\n")
-        report.info("wrote %s" % output_path)
-        generated = True
-    else:
-        report.warn("SDC generation skipped because errors were reported")
-
-    if generated:
-        apply_pending_plan(run_root, pending_plan, report)
-
-    coverage_lines = build_coverage_lines(
-        rows, candidate_rows, channels, active20, twenty_states, feedthroughs,
-        args.scenario, args.stage, args.corner,
-    )
-    accounting_complete = generated and not args.no_update_pending and report.error_count == 0
-    write_report(
-        rpt_path, report, args.scenario, args.stage, args.corner,
-        form_path, output_path, coverage_lines, completeness, accounting_complete, port_accounting,
-    )
-    print("Report: %s" % rpt_path)
-    print("Scenario: %s" % args.scenario)
-    print("Run completeness: %s" % completeness.status)
-    print("Port accounting: %s" % port_accounting)
-    print("Warnings: %d  Errors: %d  Sync changed: %s" % (report.warning_count, report.error_count, report.sync_changed))
-    if report.error_count:
-        return 1
-    if report.sync_changed and not args.force_generate_after_sync:
-        return 1
-    return 0
+    runtime_path = Path(__file__).resolve().with_name("30_target_runtime.py")
+    spec = importlib.util.spec_from_file_location("soc_sdc_target30_runtime", str(runtime_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load target 30 runtime: %s" % runtime_path)
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    return runtime.run_target30(args, sys.modules[__name__])
 
 
 if __name__ == "__main__":
