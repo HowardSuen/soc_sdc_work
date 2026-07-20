@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""
-Generate common/01_soc_clocks.sdc from local integration spreadsheets and
-flattened harden SoC-integration SDC files.
+"""Generate the single-run SoC-visible clock SDC and clock inventory.
 
-Current scope:
-  * func-only clock extraction
-  * all xlsx and SDC inputs live in the command execution directory
-  * repeated harden/module instantiations are handled per inst_name
+Target mode reads one externally selected run from ``<run_root>/inputs``,
+consumes the flat 00 manifest, updates port-workbook Used bits through the
+shared multi-workbook transaction protocol, and publishes flat 01 artifacts.
+Legacy cwd mode remains available for compatibility.
 """
 
 import argparse
 import csv
+import datetime
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import platform
 import re
 import shlex
+import shutil
+import socket
 import sys
 import traceback
 from collections import Counter
@@ -207,6 +210,12 @@ class ClockRecord:
     final_sdc_digest: str = ""
     run_completeness: str = ""
     missing_instances: str = ""
+    clock_record_id: str = ""
+    structure_digest: str = ""
+    accounting_digest_before: str = ""
+    accounting_digest_after: str = ""
+    accounting_action: str = ""
+    accounting_added_bits: str = ""
 
 
 @dataclass
@@ -233,6 +242,7 @@ class PortLookup:
     bit_index: str = ""
     is_range: bool = False
     info: Optional[PortInfo] = None
+    exact_match: bool = False
 
 
 @dataclass
@@ -301,6 +311,13 @@ class RunCompleteness:
         return len(self.not_required_instances)
 
 
+@dataclass
+class PendingPlan:
+    pending_updates: Dict[Path, List[str]] = field(default_factory=dict)
+    removed_log_lines: List[str] = field(default_factory=list)
+    removed_count: int = 0
+
+
 class Report:
     def __init__(self) -> None:
         self.lines: List[str] = []
@@ -344,6 +361,35 @@ def sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_accounting_runtime():
+    """Load the shared accounting implementation currently hosted by stage 00.
+
+    Source-tree and flat intranet-package layouts are both supported. Importing
+    the module does not execute its CLI entry point.
+    """
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parent.parent / "00_harden_port_inventory" / "00_harden_port_inventory.py",
+        here.with_name("00_harden_port_inventory.py"),
+    ]
+    runtime_path = next((path for path in candidates if path.is_file()), None)
+    if runtime_path is None:
+        raise RuntimeError("shared accounting runtime 00_harden_port_inventory.py was not found")
+    spec = importlib.util.spec_from_file_location("soc_sdc_accounting_runtime", str(runtime_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load shared accounting runtime from %s" % runtime_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.STAGE_NAME = "01_soc_clocks"
+    return module
+
+
+def canonical_clock_record_id(rec) -> str:
+    payload = ["1.0", rec.clock_name, rec.clock_kind, rec.target_object]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return "CLK_" + hashlib.sha256(encoded).hexdigest()
 
 
 def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -534,6 +580,149 @@ def scenario_scope_matches(value: str, scenario: str) -> bool:
         if item
     }
     return "common" in scopes or scenario.lower() in scopes
+
+
+def ordered_shape_bits(shape) -> List[int]:
+    if shape.scalar:
+        return [0]
+    step = 1 if shape.right >= shape.left else -1
+    return list(range(shape.left, shape.right + step, step))
+
+
+def canonical_shape_port(shape, bit: int) -> str:
+    if shape.scalar:
+        return shape.base
+    return f"{shape.base}[{bit}]"
+
+
+def selected_connection_bits(signal: str, source_shape, destination_shape, location: str) -> List[int]:
+    match = re.fullmatch(
+        r"(?P<base>[A-Za-z_][A-Za-z0-9_$]*)(?:\[(?P<left>-?\d+)(?::(?P<right>-?\d+))?\])?",
+        signal,
+    )
+    if not match:
+        raise ValueError(f"{location}: invalid connection signal {signal!r}")
+    left = match.group("left")
+    right = match.group("right")
+    if left is None:
+        if source_shape is not None:
+            return ordered_shape_bits(source_shape)
+        destination_bits = ordered_shape_bits(destination_shape)
+        return destination_bits if len(destination_bits) > 1 else [0]
+    left_value = int(left)
+    right_value = int(right) if right is not None else left_value
+    step = 1 if right_value >= left_value else -1
+    bits = list(range(left_value, right_value + step, step))
+    if source_shape is not None:
+        for bit in bits:
+            if not source_shape.contains(bit):
+                raise ValueError(f"{location}: source bit {bit} is outside {source_shape.raw}")
+    return bits
+
+
+def build_connections_from_port_records(port_records, report: Report) -> Dict[Tuple[str, str], ConnectionEdge]:
+    """Build exact input/inout driver edges directly from port workbook rows."""
+    source_index = {}
+    for record in port_records:
+        if record.direction in {"output", "inout"}:
+            source_index[(record.inst_name, record.shape.base)] = record
+    edges: Dict[Tuple[str, str], ConnectionEdge] = {}
+    for record in port_records:
+        if record.direction not in {"input", "inout"}:
+            continue
+        connection = clean_cell(record.connection_value)
+        kind, value = parse_connection(connection)
+        if kind in {"", "unknown", "const"}:
+            continue
+        destination_bits = ordered_shape_bits(record.shape)
+        source_record = None
+        source_instance = kind
+        source_signal = value
+        if kind != "top":
+            base = re.sub(r"\[.*\]$", "", value)
+            source_record = source_index.get((kind, base))
+            if source_record is None:
+                report.error(
+                    f"{record.location()}: CONNECTION_SOURCE_UNKNOWN: {connection}"
+                )
+                continue
+        try:
+            source_bits = selected_connection_bits(
+                source_signal,
+                source_record.shape if source_record is not None else None,
+                record.shape,
+                record.location(),
+            )
+        except ValueError as exc:
+            report.error(str(exc))
+            continue
+        if len(source_bits) != len(destination_bits):
+            report.error(
+                f"{record.location()}: CONNECTION_WIDTH_MISMATCH: source={connection} "
+                f"bits={source_bits}, destination={record.shape.raw} bits={destination_bits}"
+            )
+            continue
+        for source_bit, destination_bit in zip(source_bits, destination_bits):
+            dst_port = canonical_shape_port(record.shape, destination_bit)
+            if source_record is not None:
+                src_port = canonical_shape_port(source_record.shape, source_bit)
+                src_direction = source_record.direction
+            else:
+                source_match = re.fullmatch(
+                    r"(?P<base>[A-Za-z_][A-Za-z0-9_$]*)(?:\[.*\])?",
+                    source_signal,
+                )
+                source_base = source_match.group("base") if source_match else source_signal
+                src_port = source_base if len(source_bits) == 1 and source_bit == 0 else f"{source_base}[{source_bit}]"
+                src_direction = "input"
+            key = (record.inst_name, dst_port)
+            edge = ConnectionEdge(
+                connection_id="",
+                src_instance=source_instance,
+                src_direction=src_direction,
+                src_port=src_port,
+                dst_instance=record.inst_name,
+                dst_direction=record.direction,
+                dst_port=dst_port,
+                connection_type="port_workbook_direct",
+                validation_status="matched",
+                schema_version="1.0",
+                source_row=record.row,
+            )
+            if key in edges:
+                report.error(
+                    f"{record.location()}: CONNECTION_DESTINATION_MULTI_DRIVER: "
+                    f"{record.inst_name}/{dst_port}"
+                )
+                continue
+            edges[key] = edge
+    report.info(f"built {len(edges)} exact direct edge(s) from port workbooks")
+    return edges
+
+
+def attach_runtime_port_shapes(instances: Dict[str, InstInfo], port_records) -> None:
+    """Expose canonical port bases/ranges from the shared workbook parser."""
+    for record in port_records:
+        inst = instances.get(record.inst_name)
+        if inst is None:
+            continue
+        mapping = {
+            "input": inst.inputs,
+            "output": inst.outputs,
+            "inout": inst.inouts,
+        }[record.direction]
+        if record.shape.scalar:
+            width = "1"
+        else:
+            width = f"[{record.shape.left}:{record.shape.right}]"
+        mapping[record.shape.base] = PortInfo(
+            name=record.shape.base,
+            width=width,
+            used_width=clean_cell(record.used_value),
+            from_whom=clean_cell(record.connection_value) if record.direction == "input" else "",
+            to_top=clean_cell(record.connection_value) if record.direction == "output" else "",
+            connectivity=clean_cell(record.connection_value) if record.direction == "inout" else "",
+        )
 
 
 def read_connection_inventory(
@@ -779,25 +968,24 @@ def read_target_pending_ports(
 
 
 def attach_ports_from_previous_01_removed(
-    log_dir: Path,
+    log_path: Path,
     instances: Dict[str, InstInfo],
     report: Report,
 ) -> None:
-    if not log_dir.is_dir():
+    if not log_path.is_file():
         return
-    for path in sorted(log_dir.glob("*.removed")):
-        for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            key = removed_line_key(raw_line)
-            if key is None or key.inst_name not in instances:
-                continue
-            attach_target_port(
-                instances,
-                key.inst_name,
-                key.direction,
-                key.port_name,
-                report,
-                f"{path.name}:{line_no}",
-            )
+    for line_no, raw_line in enumerate(log_path.read_text(encoding="utf-8").splitlines(), start=1):
+        key = removed_line_key(raw_line)
+        if key is None or key.inst_name not in instances:
+            continue
+        attach_target_port(
+            instances,
+            key.inst_name,
+            key.direction,
+            key.port_name,
+            report,
+            f"{log_path.name}:{line_no}",
+        )
 
 
 def parse_port_sheet(df: pd.DataFrame) -> Dict[str, Dict[str, PortInfo]]:
@@ -1020,6 +1208,11 @@ def apply_harden_sdc_manifest(
             )
         elif entry.availability_status == "not_required":
             not_required.append(inst_name)
+            if not entry.note:
+                report.error(
+                    f"{manifest_path.name} row {entry.source_row}: "
+                    f"HARDEN_SDC_NOT_REQUIRED_BASIS_MISSING: {inst_name} requires a non-empty note"
+                )
             report.info(f"manifest marks {inst_name} as not_required: {entry.note or '<no note>'}")
         else:
             report.error(
@@ -1037,6 +1230,129 @@ def apply_harden_sdc_manifest(
         manifest_digest=manifest_digest,
     )
 
+    if require_complete and missing:
+        report.error(
+            "HARDEN_SDC_COMPLETENESS_REQUIRED: missing required harden SDC instance(s): "
+            + ", ".join(missing)
+        )
+    report.info(
+        f"Run completeness: {completeness.status}; available={len(available)} "
+        f"missing={len(missing)} not_required={len(not_required)}"
+    )
+    return completeness
+
+
+def apply_single_run_harden_sdc_manifest(
+    instances: Dict[str, InstInfo],
+    manifest_path: Path,
+    run_root: Path,
+    require_complete: bool,
+    report: Report,
+) -> RunCompleteness:
+    if not manifest_path.is_file():
+        report.error(f"{manifest_path}: HARDEN_SDC_MANIFEST_MISSING")
+        return RunCompleteness(status="invalid", manifest_path=str(manifest_path.resolve()))
+    required_fields = {"inst_name", "module_name", "sdc_path", "availability_status", "note"}
+    entries: Dict[str, Dict[str, str]] = {}
+    manifest_digest = sha256_file(manifest_path)
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+        reader = csv.DictReader(file_obj)
+        missing_fields = sorted(required_fields - set(reader.fieldnames or []))
+        if missing_fields:
+            report.error(
+                f"{manifest_path}: HARDEN_SDC_MANIFEST_SCHEMA_ERROR: missing field(s): "
+                + ", ".join(missing_fields)
+            )
+        for row_idx, row in enumerate(reader, start=2):
+            inst_name = clean_cell(row.get("inst_name"))
+            if not inst_name:
+                report.error(f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_EMPTY_INSTANCE")
+                continue
+            if inst_name in entries:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_DUPLICATE_INSTANCE: {inst_name}"
+                )
+                continue
+            entries[inst_name] = {
+                "module_name": clean_cell(row.get("module_name")),
+                "sdc_path": clean_cell(row.get("sdc_path")),
+                "availability_status": clean_cell(row.get("availability_status")).lower(),
+                "note": clean_cell(row.get("note")),
+                "source_row": str(row_idx),
+            }
+
+    available: List[str] = []
+    missing: List[str] = []
+    not_required: List[str] = []
+    for inst_name in sorted(instances):
+        inst = instances[inst_name]
+        entry = entries.get(inst_name)
+        if entry is None:
+            report.error(
+                f"{manifest_path.name}: HARDEN_SDC_MANIFEST_INSTANCE_MISSING: {inst_name}"
+            )
+            inst.sdc_availability = "invalid"
+            continue
+        row_idx = entry["source_row"]
+        module_name = entry["module_name"]
+        if module_name != inst.module_name:
+            report.error(
+                f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_MODULE_MISMATCH: "
+                f"{inst_name} module={module_name or '<empty>'}, info_all={inst.module_name}"
+            )
+        status = entry["availability_status"]
+        inst.sdc_availability = status
+        inst.sdc_note = entry["note"]
+        if status == "available":
+            available.append(inst_name)
+            value = entry["sdc_path"]
+            if not value:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_AVAILABLE_PATH_EMPTY: {inst_name}"
+                )
+                continue
+            sdc_path = resolve_manifest_path(run_root, value)
+            if not sdc_path.is_file():
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_AVAILABLE_FILE_MISSING: "
+                    f"{inst_name} resolved path does not exist: {sdc_path}"
+                )
+                continue
+            inst.sdc_path = sdc_path
+            inst.sdc_digest = sha256_file(sdc_path)
+            report.info(
+                f"manifest selected {inst_name}: status=available path={sdc_path.resolve()} "
+                f"digest={inst.sdc_digest}"
+            )
+        elif status == "missing":
+            missing.append(inst_name)
+            report.warn(
+                f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MISSING: {inst_name}; Used state is preserved"
+            )
+        elif status == "not_required":
+            not_required.append(inst_name)
+            if not entry["note"]:
+                report.error(
+                    f"{manifest_path.name} row {row_idx}: HARDEN_SDC_NOT_REQUIRED_BASIS_MISSING: {inst_name}"
+                )
+        else:
+            report.error(
+                f"{manifest_path.name} row {row_idx}: HARDEN_SDC_MANIFEST_STATUS_INVALID: "
+                f"{inst_name} status={status or '<empty>'}"
+            )
+    for inst_name in sorted(set(entries) - set(instances)):
+        report.error(
+            f"{manifest_path.name} row {entries[inst_name]['source_row']}: "
+            f"HARDEN_SDC_MANIFEST_ORPHAN_INSTANCE: {inst_name}"
+        )
+    completeness = RunCompleteness(
+        status="partial" if missing else "complete",
+        available_instances=available,
+        missing_instances=missing,
+        not_required_instances=not_required,
+        manifest_path=str(manifest_path.resolve()),
+        manifest_digest=manifest_digest,
+    )
     if require_complete and missing:
         report.error(
             "HARDEN_SDC_COMPLETENESS_REQUIRED: missing required harden SDC instance(s): "
@@ -1624,14 +1940,35 @@ def port_maps_by_direction(inst: InstInfo) -> List[Tuple[str, Dict[str, PortInfo
 
 def lookup_port(inst: InstInfo, port: str) -> PortLookup:
     port = clean_cell(port)
-    for direction, mapping in port_maps_by_direction(inst):
-        if port in mapping:
-            return PortLookup(direction, port, port, "", False, mapping[port])
     base, bit_index, is_range = split_port_key(port)
     for direction, mapping in port_maps_by_direction(inst):
+        if port in mapping:
+            return PortLookup(
+                direction=direction,
+                canonical_port=port,
+                declared_port=base,
+                bit_index=bit_index,
+                is_range=is_range,
+                info=mapping[port],
+                exact_match=True,
+            )
+    for direction, mapping in port_maps_by_direction(inst):
         if base in mapping:
-            return PortLookup(direction, port, base, bit_index, is_range, mapping[base])
-    return PortLookup("unknown", port, base, bit_index, is_range, None)
+            return PortLookup(
+                direction=direction,
+                canonical_port=port,
+                declared_port=base,
+                bit_index=bit_index,
+                is_range=is_range,
+                info=mapping[base],
+            )
+    return PortLookup(
+        direction="unknown",
+        canonical_port=port,
+        declared_port=base,
+        bit_index=bit_index,
+        is_range=is_range,
+    )
 
 
 def parse_width_bounds(text: str) -> Optional[Tuple[int, int]]:
@@ -1654,23 +1991,34 @@ def parse_width_bounds(text: str) -> Optional[Tuple[int, int]]:
 def port_declared_vector(info: Optional[PortInfo]) -> bool:
     if info is None:
         return False
-    for text in (info.used_width, info.width):
-        bounds = parse_width_bounds(text)
-        if bounds is not None:
-            return bounds[1] > bounds[0]
-    return False
+    bounds = parse_width_bounds(info.width)
+    return bounds is not None and bounds[1] > bounds[0]
 
 
 def port_bit_in_declared_width(info: Optional[PortInfo], bit_index: str) -> bool:
     if info is None or not bit_index:
         return True
-    for text in (info.used_width, info.width):
-        bounds = parse_width_bounds(text)
-        if bounds is None:
-            continue
-        bit = int(bit_index)
-        return bounds[0] <= bit <= bounds[1]
-    return True
+    bounds = parse_width_bounds(info.width)
+    if bounds is None:
+        return True
+    bit = int(bit_index)
+    return bounds[0] <= bit <= bounds[1]
+
+
+def explicit_port_bit_example(lookup: PortLookup) -> str:
+    base = lookup.declared_port or split_port_key(lookup.canonical_port)[0]
+    bit = 0
+    range_match = re.match(
+        r"^.+\[(\d+)\s*:\s*(\d+)\]$",
+        lookup.canonical_port,
+    )
+    if range_match:
+        bit = min(int(range_match.group(1)), int(range_match.group(2)))
+    else:
+        bounds = parse_width_bounds(lookup.info.width if lookup.info is not None else "")
+        if bounds is not None:
+            bit = bounds[0]
+    return f"{base}[{bit}]"
 
 
 def clock_name_for(inst_name: str, port: str) -> str:
@@ -1693,7 +2041,8 @@ def clock_port_reference_error(inst: InstInfo, port: str, role: str) -> Tuple[st
     if lookup.is_range:
         return (
             f"CLOCK_{role_upper}_RANGE_NOT_SUPPORTED",
-            f"{role} port {port} is a range; 01 requires scalar or explicit bit target/source",
+            f"{role} port {port} is a range; 01 requires scalar or explicit bit "
+            f"target/source such as {explicit_port_bit_example(lookup)}",
         )
     if lookup.direction == "unknown":
         rule_id = "CLOCK_TARGET_NOT_IN_OWNER_SHEET"
@@ -1703,7 +2052,11 @@ def clock_port_reference_error(inst: InstInfo, port: str, role: str) -> Tuple[st
             rule_id,
             f"{role} port {port} is not listed as Input/Output/Inout in owner sheet",
         )
-    if lookup.bit_index and not port_bit_in_declared_width(lookup.info, lookup.bit_index):
+    if (
+        lookup.bit_index
+        and not lookup.exact_match
+        and not port_bit_in_declared_width(lookup.info, lookup.bit_index)
+    ):
         return (
             f"CLOCK_{role_upper}_BIT_OUT_OF_RANGE",
             f"{role} port {port} is outside declared width for {lookup.declared_port}",
@@ -1711,7 +2064,8 @@ def clock_port_reference_error(inst: InstInfo, port: str, role: str) -> Tuple[st
     if not lookup.bit_index and lookup.canonical_port == lookup.declared_port and port_declared_vector(lookup.info):
         return (
             f"CLOCK_{role_upper}_VECTOR_REQUIRES_BIT",
-            f"{role} port {port} is a vector; 01 requires explicit bit target/source such as {port}[0]",
+            f"{role} port {port} is a vector; 01 requires explicit bit target/source "
+            f"such as {explicit_port_bit_example(lookup)}",
         )
     return "", ""
 
@@ -2001,6 +2355,16 @@ def process_instance(
                 rule_id, message = clock_port_reference_error(inst, source_port, "source")
                 if rule_id:
                     source_errors.append((rule_id, message))
+                elif lookup_port(inst, source_port).direction == "output":
+                    report.warn(
+                        harden_clock_issue(
+                            inst,
+                            cmd,
+                            "CLOCK_GENERATED_SOURCE_OUTPUT_REVIEW",
+                            "generated clock source is a current-harden output port; "
+                            "use an input boundary source unless the output-source relationship is explicitly reviewed",
+                        )
+                    )
             source_kind, _ = parse_get_object(cmd.source_token) if cmd.source_token else ("", [])
             if source_kind == "get_pins":
                 source_errors.append(
@@ -2622,35 +2986,43 @@ def compute_root_sources(
 
 
 def validate_clock_universe(records: List[ClockRecord], report: Report) -> None:
-    active_names = {
-        rec.clock_name
-        for rec in records
-        if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command
-    }
-    for rec in records:
-        if rec.source_type != "manual_overlay" or rec.final_action not in EMITTED_CLOCK_ACTIONS:
-            continue
-        tokens = tokenize_tcl_words(rec.emitted_command)
-        source_token = get_option(tokens, "-source")
-        source_kind, source_objects = parse_get_object(source_token) if source_token else ("", [])
-        missing_names: List[str] = []
-        if source_kind == "get_clocks":
-            missing_names.extend(name for name in source_objects if name not in active_names)
-        master_clock = get_option(tokens, "-master_clock")
-        if master_clock and master_clock not in active_names:
-            missing_names.append(master_clock)
-        if missing_names:
-            report.error(
-                record_clock_issue(
-                    rec,
-                    "CLOCK_MANUAL_REFERENCE_NOT_IN_UNIVERSE",
-                    "manual source/master clock is absent from final clock universe: "
-                    + ", ".join(sorted(set(missing_names))),
+    # Validate to a fixed point. A manual clock can reference another manual
+    # clock that is itself removed by validation, so a one-pass snapshot can
+    # leave a dangling source/master reference in the final universe.
+    while True:
+        active_names = {
+            rec.clock_name
+            for rec in records
+            if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command
+        }
+        changed = False
+        for rec in records:
+            if rec.source_type != "manual_overlay" or rec.final_action not in EMITTED_CLOCK_ACTIONS:
+                continue
+            tokens = tokenize_tcl_words(rec.emitted_command)
+            source_token = get_option(tokens, "-source")
+            source_kind, source_objects = parse_get_object(source_token) if source_token else ("", [])
+            missing_names: List[str] = []
+            if source_kind == "get_clocks":
+                missing_names.extend(name for name in source_objects if name not in active_names)
+            master_clock = get_option(tokens, "-master_clock")
+            if master_clock and master_clock not in active_names:
+                missing_names.append(master_clock)
+            if missing_names:
+                report.error(
+                    record_clock_issue(
+                        rec,
+                        "CLOCK_MANUAL_REFERENCE_NOT_IN_UNIVERSE",
+                        "manual source/master clock is absent from final clock universe: "
+                        + ", ".join(sorted(set(missing_names))),
+                    )
                 )
-            )
-            rec.final_action = "skipped"
-            rec.emitted_command = ""
-            rec.note = "manual clock source/master is absent from final clock universe"
+                rec.final_action = "skipped"
+                rec.emitted_command = ""
+                rec.note = "manual clock source/master is absent from final clock universe"
+                changed = True
+        if not changed:
+            break
 
     first_by_target: Dict[str, ClockRecord] = {}
     for rec in records:
@@ -2834,6 +3206,9 @@ def write_sdc(
     completeness: RunCompleteness,
     scenario: str,
     target_layout: bool,
+    port_accounting_enabled: bool,
+    connection_path: Path,
+    manifest_path: Optional[Path],
 ) -> None:
     emitted = dependency_ordered_emitted(records, report)
     lines = [
@@ -2843,6 +3218,13 @@ def write_sdc(
         "# Stage: 01_soc_clocks",
         "# Script: 01_extract_soc_clocks.py",
         f"# Scenario: {scenario}",
+        (
+            "# Port accounting: enabled"
+            if port_accounting_enabled
+            else "# Port accounting: disabled by explicit option"
+        ),
+        f"# Connection inventory: {connection_path.resolve()}",
+        f"# Harden SDC manifest: {manifest_path.resolve() if manifest_path else '<legacy inferred>'}",
     ]
     lines.extend(completeness_lines(completeness, "# "))
     lines.extend([
@@ -2869,8 +3251,20 @@ def write_sdc(
     report.info(f"wrote {len(emitted)} clock command(s) to {path}")
 
 
-def write_inventory(path: Path, records: List[ClockRecord]) -> None:
+def write_inventory(
+    path: Path,
+    records: List[ClockRecord],
+    scenario: str = "common",
+    port_accounting_enabled: bool = True,
+    connection_path: Optional[Path] = None,
+    manifest_path: Optional[Path] = None,
+) -> None:
     fields = [
+        "author",
+        "scenario",
+        "port_accounting",
+        "connection_inventory",
+        "harden_sdc_manifest",
         "inst_name",
         "module_name",
         "port_name",
@@ -2901,7 +3295,23 @@ def write_inventory(path: Path, records: List[ClockRecord]) -> None:
         writer = csv.DictWriter(file_obj, fieldnames=fields)
         writer.writeheader()
         for rec in records:
-            writer.writerow({field: getattr(rec, field) for field in fields})
+            row = {
+                field: getattr(rec, field)
+                for field in fields
+                if hasattr(rec, field)
+            }
+            row.update(
+                {
+                    "author": author_name(),
+                    "scenario": scenario,
+                    "port_accounting": (
+                        "enabled" if port_accounting_enabled else "disabled by explicit option"
+                    ),
+                    "connection_inventory": str(connection_path.resolve()) if connection_path else "",
+                    "harden_sdc_manifest": str(manifest_path.resolve()) if manifest_path else "",
+                }
+            )
+            writer.writerow(row)
     tmp.replace(path)
 
 
@@ -2983,6 +3393,9 @@ def write_inventory_meta(
     inventory_path: Path,
     records: Sequence[ClockRecord],
     completeness: RunCompleteness,
+    port_accounting_enabled: bool,
+    connection_path: Path,
+    manifest_path: Optional[Path],
 ) -> None:
     active_names = sorted(
         rec.clock_name
@@ -2994,7 +3407,14 @@ def write_inventory_meta(
         "author": author_name(),
         "stage": "01_soc_clocks",
         "script": "01_extract_soc_clocks.py",
+        "valid": True,
+        "error_count": 0,
         "scenario": scenario,
+        "port_accounting": (
+            "enabled" if port_accounting_enabled else "disabled by explicit option"
+        ),
+        "connection_inventory": str(connection_path.resolve()),
+        "harden_sdc_manifest": str(manifest_path.resolve()) if manifest_path else "",
         "final_sdc_path": str(sdc_path.resolve()),
         "final_sdc_digest": sha256_file(sdc_path),
         "inventory_path": str(inventory_path.resolve()),
@@ -3179,20 +3599,27 @@ def removed_line_key(line: str) -> Optional[PortKey]:
     return PortKey(inst_name, direction, port)
 
 
-def read_removed_keys(log_dir: Path) -> Set[PortKey]:
-    keys: Set[PortKey] = set()
-    if not log_dir.is_dir():
-        return keys
-    for path in sorted(log_dir.glob("*.removed")):
+def read_removed_key_sources(paths: Sequence[Path], report: Report) -> Dict[PortKey, str]:
+    sources: Dict[PortKey, str] = {}
+    for path in paths:
+        if not path.is_file():
+            continue
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        except (OSError, UnicodeError) as exc:
+            report.error(f"removed log is not readable: {path}: {exc}")
             continue
-        for line in lines:
+        for line_no, line in enumerate(lines, start=1):
             key = removed_line_key(line)
             if key is not None:
-                keys.add(key)
-    return keys
+                if key in sources and sources[key] != str(path):
+                    report.error(
+                        f"removed owner duplicate for {key.inst_name} {key.direction} {key.port_name}: "
+                        f"{sources[key]} and {path}:{line_no}"
+                    )
+                    continue
+                sources[key] = str(path)
+    return sources
 
 
 def clock_removed_reason(rec: ClockRecord) -> str:
@@ -3226,27 +3653,55 @@ def removed_log_line(rec: ClockRecord) -> str:
     return " ".join(fields)
 
 
-def update_pending_for_01(
-    cwd: Path,
+def prepare_pending_plan_01(
     pending_dir: Path,
-    log_dir: Path,
+    removed_log_path: Path,
+    previous_removed_paths: Sequence[Path],
     records: Sequence[ClockRecord],
     report: Report,
-) -> None:
+) -> PendingPlan:
+    plan = PendingPlan()
     if not pending_dir.exists():
-        return
+        report.error(f"{pending_dir}: TARGET_UPSTREAM_PENDING_MISSING")
+        return plan
     if not pending_dir.is_dir():
         report.error(f"{pending_dir}: pending path exists but is not a directory")
-        return
+        return plan
 
     removable = removable_clock_records(records)
     if not removable:
-        return
+        return plan
 
-    previous_removed = read_removed_keys(log_dir)
+    previous_sources = read_removed_key_sources(previous_removed_paths, report)
+    current_sources = read_removed_key_sources([removed_log_path], report)
+    for key in sorted(
+        set(previous_sources).intersection(current_sources),
+        key=lambda item: (item.inst_name, item.direction, item.port_name),
+    ):
+        report.error(
+            f"01 removal duplicates previous owner for {key.inst_name} {key.direction} "
+            f"{key.port_name}: {previous_sources[key]}"
+        )
+
+    try:
+        existing_lines = (
+            removed_log_path.read_text(encoding="utf-8").splitlines()
+            if removed_log_path.is_file()
+            else []
+        )
+    except (OSError, UnicodeError) as exc:
+        report.error(f"removed log is not readable: {removed_log_path}: {exc}")
+        existing_lines = []
 
     by_inst: Dict[str, List[ClockRecord]] = {}
     for rec in removable:
+        key = PortKey(rec.inst_name, rec.direction, rec.port_name)
+        if key in previous_sources:
+            report.info(
+                f"{rec.inst_name}/{rec.port_name}: retained previous port-level removal owner "
+                f"{previous_sources[key]}"
+            )
+            continue
         by_inst.setdefault(rec.inst_name, []).append(rec)
 
     removed_records: List[ClockRecord] = []
@@ -3254,7 +3709,7 @@ def update_pending_for_01(
         pending_file = pending_dir / f"{inst_name}.ports"
         if not pending_file.is_file():
             for rec in inst_records:
-                if PortKey(rec.inst_name, rec.direction, rec.port_name) in previous_removed:
+                if PortKey(rec.inst_name, rec.direction, rec.port_name) in current_sources:
                     continue
                 report.error(
                     f"{pending_file}: missing pending file for 01 clock port "
@@ -3280,7 +3735,7 @@ def update_pending_for_01(
         for rec in inst_records:
             key = (rec.direction, rec.port_name)
             if key not in index:
-                if PortKey(rec.inst_name, rec.direction, rec.port_name) in previous_removed:
+                if PortKey(rec.inst_name, rec.direction, rec.port_name) in current_sources:
                     continue
                 report.error(
                     f"{pending_file}: 01 wants to remove {rec.direction} {rec.port_name}, "
@@ -3292,12 +3747,9 @@ def update_pending_for_01(
 
         if remove_line_indices:
             kept = [line for idx, line in enumerate(lines) if idx not in remove_line_indices]
-            atomic_write_text(pending_file, "\n".join(kept).rstrip() + ("\n" if kept else ""))
+            plan.pending_updates[pending_file] = kept
 
     if removed_records:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "01_soc_clocks.removed"
-        existing_lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.is_file() else []
         existing_keys: Set[PortKey] = set()
         for line in existing_lines:
             key = removed_line_key(line)
@@ -3309,14 +3761,783 @@ def update_pending_for_01(
             if key not in existing_keys:
                 new_lines.append(removed_log_line(rec))
                 existing_keys.add(key)
-        if new_lines:
-            log_lines = [line for line in existing_lines if line.strip()] + new_lines
-            atomic_write_text(log_path, "\n".join(log_lines).rstrip() + "\n")
-        try:
-            display_path = log_path.relative_to(cwd)
-        except ValueError:
-            display_path = log_path
-        report.info(f"removed {len(removed_records)} harden clock port(s) from pending; log={display_path}")
+        plan.removed_log_lines = [line for line in existing_lines if line.strip()] + new_lines
+        plan.removed_count = len(removed_records)
+    return plan
+
+
+def apply_pending_plan_01(plan: PendingPlan, removed_log_path: Path) -> None:
+    for path, lines in plan.pending_updates.items():
+        text = "\n".join(lines).rstrip()
+        atomic_write_text(path, text + ("\n" if text else ""))
+    if plan.removed_log_lines:
+        atomic_write_text(
+            removed_log_path,
+            "\n".join(plan.removed_log_lines).rstrip() + "\n",
+        )
+
+
+TARGET_INVENTORY_FIELDS = [
+    "schema_version",
+    "run_id",
+    "mode_label",
+    "design_revision",
+    "clock_record_id",
+    "inst_name",
+    "module_name",
+    "port_name",
+    "direction",
+    "clock_name",
+    "clock_kind",
+    "period",
+    "waveform",
+    "direct_source",
+    "root_source",
+    "from_whom",
+    "original_sdc",
+    "source_line",
+    "original_clock_name",
+    "original_command",
+    "final_action",
+    "source_type",
+    "source_file",
+    "target_object",
+    "final_sdc_digest",
+    "run_completeness",
+    "missing_instances",
+    "structure_digest",
+    "accounting_digest_before",
+    "accounting_digest_after",
+    "accounting_action",
+    "accounting_added_bits",
+    "note",
+]
+
+
+def render_target_sdc(
+    records: List[ClockRecord],
+    report: Report,
+    completeness: RunCompleteness,
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    accounting_after: str,
+    manifest_path: Path,
+) -> str:
+    emitted = dependency_ordered_emitted(records, report)
+    lines = [
+        "################################################################################",
+        "# Auto-generated SoC clock constraints",
+        f"# Author: {author_name()}",
+        "# Stage: 01_soc_clocks",
+        "# Script: 01_extract_soc_clocks.py",
+        f"# Run ID: {run_context.get('run_id', '')}",
+        f"# Mode label: {run_context.get('mode_label', '')}",
+        f"# Design revision: {run_context.get('design_revision', '')}",
+        "# Port accounting: enabled",
+        f"# Structure digest: {structure}",
+        f"# Accounting digest before: {accounting_before}",
+        f"# Accounting digest after: {accounting_after}",
+        f"# Harden SDC manifest: {manifest_path.resolve()}",
+    ]
+    lines.extend(completeness_lines(completeness, "# "))
+    lines.extend(["################################################################################", ""])
+    for rec in emitted:
+        if rec.final_action == "emit_virtual_clock":
+            lines.append(f"# virtual clock {rec.clock_name} from {rec.original_sdc}")
+        else:
+            lines.append(f"# {rec.inst_name}/{rec.port_name} from {rec.original_sdc}")
+        if rec.from_whom:
+            lines.append(f"# From Whom: {rec.from_whom}")
+        if rec.note and rec.final_action == "emit_virtual_clock":
+            lines.append(f"# Note: {rec.note}")
+        lines.extend([rec.emitted_command, ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def target_inventory_text(records: Sequence[ClockRecord], run_context: Dict[str, str]) -> str:
+    stream = io.StringIO()
+    writer = csv.DictWriter(stream, fieldnames=TARGET_INVENTORY_FIELDS, lineterminator="\n")
+    writer.writeheader()
+    for rec in records:
+        row = {field: getattr(rec, field, "") for field in TARGET_INVENTORY_FIELDS}
+        row.update(
+            {
+                "schema_version": "1.0",
+                "run_id": run_context.get("run_id", ""),
+                "mode_label": run_context.get("mode_label", ""),
+                "design_revision": run_context.get("design_revision", ""),
+            }
+        )
+        writer.writerow(row)
+    return stream.getvalue()
+
+
+def validate_upstream_00(
+    runtime,
+    run_root: Path,
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    report: Report,
+) -> Dict[str, object]:
+    middle = run_root / "00_middle"
+    snapshot_path = middle / "input_snapshot.meta"
+    delta_path = middle / "port_accounting_delta.csv"
+    delta_meta_path = middle / "port_accounting_delta.meta"
+    completion_path = middle / "stage_completion.meta"
+    snapshot = runtime.read_json(snapshot_path, "00 input snapshot") if snapshot_path.is_file() else {}
+    delta_meta = runtime.read_json(delta_meta_path, "00 accounting delta meta") if delta_meta_path.is_file() else {}
+    completion = runtime.read_json(completion_path, "00 completion meta") if completion_path.is_file() else {}
+    for path, payload, label in (
+        (snapshot_path, snapshot, "input snapshot"),
+        (delta_meta_path, delta_meta, "accounting delta meta"),
+        (completion_path, completion, "completion meta"),
+    ):
+        if not payload:
+            report.error(f"required 00 {label} is missing or invalid: {path}")
+            continue
+        if payload.get("run_id") != run_context.get("run_id") or payload.get("mode_label") != run_context.get("mode_label"):
+            report.error(f"{path}: run provenance does not match inputs/run_context.csv")
+        if payload.get("structure_digest") != structure:
+            report.error(f"{path}: structure_digest is stale")
+    if completion and (
+        completion.get("completion_status") != "complete"
+        or int(completion.get("error_count", 0) or 0) != 0
+    ):
+        report.error(f"{completion_path}: 00 stage is not complete")
+    if delta_meta:
+        if not delta_path.is_file():
+            report.error(f"required 00 accounting delta CSV is missing: {delta_path}")
+        elif delta_meta.get("delta_csv_digest") != sha256_file(delta_path):
+            report.error(f"{delta_meta_path}: delta_csv_digest is stale")
+        expected_after = delta_meta.get("accounting_digest_after", "")
+        if snapshot and snapshot.get("accounting_digest_after") != expected_after:
+            report.error("00 snapshot/accounting delta after-digest mismatch")
+        if completion and completion.get("accounting_digest_after") != expected_after:
+            report.error("00 completion/accounting delta after-digest mismatch")
+    return {
+        "input_snapshot.meta": sha256_file(snapshot_path) if snapshot_path.is_file() else "",
+        "port_accounting_delta.csv": sha256_file(delta_path) if delta_path.is_file() else "",
+        "port_accounting_delta.meta": sha256_file(delta_meta_path) if delta_meta_path.is_file() else "",
+        "stage_completion.meta": sha256_file(completion_path) if completion_path.is_file() else "",
+        "accounting_digest_after": delta_meta.get("accounting_digest_after", "") if delta_meta else "",
+    }
+
+
+def target_port_record_index(port_records) -> Dict[Tuple[str, str, str], List[object]]:
+    result: Dict[Tuple[str, str, str], List[object]] = {}
+    for record in port_records:
+        result.setdefault((record.inst_name, record.direction, record.shape.base), []).append(record)
+    return result
+
+
+def plan_target_accounting(
+    records: Sequence[ClockRecord],
+    port_records,
+    runtime,
+    report: Report,
+) -> List[Tuple[ClockRecord, object, int]]:
+    index = target_port_record_index(port_records)
+    planned: List[Tuple[ClockRecord, object, int]] = []
+    for rec in removable_clock_records(records):
+        base, bit_text, is_range = split_port_key(rec.port_name)
+        if is_range:
+            report.error(
+                f"{rec.inst_name}/{rec.port_name}: ACCOUNTING_RANGE_NOT_EXACT: clock accounting requires one exact bit"
+            )
+            continue
+        bit = int(bit_text) if bit_text else 0
+        candidates = [
+            item
+            for item in index.get((rec.inst_name, rec.direction, base), [])
+            if item.shape.contains(bit)
+        ]
+        if len(candidates) != 1:
+            report.error(
+                f"{rec.inst_name}/{rec.port_name}: ACCOUNTING_PORT_ROW_NOT_UNIQUE: matched {len(candidates)} row(s)"
+            )
+            continue
+        record = candidates[0]
+        added = bit not in record.used_bits
+        if added:
+            record.used_bits.add(bit)
+            record.added_bits.add(bit)
+            record.modified = True
+            record.model.modified = True
+        rec.accounting_action = "union_used_bit" if added else "already_accounted"
+        rec.accounting_added_bits = str(bit) if added else ""
+        planned.append((rec, record, bit))
+        report.info(
+            f"accounting {record.workbook}:{record.sheet} row {record.row} {record.direction} "
+            f"{record.shape.raw}: added_bits={str(bit) if added else '<none>'} "
+            f"final_used_bits={runtime.format_bits(record.used_bits)}"
+        )
+    for record in port_records:
+        if record.modified:
+            cell = record.model.workbook[record.sheet].cell(record.row, record.used_col)
+            cell.value = runtime.format_bits(record.used_bits)
+            cell.number_format = "@"
+    return planned
+
+
+def make_target_transaction_id(run_id: str) -> str:
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+    seed = f"01|{run_id}|{timestamp}|{os.getpid()}|{socket.gethostname()}"
+    return "01_%s_%s" % (timestamp, hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12])
+
+
+def build_target_delta_rows(
+    planned,
+    run_context: Dict[str, str],
+    transaction_id: str,
+    structure: str,
+    before: str,
+    after: str,
+    runtime,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for clock, record, bit in planned:
+        rows.append(
+            {
+                "schema_version": "1.0",
+                "run_id": run_context.get("run_id", ""),
+                "mode_label": run_context.get("mode_label", ""),
+                "stage_name": "01_soc_clocks",
+                "transaction_id": transaction_id,
+                "view_id": "",
+                "stage": "",
+                "corner": "",
+                "structure_digest": structure,
+                "accounting_digest_before": before,
+                "accounting_digest_after": after,
+                "workbook": record.workbook,
+                "sheet": record.sheet,
+                "row": record.row,
+                "direction": record.direction,
+                "port": record.shape.raw,
+                "legal_bits": runtime.format_bits(set(record.shape.bits())),
+                "added_bits": str(bit) if bit in record.added_bits else "",
+                "final_used_bits": runtime.format_bits(record.used_bits),
+                "owner_object_id": clock.clock_record_id,
+                "reason": clock_removed_reason(clock),
+                "evidence_status": "approved",
+            }
+        )
+    return rows
+
+
+def render_target_report(
+    report: Report,
+    records: Sequence[ClockRecord],
+    completeness: RunCompleteness,
+    run_context: Dict[str, str],
+    structure: str,
+    accounting_before: str,
+    accounting_after: str,
+    completion_status: str,
+) -> str:
+    action_counts: Dict[str, int] = {}
+    for rec in records:
+        action_counts[rec.final_action] = action_counts.get(rec.final_action, 0) + 1
+    lines = [
+        "01_soc_clocks extraction report",
+        "================================",
+        "",
+        f"Author: {author_name()}",
+        "Stage: 01_soc_clocks",
+        "Script: 01_extract_soc_clocks.py",
+        f"Run ID: {run_context.get('run_id', '')}",
+        f"Mode label: {run_context.get('mode_label', '')}",
+        f"Design revision: {run_context.get('design_revision', '')}",
+        f"Completion status: {completion_status}",
+        "Port accounting: enabled" if completion_status == "complete" else "Port accounting: not committed",
+        f"Structure digest: {structure or '<unavailable>'}",
+        f"Accounting digest before: {accounting_before or '<unavailable>'}",
+        f"Accounting digest after: {accounting_after or '<unavailable>'}",
+        "",
+    ]
+    lines.extend(completeness_lines(completeness))
+    lines.extend(
+        [
+            "",
+            f"Warnings: {report.warning_count}",
+            f"Errors  : {report.error_count}",
+            "",
+            "Action counts:",
+        ]
+    )
+    for action in sorted(action_counts):
+        lines.append(f"  {action}: {action_counts[action]}")
+    lines.extend(["", "Messages:"])
+    lines.extend(report.lines or ["INFO: no messages"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def run_target_single_run(args: argparse.Namespace, argv: Sequence[str]) -> int:
+    print(f"Author: {author_name()}")
+    report = Report()
+    runtime = load_accounting_runtime()
+    run_root = Path(args.run_root).expanduser().resolve()
+    input_root = run_root / "inputs"
+    middle_root = run_root / "01_middle"
+    output_path = run_root / "01_result/01_soc_clocks.sdc"
+    inventory_path = middle_root / "clock_inventory.csv"
+    inventory_meta_path = middle_root / "clock_inventory.meta"
+    delta_path = middle_root / "port_accounting_delta.csv"
+    delta_meta_path = middle_root / "port_accounting_delta.meta"
+    completion_path = middle_root / "stage_completion.meta"
+    report_path = run_root / "01_result/reports/clock_check_report.txt"
+    manifest_path = run_root / "00_middle/harden_sdc_manifest.csv"
+    snapshot_path = run_root / "00_middle/input_snapshot.meta"
+    info_path = input_root / "info_all.xlsx"
+    run_context_path = input_root / "run_context.csv"
+    required_views_path = input_root / "required_views.csv"
+    virtual_path = input_root / "virtual_clocks.csv"
+    manual_path = input_root / "01_soc_clocks_manual.sdc"
+    debug_dir = (
+        Path(args.debug_dir).expanduser()
+        if args.debug_dir and Path(args.debug_dir).expanduser().is_absolute()
+        else run_root / (args.debug_dir or "01_middle/debug/01_soc_clocks")
+    )
+    debug_enabled = args.debug or bool(args.debug_dir) or args.debug_verbose
+    diagnostic_mode = args.diagnose_only or args.no_update_pending or args.no_write_sdc
+    overrides = [
+        name
+        for name, value in (
+            ("--harden-sdc-manifest", args.harden_sdc_manifest),
+            ("--info", args.info),
+            ("--port-files", args.port_files),
+            ("--output", args.output),
+            ("--inventory", args.inventory),
+            ("--report", args.report),
+            ("--virtual-clocks", args.virtual_clocks),
+            ("--manual-clocks", args.manual_clocks),
+            ("--connection-inventory", args.connection_inventory),
+            ("--pending-root", args.pending_root),
+        )
+        if value
+    ]
+    if overrides:
+        report.error(
+            "target mode uses fixed single-run artifact paths; override(s) are not allowed: "
+            + ",".join(overrides)
+        )
+
+    run_context: Dict[str, str] = {}
+    required_views = []
+    instances: Dict[str, InstInfo] = {}
+    completeness = RunCompleteness(status="invalid")
+    models = []
+    port_records = []
+    records: List[ClockRecord] = []
+    structure = ""
+    accounting_before = ""
+    accounting_after = ""
+    upstream_digests: Dict[str, object] = {}
+    preview_dir: Optional[Path] = None
+    transaction_id = ""
+    try:
+        if not input_root.is_dir():
+            report.error(f"required inputs directory is missing: {input_root}")
+            raise RuntimeError("target input layout validation failed")
+        lock_path = input_root / ".port_accounting.lock"
+        with runtime.AccountingLock(lock_path, report):
+            runtime.recover_transactions(run_root, report)
+            run_context = runtime.read_run_context(run_context_path, report)
+            print(f"Run ID: {run_context.get('run_id', '')}")
+            print(f"Mode label: {run_context.get('mode_label', '')}")
+            print(f"Design revision: {run_context.get('design_revision', '')}")
+            required_views = runtime.read_required_views(required_views_path, report)
+            runtime_instances, info_semantic = runtime.read_info_all(info_path, report)
+            port_paths = runtime.discover_port_workbooks(input_root, report)
+            models, port_records = runtime.read_port_workbooks(
+                port_paths, run_root, runtime_instances, True, report
+            )
+            runtime.validate_connections(port_records, runtime_instances, report)
+            structure = runtime.structure_digest(
+                run_context, required_views, info_semantic, port_records
+            )
+            accounting_before = runtime.accounting_digest(port_records)
+            upstream_digests = validate_upstream_00(
+                runtime,
+                run_root,
+                run_context,
+                structure,
+                accounting_before,
+                report,
+            )
+            upstream_accounting_after = clean_cell(
+                upstream_digests.pop("accounting_digest_after", "")
+            )
+
+            old_delta_rows = runtime.load_delta_rows(delta_path, report) if delta_path.is_file() else []
+            old_delta_meta = (
+                runtime.read_json(delta_meta_path, "01 accounting delta meta")
+                if delta_meta_path.is_file()
+                else {}
+            )
+            old_completion = (
+                runtime.read_json(completion_path, "01 completion meta")
+                if completion_path.is_file()
+                else {}
+            )
+            if delta_path.is_file() != delta_meta_path.is_file():
+                report.error("01 accounting delta CSV/meta presence is inconsistent")
+            if bool(old_completion) != bool(old_delta_meta):
+                report.error("01 completion and accounting delta meta presence is inconsistent")
+            expected_before = (
+                old_delta_meta.get("accounting_digest_after", "")
+                if old_delta_meta
+                else upstream_accounting_after
+            )
+            if old_delta_meta:
+                if old_delta_meta.get("run_id") != run_context.get("run_id") or old_delta_meta.get("mode_label") != run_context.get("mode_label"):
+                    report.error("01 accounting delta meta run provenance is stale")
+                if old_delta_meta.get("structure_digest") != structure:
+                    report.error("01 accounting delta meta structure_digest is stale")
+                if old_delta_meta.get("delta_csv_digest") != sha256_file(delta_path):
+                    report.error("01 accounting delta meta delta_csv_digest is stale")
+                chain_before = upstream_accounting_after
+                for transaction in old_delta_meta.get("transactions", []):
+                    if transaction.get("structure_digest") != structure:
+                        report.error("01 accounting transaction has stale structure_digest")
+                    if chain_before and transaction.get("accounting_digest_before") != chain_before:
+                        report.error("01 accounting transaction digest chain is discontinuous")
+                    chain_before = transaction.get("accounting_digest_after", "")
+                if chain_before and chain_before != old_delta_meta.get("accounting_digest_after"):
+                    report.error("01 accounting delta meta final digest does not match transaction chain")
+                for row_idx, row in enumerate(old_delta_rows, start=2):
+                    if clean_cell(row.get("run_id")) != run_context.get("run_id") or clean_cell(row.get("mode_label")) != run_context.get("mode_label"):
+                        report.error(f"01 delta row {row_idx} run provenance is stale")
+                    if clean_cell(row.get("structure_digest")) != structure:
+                        report.error(f"01 delta row {row_idx} structure_digest is stale")
+                if old_completion:
+                    if old_completion.get("completion_status") != "complete" or int(old_completion.get("error_count", 0) or 0) != 0:
+                        report.error("existing 01 completion is not complete")
+                    if old_completion.get("run_id") != run_context.get("run_id") or old_completion.get("mode_label") != run_context.get("mode_label"):
+                        report.error("existing 01 completion run provenance is stale")
+                    if old_completion.get("structure_digest") != structure:
+                        report.error("existing 01 completion structure_digest is stale")
+                    if old_completion.get("accounting_digest_after") != old_delta_meta.get("accounting_digest_after"):
+                        report.error("existing 01 completion accounting digest is stale")
+                    if not output_path.is_file() or old_completion.get("output_sdc_digest") != sha256_file(output_path):
+                        report.error("existing 01 completion output SDC is missing or stale")
+                    if not inventory_path.is_file() or old_completion.get("clock_inventory_digest") != sha256_file(inventory_path):
+                        report.error("existing 01 completion clock inventory is missing or stale")
+            if expected_before and expected_before != accounting_before:
+                report.error(
+                    f"accounting digest chain mismatch: expected before={expected_before}, current={accounting_before}"
+                )
+
+            instances = read_info_all(info_path, report)
+            sheets = read_port_workbooks(port_paths, report)
+            attach_port_data(instances, sheets, report)
+            attach_runtime_port_shapes(instances, port_records)
+            completeness = apply_single_run_harden_sdc_manifest(
+                instances,
+                manifest_path,
+                run_root,
+                args.require_complete_harden_sdc,
+                report,
+            )
+            connection_by_dst = build_connections_from_port_records(port_records, report)
+            records = missing_sdc_records(instances, completeness)
+            for inst_name in sorted(instances):
+                records.extend(
+                    process_instance(
+                        instances[inst_name],
+                        report,
+                        connection_by_dst,
+                        strict_connections=True,
+                    )
+                )
+            dedupe_top_clocks(records, report)
+            records.extend(virtual_clock_records(read_virtual_clock_csv(virtual_path, report)))
+            dedupe_virtual_clocks(records, report)
+            records.extend(
+                manual_clock_records(manual_path, instances, connection_by_dst, report)
+            )
+            validate_clock_universe(records, report)
+            compute_root_sources(records, build_instance_lookup(instances), connection_by_dst)
+            run_checks(
+                records,
+                build_instance_lookup(instances),
+                report,
+                set(completeness.missing_instances),
+            )
+            for rec in records:
+                rec.clock_record_id = canonical_clock_record_id(rec)
+                rec.run_completeness = completeness.status
+                rec.missing_instances = ";".join(completeness.missing_instances)
+                rec.structure_digest = structure
+                rec.accounting_digest_before = accounting_before
+
+            planned = plan_target_accounting(records, port_records, runtime, report)
+            accounting_after = runtime.accounting_digest(port_records)
+            for rec in records:
+                rec.accounting_digest_after = accounting_after
+
+            if report.error_count:
+                raise RuntimeError("01 validation failed")
+
+            print(f"Run completeness: {completeness.status}")
+            print("Port accounting: diagnostic" if diagnostic_mode else "Port accounting: enabled")
+            print(f"Structure digest: {structure}")
+
+            if diagnostic_mode:
+                for rec in records:
+                    rec.accounting_digest_after = accounting_before
+                    if rec.accounting_action == "union_used_bit":
+                        rec.accounting_action = "diagnostic_would_union_used_bit"
+                inventory_text = target_inventory_text(records, run_context)
+                atomic_write_text(inventory_path, inventory_text)
+                diagnostic_meta = {
+                    "schema_version": "1.0",
+                    "author": author_name(),
+                    "stage_name": "01_soc_clocks",
+                    "run_id": run_context.get("run_id", ""),
+                    "mode_label": run_context.get("mode_label", ""),
+                    "design_revision": run_context.get("design_revision", ""),
+                    "completion_status": "diagnostic",
+                    "error_count": 0,
+                    "structure_digest": structure,
+                    "accounting_digest_before": accounting_before,
+                    "accounting_digest_after": accounting_before,
+                    "inventory_digest": hashlib.sha256(inventory_text.encode("utf-8")).hexdigest(),
+                    "final_sdc_path": "",
+                    "final_sdc_digest": "",
+                }
+                atomic_write_text(
+                    inventory_meta_path,
+                    json.dumps(diagnostic_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                )
+                report.info("diagnostic mode: formal SDC, workbook transaction, delta and completion were not published")
+            else:
+                sdc_text = render_target_sdc(
+                    records,
+                    report,
+                    completeness,
+                    run_context,
+                    structure,
+                    accounting_before,
+                    accounting_after,
+                    manifest_path,
+                )
+                sdc_digest = hashlib.sha256(sdc_text.encode("utf-8")).hexdigest()
+                for rec in records:
+                    if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command:
+                        rec.final_sdc_digest = sdc_digest
+                preview_dir = middle_root / (".01_preview_%s" % os.getpid())
+                preview_dir.mkdir(parents=True, exist_ok=False)
+                preview_sdc = preview_dir / "01_soc_clocks.sdc"
+                atomic_write_text(preview_sdc, sdc_text)
+                reconcile_final_sdc(preview_sdc, records, report)
+                if report.error_count:
+                    raise RuntimeError("final SDC reconcile failed")
+
+                inventory_text = target_inventory_text(records, run_context)
+                inventory_payload = inventory_text.encode("utf-8")
+                inventory_digest = hashlib.sha256(inventory_payload).hexdigest()
+                active_names = sorted(
+                    rec.clock_name
+                    for rec in records
+                    if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command
+                )
+                inventory_meta = {
+                    "schema_version": "1.0",
+                    "author": author_name(),
+                    "stage_name": "01_soc_clocks",
+                    "run_id": run_context.get("run_id", ""),
+                    "mode_label": run_context.get("mode_label", ""),
+                    "design_revision": run_context.get("design_revision", ""),
+                    "completion_status": "complete",
+                    "error_count": 0,
+                    "structure_digest": structure,
+                    "accounting_digest_before": accounting_before,
+                    "accounting_digest_after": accounting_after,
+                    "inventory_path": str(inventory_path.resolve()),
+                    "inventory_digest": inventory_digest,
+                    "clock_count": len(active_names),
+                    "clock_set_digest": hashlib.sha256("\n".join(active_names).encode("utf-8")).hexdigest(),
+                    "final_sdc_path": str(output_path.resolve()),
+                    "final_sdc_digest": sdc_digest,
+                    "run_completeness": completeness.status,
+                    "missing_instances": completeness.missing_instances,
+                }
+
+                transaction_id = make_target_transaction_id(run_context.get("run_id", ""))
+                prepared_candidates = {}
+                workbook_before = {model.relative_name: model.digest_before for model in models}
+                for model in models:
+                    if model.modified:
+                        candidate = preview_dir / model.path.name
+                        model.workbook.save(str(candidate))
+                        model.digest_after = sha256_file(candidate)
+                        prepared_candidates[model.relative_name] = candidate
+                    else:
+                        model.digest_after = model.digest_before
+                workbook_after = {model.relative_name: model.digest_after for model in models}
+                inventory_meta["workbook_file_digest_before"] = workbook_before
+                inventory_meta["workbook_file_digest_after"] = workbook_after
+                new_delta_rows = build_target_delta_rows(
+                    planned,
+                    run_context,
+                    transaction_id,
+                    structure,
+                    accounting_before,
+                    accounting_after,
+                    runtime,
+                )
+                old_delta_text = delta_path.read_text(encoding="utf-8") if delta_path.is_file() else ""
+                if old_delta_text:
+                    delta_text = old_delta_text + ("" if old_delta_text.endswith("\n") else "\n")
+                    delta_text += runtime.csv_text(runtime.DELTA_HEADERS, new_delta_rows, include_header=False)
+                else:
+                    delta_text = runtime.csv_text(runtime.DELTA_HEADERS, old_delta_rows + new_delta_rows)
+                delta_payload = delta_text.encode("utf-8")
+                transaction_entry = {
+                    "transaction_id": transaction_id,
+                    "committed_at": runtime.utc_timestamp(),
+                    "structure_digest": structure,
+                    "accounting_digest_before": accounting_before,
+                    "accounting_digest_after": accounting_after,
+                    "delta_rows_digest": runtime.delta_rows_digest(new_delta_rows),
+                }
+                delta_meta = {
+                    "schema_version": "1.0",
+                    "run_id": run_context.get("run_id", ""),
+                    "mode_label": run_context.get("mode_label", ""),
+                    "stage_name": "01_soc_clocks",
+                    "completion_status": "complete",
+                    "structure_digest": structure,
+                    "accounting_digest_before": accounting_before,
+                    "accounting_digest_after": accounting_after,
+                    "workbook_file_digest_before": workbook_before,
+                    "workbook_file_digest_after": workbook_after,
+                    "delta_csv_digest": hashlib.sha256(delta_payload).hexdigest(),
+                    "transactions": list(old_delta_meta.get("transactions", [])) + [transaction_entry],
+                }
+                completion = {
+                    "schema_version": "1.0",
+                    "author": author_name(),
+                    "run_id": run_context.get("run_id", ""),
+                    "mode_label": run_context.get("mode_label", ""),
+                    "design_revision": run_context.get("design_revision", ""),
+                    "stage_name": "01_soc_clocks",
+                    "stage": "",
+                    "corner": "",
+                    "completion_status": "complete",
+                    "error_count": 0,
+                    "sync_changed": "no",
+                    "structure_digest": structure,
+                    "accounting_digest_before": accounting_before,
+                    "accounting_digest_after": accounting_after,
+                    "port_accounting": "enabled",
+                    "added_bits": sum(len(record.added_bits) for record in port_records),
+                    "workbook_file_digest_before": workbook_before,
+                    "workbook_file_digest_after": workbook_after,
+                    "upstream_artifact_digests": upstream_digests,
+                    "output_sdc_digest": sdc_digest,
+                    "clock_inventory_digest": inventory_digest,
+                    "accounting_delta_digest": hashlib.sha256(delta_payload).hexdigest(),
+                    "transaction_id": transaction_id,
+                }
+                report_text = render_target_report(
+                    report,
+                    records,
+                    completeness,
+                    run_context,
+                    structure,
+                    accounting_before,
+                    accounting_after,
+                    "complete",
+                )
+                artifact_payloads = [
+                    (output_path, sdc_text.encode("utf-8")),
+                    (inventory_path, inventory_payload),
+                    (inventory_meta_path, (json.dumps(inventory_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")),
+                    (delta_path, delta_payload),
+                    (delta_meta_path, (json.dumps(delta_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")),
+                    (completion_path, (json.dumps(completion, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")),
+                    (report_path, report_text.encode("utf-8")),
+                ]
+                runtime.execute_transaction(
+                    run_root,
+                    models,
+                    prepared_candidates,
+                    artifact_payloads,
+                    transaction_id,
+                    run_context,
+                    structure,
+                    accounting_before,
+                    accounting_after,
+                    report,
+                )
+                report.info(f"committed 01 accounting transaction {transaction_id}")
+
+        if diagnostic_mode:
+            report_text = render_target_report(
+                report,
+                records,
+                completeness,
+                run_context,
+                structure,
+                accounting_before,
+                accounting_before,
+                "diagnostic",
+            )
+            atomic_write_text(report_path, report_text)
+    except Exception as exc:
+        if not report.error_count:
+            report.error(str(exc))
+        failure_text = render_target_report(
+            report,
+            records,
+            completeness,
+            run_context,
+            structure,
+            accounting_before,
+            accounting_after or accounting_before,
+            "failed",
+        )
+        atomic_write_text(report_path, failure_text)
+    finally:
+        for model in models:
+            try:
+                model.workbook.close()
+            except Exception:
+                pass
+        if preview_dir is not None and preview_dir.exists():
+            shutil.rmtree(str(preview_dir))
+
+    if debug_enabled:
+        resolved_paths = {
+            "run_root": run_root,
+            "input_root": input_root,
+            "harden_sdc_manifest": manifest_path,
+            "output_sdc": output_path,
+            "output_inventory": inventory_path,
+            "output_report": report_path,
+            "debug_dir": debug_dir,
+        }
+        input_paths = [run_context_path, required_views_path, info_path, manifest_path, virtual_path, manual_path]
+        input_paths.extend(model.path for model in models)
+        input_paths.extend(inst.sdc_path for inst in instances.values() if inst.sdc_path is not None)
+        write_debug_bundle(
+            debug_dir,
+            argv,
+            resolved_paths,
+            input_paths,
+            instances,
+            records,
+            completeness,
+            report,
+        )
+        if args.debug_verbose:
+            for line in report.lines:
+                print("DEBUG: " + line)
+    return 1 if report.error_count else 0
 
 
 def default_port_files(cwd: Path, info_name: str) -> List[Path]:
@@ -3333,16 +4554,15 @@ def default_port_files(cwd: Path, info_name: str) -> List[Path]:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate common/01_soc_clocks.sdc from local harden SDC and integration xlsx files."
+        description="Generate one run's SoC-visible clock SDC and transactional port accounting artifacts."
     )
     parser.add_argument(
         "--run-root",
-        help="target runtime root; when set, inputs are read from <run-root>/inputs and outputs use 01_middle/01_result",
+        help="single-run target root; reads inputs/ and flat 00_middle artifacts, writes flat 01_middle/01_result artifacts",
     )
-    parser.add_argument("--scenario", default="common", help="clock scenario; current func-only implementation accepts common")
     parser.add_argument(
         "--harden-sdc-manifest",
-        help="00 harden SDC manifest; target default: 00_middle/scenario/<scenario>/harden_sdc_manifest.csv",
+        help="legacy manifest override; target mode uses fixed 00_middle/harden_sdc_manifest.csv",
     )
     parser.add_argument(
         "--require-complete-harden-sdc",
@@ -3381,31 +4601,29 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--connection-inventory",
         help=(
-            "00 bit-to-bit connection inventory. Required in target runtime; legacy mode "
-            "falls back to owner From Whom when absent"
+            "legacy 00 bit-to-bit connection inventory; target mode reads port workbooks directly"
         ),
     )
     parser.add_argument(
         "--no-write-sdc",
         action="store_true",
-        help="only write inventory/report, not common/01_soc_clocks.sdc",
+        help="diagnostic mode alias: do not publish formal SDC/accounting completion",
     )
     parser.add_argument(
         "--pending-root",
         help=(
-            "legacy 00 harden port inventory root. Target runtime uses the fixed scenario pending path; "
-            "01 removes covered clock ports and writes its removed log"
+            "legacy pending root only; target mode updates port workbook Used columns"
         ),
     )
     parser.add_argument(
         "--no-update-pending",
         action="store_true",
-        help="do not consume 00_harden_port_inventory/pending even if it exists",
+        help="legacy compatibility / target diagnostic alias; target formal runs update Used columns transactionally",
     )
     parser.add_argument(
         "--diagnose-only",
         action="store_true",
-        help="parse and check inputs without writing the official SDC or updating pending",
+        help="parse/check and write diagnostic inventory/report without formal SDC, workbook update, delta or completion",
     )
     parser.add_argument(
         "--debug",
@@ -3426,9 +4644,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def _main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.run_root:
+        return run_target_single_run(args, argv)
+    args.scenario = "common"
     cwd = Path.cwd()
     report = Report()
     print(f"Author: {author_name()}")
+    target_layout = False
     if args.diagnose_only:
         args.no_write_sdc = True
         args.no_update_pending = True
@@ -3438,11 +4660,6 @@ def _main(argv: Sequence[str]) -> int:
             "Port accounting: disabled by explicit option; pending closure is not claimed"
         )
 
-    if args.scenario != "common":
-        print("ERROR: current 01 implementation supports only --scenario common", file=sys.stderr)
-        return 2
-
-    target_layout = bool(args.run_root)
     run_root = Path(args.run_root).expanduser().resolve() if target_layout else cwd
     input_root = run_root / "inputs" if target_layout else cwd
 
@@ -3450,47 +4667,64 @@ def _main(argv: Sequence[str]) -> int:
         path = Path(value) if value else Path(default)
         return path if path.is_absolute() else base / path
 
-    info_path = resolve_path(input_root, args.info, "info_all.xlsx")
-    output_path = resolve_path(
-        run_root if target_layout else cwd,
-        args.output,
-        "01_result/common/01_soc_clocks.sdc" if target_layout else "common/01_soc_clocks.sdc",
-    )
-    inventory_path = resolve_path(
-        run_root if target_layout else cwd,
-        args.inventory,
-        "01_middle/common/clock_inventory.csv" if target_layout else "clock_inventory.csv",
-    )
-    report_path = resolve_path(
-        run_root if target_layout else cwd,
-        args.report,
-        f"01_result/reports/clock_check_report_{args.scenario}.txt" if target_layout else "clock_check_report.txt",
-    )
-    virtual_path = resolve_path(input_root, args.virtual_clocks, "virtual_clocks.csv")
-    manual_path = resolve_path(input_root, args.manual_clocks, "01_soc_clocks_manual.sdc")
-    connection_path = resolve_path(
-        run_root if target_layout else cwd,
-        args.connection_inventory,
-        "00_middle/connection_inventory.csv" if target_layout else "00_harden_port_inventory/connection_inventory.csv",
-    )
+    if target_layout:
+        override_names = [
+            name
+            for name, value in (
+                ("--harden-sdc-manifest", args.harden_sdc_manifest),
+                ("--info", args.info),
+                ("--port-files", args.port_files),
+                ("--output", args.output),
+                ("--inventory", args.inventory),
+                ("--report", args.report),
+                ("--virtual-clocks", args.virtual_clocks),
+                ("--manual-clocks", args.manual_clocks),
+                ("--connection-inventory", args.connection_inventory),
+                ("--pending-root", args.pending_root),
+            )
+            if value
+        ]
+        if override_names:
+            report.error(
+                "target mode uses fixed artifact paths; path override(s) are not allowed: "
+                + ",".join(override_names)
+            )
+        info_path = input_root / "info_all.xlsx"
+        output_path = run_root / "01_result/common/01_soc_clocks.sdc"
+        inventory_path = run_root / "01_middle/common/clock_inventory.csv"
+        report_path = run_root / f"01_result/reports/clock_check_report_{args.scenario}.txt"
+        virtual_path = input_root / "virtual_clocks.csv"
+        manual_path = input_root / "01_soc_clocks_manual.sdc"
+        connection_path = run_root / "00_middle/connection_inventory.csv"
+    else:
+        info_path = resolve_path(input_root, args.info, "info_all.xlsx")
+        output_path = resolve_path(cwd, args.output, "common/01_soc_clocks.sdc")
+        inventory_path = resolve_path(cwd, args.inventory, "clock_inventory.csv")
+        report_path = resolve_path(cwd, args.report, "clock_check_report.txt")
+        virtual_path = resolve_path(input_root, args.virtual_clocks, "virtual_clocks.csv")
+        manual_path = resolve_path(input_root, args.manual_clocks, "01_soc_clocks_manual.sdc")
+        connection_path = resolve_path(
+            cwd,
+            args.connection_inventory,
+            "00_harden_port_inventory/connection_inventory.csv",
+        )
     manifest_path: Optional[Path]
     if target_layout:
-        manifest_path = resolve_path(
-            run_root,
-            args.harden_sdc_manifest,
-            f"00_middle/scenario/{args.scenario}/harden_sdc_manifest.csv",
-        )
+        manifest_path = run_root / f"00_middle/scenario/{args.scenario}/harden_sdc_manifest.csv"
     elif args.harden_sdc_manifest:
         manifest_path = resolve_path(cwd, args.harden_sdc_manifest, args.harden_sdc_manifest)
     else:
         manifest_path = None
     if target_layout:
-        if args.pending_root:
-            pending_base = resolve_path(run_root, args.pending_root, args.pending_root)
-            pending_dir = pending_base / "pending"
-        else:
-            pending_dir = run_root / f"00_middle/scenario/{args.scenario}/pending"
-        removed_log_dir = run_root / f"01_middle/scenario/{args.scenario}/removed_log"
+        pending_dir = run_root / f"00_middle/scenario/{args.scenario}/pending"
+        removed_log_path = (
+            run_root
+            / f"01_middle/scenario/{args.scenario}/removed_log/01_soc_clocks.removed"
+        )
+        previous_removed_paths = [
+            run_root
+            / f"00_middle/scenario/{args.scenario}/removed_log/00_disposition.removed"
+        ]
         common_meta_path: Optional[Path] = run_root / "01_middle/common/clock_inventory.meta"
         scenario_inventory_path: Optional[Path] = run_root / f"01_middle/scenario/{args.scenario}/clock_inventory.csv"
         scenario_meta_path: Optional[Path] = run_root / f"01_middle/scenario/{args.scenario}/clock_inventory.meta"
@@ -3499,7 +4733,8 @@ def _main(argv: Sequence[str]) -> int:
     else:
         pending_base = resolve_path(cwd, args.pending_root, "00_harden_port_inventory")
         pending_dir = pending_base / "pending"
-        removed_log_dir = pending_base / "removed_log"
+        removed_log_path = pending_base / "removed_log/01_soc_clocks.removed"
+        previous_removed_paths = [pending_base / "removed_log/00_disposition.removed"]
         common_meta_path = None
         scenario_inventory_path = None
         scenario_meta_path = None
@@ -3556,7 +4791,7 @@ def _main(argv: Sequence[str]) -> int:
             report,
             required=not args.no_update_pending,
         )
-        attach_ports_from_previous_01_removed(removed_log_dir, instances, report)
+        attach_ports_from_previous_01_removed(removed_log_path, instances, report)
     else:
         if not info_path.is_file():
             print(f"ERROR: info workbook not found in execution directory: {info_path}", file=sys.stderr)
@@ -3614,7 +4849,38 @@ def _main(argv: Sequence[str]) -> int:
         rec.run_completeness = completeness.status
         rec.missing_instances = missing_text
 
-    if not args.no_write_sdc:
+    port_accounting_enabled = not args.no_update_pending
+    print(f"Scenario: {args.scenario}")
+    print(f"Run completeness: {completeness.status}")
+    print(
+        "Port accounting: enabled"
+        if port_accounting_enabled
+        else "Port accounting: disabled by explicit option"
+    )
+    print(f"Connection inventory: {connection_path.resolve()}")
+    print(
+        f"Harden SDC manifest: {manifest_path.resolve()}"
+        if manifest_path is not None
+        else "Harden SDC manifest: <legacy inferred>"
+    )
+
+    pending_plan = PendingPlan()
+    if report.error_count == 0 and port_accounting_enabled:
+        pending_plan = prepare_pending_plan_01(
+            pending_dir,
+            removed_log_path,
+            previous_removed_paths,
+            records,
+            report,
+        )
+
+    artifact_allowed = not target_layout or report.error_count == 0
+    if not artifact_allowed:
+        report.warn(
+            "FORMAL_ARTIFACT_UPDATE_SKIPPED_DUE_TO_ERRORS: target SDC/inventory/meta and pending were not updated"
+        )
+
+    if artifact_allowed and not args.no_write_sdc:
         write_sdc(
             output_path,
             records,
@@ -3622,28 +4888,49 @@ def _main(argv: Sequence[str]) -> int:
             completeness,
             args.scenario,
             target_layout,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
         )
         final_digest = sha256_file(output_path)
         for rec in records:
             if rec.final_action in EMITTED_CLOCK_ACTIONS and rec.emitted_command:
                 rec.final_sdc_digest = final_digest
         reconcile_final_sdc(output_path, records, report)
-    write_inventory(inventory_path, records)
-    if not args.no_update_pending:
-        if report.error_count:
-            report.warn(
-                "PENDING_UPDATE_SKIPPED_DUE_TO_ERRORS: pending files were not modified because validation errors exist"
-            )
-        else:
-            update_pending_for_01(run_root, pending_dir, removed_log_dir, records, report)
-    if target_layout and not args.no_write_sdc:
+    if artifact_allowed:
+        write_inventory(
+            inventory_path,
+            records,
+            args.scenario,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
+        )
+    if target_layout and artifact_allowed and not args.no_write_sdc:
         assert common_meta_path is not None
         assert scenario_inventory_path is not None
         assert scenario_meta_path is not None
         assert assembled_inventory_path is not None
         assert assembled_meta_path is not None
-        write_inventory_meta(common_meta_path, args.scenario, output_path, inventory_path, records, completeness)
-        write_inventory(scenario_inventory_path, records)
+        write_inventory_meta(
+            common_meta_path,
+            args.scenario,
+            output_path,
+            inventory_path,
+            records,
+            completeness,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
+        )
+        write_inventory(
+            scenario_inventory_path,
+            records,
+            args.scenario,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
+        )
         write_inventory_meta(
             scenario_meta_path,
             args.scenario,
@@ -3651,8 +4938,18 @@ def _main(argv: Sequence[str]) -> int:
             scenario_inventory_path,
             records,
             completeness,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
         )
-        write_inventory(assembled_inventory_path, records)
+        write_inventory(
+            assembled_inventory_path,
+            records,
+            args.scenario,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
+        )
         write_inventory_meta(
             assembled_meta_path,
             args.scenario,
@@ -3660,6 +4957,20 @@ def _main(argv: Sequence[str]) -> int:
             assembled_inventory_path,
             records,
             completeness,
+            port_accounting_enabled,
+            connection_path,
+            manifest_path,
+        )
+    if artifact_allowed and port_accounting_enabled and report.error_count == 0:
+        apply_pending_plan_01(pending_plan, removed_log_path)
+        if pending_plan.removed_count:
+            report.info(
+                f"removed {pending_plan.removed_count} harden clock port(s) from pending; "
+                f"log={removed_log_path}"
+            )
+    elif port_accounting_enabled and report.error_count:
+        report.warn(
+            "PENDING_UPDATE_SKIPPED_DUE_TO_ERRORS: pending files were not modified because validation errors exist"
         )
     if debug_enabled:
         report.info(f"writing offline debug bundle to {debug_dir.resolve()}")
@@ -3669,7 +4980,7 @@ def _main(argv: Sequence[str]) -> int:
         records,
         completeness,
         args.scenario,
-        port_accounting_enabled=not args.no_update_pending,
+        port_accounting_enabled=port_accounting_enabled,
     )
 
     if debug_enabled:
@@ -3678,7 +4989,7 @@ def _main(argv: Sequence[str]) -> int:
             "input_root": input_root,
             "connection_inventory": connection_path,
             "pending_dir": pending_dir,
-            "removed_log_dir": removed_log_dir,
+            "removed_log_path": removed_log_path,
             "output_sdc": output_path,
             "output_inventory": inventory_path,
             "output_report": report_path,
