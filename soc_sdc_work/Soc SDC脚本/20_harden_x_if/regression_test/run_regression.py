@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Target-runtime regression for 20_extract_harden_x_if.py."""
+"""Regression for the workbook-centric single-run stage-20 runtime."""
 
 from __future__ import print_function
 
 import csv
-import hashlib
 import importlib.util
 import json
+import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from openpyxl import load_workbook
 
 
 BASE = Path(__file__).resolve().parent
-SCRIPT = BASE.parent / "20_extract_harden_x_if.py"
-NORMAL_CHANNEL = "CH_u_a_data_o_bit0__u_c_data_i_bit0"
-EXCEPTION_CHANNEL = "CH_u_a_cfg_o__u_c_cfg_i"
+STAGE20 = BASE.parent
+SCRIPTS = STAGE20.parent
+EX20 = STAGE20 / "20_extract_harden_x_if.py"
+T10_REGRESSION = SCRIPTS / "10_feedthrough" / "regression_test" / "run_regression.py"
+WORK = BASE / "work_latest"
 
 
 def require(condition, message):
@@ -27,637 +30,382 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def sha(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as file_obj:
-        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def load_t10_fixture():
+    spec = importlib.util.spec_from_file_location("stage10_fixture_for_20", str(T10_REGRESSION))
+    require(spec is not None and spec.loader is not None, "cannot load stage-10 fixture")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def write_text(path, text):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+T10 = load_t10_fixture()
 
 
-def write_csv(path, headers, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as file_obj:
-        writer = csv.DictWriter(file_obj, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(rows)
+def run_20(root, *extra):
+    return T10.run_script(EX20, ["--run-root", root] + list(extra), root)
 
 
-def write_json(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def edge(connection_id, src_i, src_d, src_p, dst_i, dst_d, dst_p, scope="common"):
-    def bit(port):
-        return port.split("[")[-1].rstrip("]") if "[" in port else ""
-
-    return {
-        "schema_version": "1",
-        "connection_id": connection_id,
-        "connection_type": "harden_to_harden",
-        "scenario_scope": scope,
-        "src_instance": src_i,
-        "src_direction": src_d,
-        "src_port": src_p,
-        "src_bit_index": bit(src_p),
-        "src_endpoint_key": "%s:%s:%s" % (src_i, src_d, src_p),
-        "src_soc_object": "%s/%s" % (src_i, src_p),
-        "dst_instance": dst_i,
-        "dst_direction": dst_d,
-        "dst_port": dst_p,
-        "dst_bit_index": bit(dst_p),
-        "dst_endpoint_key": "%s:%s:%s" % (dst_i, dst_d, dst_p),
-        "dst_soc_object": "%s/%s" % (dst_i, dst_p),
-        "validation_status": "matched",
-        "note": "",
-    }
-
-
-def build_target(root, missing_dst=False, include_feedthrough_inventory=True, create_pending=True):
-    if root.exists():
-        shutil.rmtree(str(root))
-    root.mkdir(parents=True)
-
-    connection_headers = [
-        "schema_version", "connection_id", "connection_type", "scenario_scope",
-        "src_instance", "src_direction", "src_port", "src_bit_index",
-        "src_endpoint_key", "src_soc_object",
-        "dst_instance", "dst_direction", "dst_port", "dst_bit_index",
-        "dst_endpoint_key", "dst_soc_object", "validation_status", "note",
-    ]
-    rows = [
-        edge("CONN_NORMAL", "u_a", "output", "data_o[0]", "u_c", "input", "data_i[0]"),
-        edge("CONN_FT_IN", "u_a", "output", "ft_src_o[0]", "u_b", "input", "fti_0_path[0]"),
-        edge("CONN_FT_OUT", "u_b", "output", "fto_0_path[0]", "u_c", "input", "ft_dst_i[0]"),
-        edge("CONN_EXCEPTION", "u_a", "output", "cfg_o", "u_c", "input", "cfg_i"),
-        edge("CONN_CLOCK", "u_a", "output", "clk_o", "u_c", "input", "clk_i"),
-        edge("CONN_SCAN_ONLY", "u_a", "output", "scan_o", "u_c", "input", "scan_i", "scan"),
-    ]
-    write_csv(root / "00_middle/connection_inventory.csv", connection_headers, rows)
-
-    write_text(
-        root / "inputs/u_a.sdc",
-        "set_output_delay -max 2.0 -clock [get_clocks {clk_a}] [get_ports {data_o[0]}]\n"
-        "set_output_delay -max 3.0 -clock [get_clocks {clk_a}] [get_ports {ft_src_o[0]}]\n"
-        "set_output_delay -max 0.8 -clock [get_clocks {clk_a}] [get_ports {cfg_o}]\n"
-        "set_false_path -from [\n"
-        "  get_ports {cfg_o}\n"
-        "]\n",
-    )
-    write_text(root / "inputs/u_b.sdc", "")
-    if not missing_dst:
-        write_text(
-            root / "inputs/u_c.sdc",
-            "set_input_delay -max 1.5 -clock [get_clocks {clk_c}] [get_ports {data_i[0]}]\n"
-            "set_input_delay -max 2.5 -clock [get_clocks {clk_c}] [get_ports {ft_dst_i[0]}]\n"
-            "set_input_delay -max 0.7 -clock [get_clocks {clk_c}] [get_ports {cfg_i}]\n",
+def prepare_upstreams(root, missing_sdcs=None, require_20=True):
+    if require_20:
+        T10.build_root(root, missing_sdcs=missing_sdcs)
+    else:
+        T10.clean_dir(root)
+        T10.write_inputs(root, missing_sdcs=missing_sdcs)
+        required_path = root / "inputs" / "required_views.csv"
+        required_rows = read_csv(required_path)
+        require(required_rows, "required view fixture is empty")
+        required_rows[0]["require_20"] = "no"
+        T10.write_csv(required_path, list(required_rows[0]), required_rows)
+        initialized = T10.run_00(root)
+        require(initialized.returncode == 0, "00 no-required-20 fixture initialization failed")
+        T10.publish_upstream_artifacts(root)
+    first = T10.run_10(root)
+    require(first.returncode != 0, "stage 10 first sync did not stop")
+    form = root / "10_middle" / "10_feedthrough.xlsx"
+    specifications = {}
+    for row in T10.inventory_rows(root):
+        specifications[T10.edge_key(row)] = T10.approved(
+            "no_soc_budget_required",
+            independent="regression upstream owner basis independent of partial SDC",
         )
-
-    manifest_rows = [
-        {"scenario": "common", "inst_name": "u_a", "module_name": "harden_a", "sdc_path": "inputs/u_a.sdc", "availability_status": "available", "note": ""},
-        {"scenario": "common", "inst_name": "u_b", "module_name": "harden_b", "sdc_path": "inputs/u_b.sdc", "availability_status": "available", "note": ""},
-        {
-            "scenario": "common",
-            "inst_name": "u_c",
-            "module_name": "harden_c",
-            "sdc_path": "inputs/u_c.sdc",
-            "availability_status": "missing" if missing_dst else "available",
-            "note": "awaiting delivery" if missing_dst else "",
-        },
-    ]
-    write_csv(
-        root / "00_middle/scenario/common/harden_sdc_manifest.csv",
-        ["scenario", "inst_name", "module_name", "sdc_path", "availability_status", "note"],
-        manifest_rows,
+    T10.approve_edges(form, specifications)
+    second = T10.run_10(root)
+    require(
+        second.returncode == 0,
+        "stage 10 fixture completion failed:\n%s\n%s" % (second.stdout, second.stderr),
     )
 
-    if create_pending:
-        write_text(
-            root / "00_middle/scenario/common/pending/u_a.ports",
-            "output data_o[0]\noutput ft_src_o[0]\noutput cfg_o\noutput clk_o\noutput scan_o\n",
-        )
-        write_text(
-            root / "00_middle/scenario/common/pending/u_b.ports",
-            "input fti_0_path[0]\noutput fto_0_path[0]\n",
-        )
-        write_text(
-            root / "00_middle/scenario/common/pending/u_c.ports",
-            "input data_i[0]\ninput ft_dst_i[0]\ninput cfg_i\ninput clk_i\ninput scan_i\n",
-        )
 
-    final_clock_sdc = root / "01_result/common/01_soc_clocks.sdc"
-    write_text(final_clock_sdc, "# clock fixture\n")
-    clock_csv = root / "01_middle/assembled/common/clock_inventory.csv"
-    clock_headers = [
-        "clock_name", "inst_name", "original_clock_name", "port_name",
-        "target_object", "direct_source", "producer_object", "final_action",
-    ]
-    clock_rows = [
-        {"clock_name": "soc_clk_a", "inst_name": "u_a", "original_clock_name": "clk_a", "port_name": "clk_o", "target_object": "u_a/clk_o", "direct_source": "", "producer_object": "", "final_action": "emit_virtual_clock"},
-        {"clock_name": "soc_clk_c", "inst_name": "u_c", "original_clock_name": "clk_c", "port_name": "", "target_object": "", "direct_source": "", "producer_object": "", "final_action": "emit_virtual_clock"},
-    ]
-    write_csv(clock_csv, clock_headers, clock_rows)
-    clock_meta = root / "01_middle/assembled/common/clock_inventory.meta"
-    write_json(
-        clock_meta,
+def prepare_upstreams_with_normal_exception(root):
+    T10.clean_dir(root)
+    T10.write_inputs(root)
+    source_sdc = root / "inputs" / "u_src.sdc"
+    source_sdc.write_text(
+        source_sdc.read_text(encoding="utf-8")
+        + "set_false_path -from [get_ports {normal_o}]\n",
+        encoding="utf-8",
+    )
+    initialized = T10.run_00(root)
+    require(initialized.returncode == 0, "00 exception fixture initialization failed")
+    T10.publish_upstream_artifacts(root)
+    first = T10.run_10(root)
+    require(first.returncode != 0, "stage 10 exception fixture first sync did not stop")
+    form = root / "10_middle" / "10_feedthrough.xlsx"
+    T10.approve_edges(
+        form,
         {
-            "author": "Howard",
-            "scenario": "common",
-            "run_completeness": "partial" if missing_dst else "complete",
-            "inventory_digest": sha(clock_csv),
-            "clock_count": 2,
-            "clock_set_digest": hashlib.sha256("soc_clk_a\nsoc_clk_c".encode("utf-8")).hexdigest(),
-            "final_sdc_path": str(final_clock_sdc),
-            "final_sdc_digest": sha(final_clock_sdc),
+            T10.edge_key(row): T10.approved("no_soc_budget_required")
+            for row in T10.inventory_rows(root)
         },
     )
-
-    relation_csv = root / "03_middle/relation_map/common.csv"
-    write_csv(
-        relation_csv,
-        ["schema_version", "scenario", "clock_a", "clock_b", "relation_type", "relation_source", "source_rule_ids", "clock_universe_digest", "assembled_view_digest"],
-        [{
-            "schema_version": "1", "scenario": "common", "clock_a": "soc_clk_a", "clock_b": "soc_clk_c",
-            "relation_type": "synchronous", "relation_source": "default_synchronous", "source_rule_ids": "",
-            "clock_universe_digest": hashlib.sha256("soc_clk_a\nsoc_clk_c".encode("utf-8")).hexdigest(),
-            "assembled_view_digest": "fixture_view",
-        }],
-    )
-    write_json(
-        root / "03_middle/relation_map/common.meta",
-        {
-            "author": "Howard",
-            "schema_version": "1",
-            "scenario": "common",
-            "run_completeness": "partial" if missing_dst else "complete",
-            "relation_map_digest": sha(relation_csv),
-            "inventory_digest": sha(clock_csv),
-            "inventory_meta_digest": sha(clock_meta),
-            "clock_universe_digest": hashlib.sha256("soc_clk_a\nsoc_clk_c".encode("utf-8")).hexdigest(),
-            "assembled_view_digest": "fixture_view",
-        },
-    )
-
-    ft_path = root / "10_middle/scenario/common/feedthrough_edge_inventory.csv"
-    if include_feedthrough_inventory:
-        write_csv(
-            ft_path,
-            ["schema_version", "scenario", "feedthrough_edge_id", "connection_id"],
-            [
-                {"schema_version": "1", "scenario": "common", "feedthrough_edge_id": "FTE_CONN_FT_IN", "connection_id": "CONN_FT_IN"},
-                {"schema_version": "1", "scenario": "common", "feedthrough_edge_id": "FTE_CONN_FT_OUT", "connection_id": "CONN_FT_OUT"},
-            ],
-        )
+    second = T10.run_10(root)
+    require(second.returncode == 0, "stage 10 exception fixture failed")
 
 
-def run_stage(root, mode=None, extra=None):
-    args = [
-        sys.executable,
-        str(SCRIPT),
-        "--run-root",
-        str(root),
-        "--scenario",
-        "common",
-    ]
-    if mode:
-        args.extend(["--mode", mode])
-    args.extend(extra or [])
-    return subprocess.run(
-        args,
-        cwd=str(BASE.parent),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-
-
-def run_legacy(root, extra=None):
-    args = [sys.executable, str(SCRIPT), "--scenario", "common"]
-    args.extend(extra or [])
-    return subprocess.run(
-        args,
-        cwd=str(root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-
-
-def read_rows(path):
+def read_csv(path):
     with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
         return list(csv.DictReader(file_obj))
 
 
-def executable_tcl_lines(path):
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+def read_json(path):
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def workbook_row(form, channel_id):
-    workbook = load_workbook(str(form))
+def report_text(root, stage="synth", corner="ss"):
+    suffix = "" if (stage, corner) == ("all", "all") else "_%s_%s" % (stage, corner)
+    path = root / "20_result" / "reports" / ("harden_x_if_check_report%s.txt" % suffix)
+    require(path.is_file(), "20 report missing: %s" % path)
+    return path.read_text(encoding="utf-8")
+
+
+def port_bytes(root):
+    return {
+        path.name: path.read_bytes()
+        for path in sorted((root / "inputs").glob("port_*.xlsx"))
+    }
+
+
+def used_state(root, sheet_name, direction, port_name):
+    return T10.used_state(root, sheet_name, direction, port_name)
+
+
+def inventory_rows(root):
+    return read_csv(root / "20_middle" / "channel_inventory.csv")
+
+
+def current_review_rows(form, stage="synth", corner="ss"):
+    workbook = load_workbook(str(form), data_only=False)
     sheet = workbook["interface_budget"]
     headers = {cell.value: cell.column for cell in sheet[1] if cell.value}
-    for row_idx in range(2, sheet.max_row + 1):
-        if sheet.cell(row_idx, headers["channel_id"]).value == channel_id:
-            return workbook, sheet, headers, row_idx
-    raise AssertionError("channel not found in workbook: " + channel_id)
+    rows = [
+        row_idx for row_idx in range(2, sheet.max_row + 1)
+        if str(sheet.cell(row_idx, headers["stage"]).value or "") == stage
+        and str(sheet.cell(row_idx, headers["corner"]).value or "") == corner
+    ]
+    return workbook, sheet, headers, rows
 
 
-def mutate_row(form, channel_id, updates):
-    workbook, sheet, headers, row_idx = workbook_row(form, channel_id)
-    for key, value in updates.items():
-        sheet.cell(row_idx, headers[key], value)
+def approve_20(form, updates, stage="synth", corner="ss"):
+    workbook, sheet, headers, rows = current_review_rows(form, stage, corner)
+    require(rows, "20 review workbook has no current-view rows")
+    for row_idx in rows:
+        for name, value in updates.items():
+            require(name in headers, "20 workbook missing review field %s" % name)
+            sheet.cell(row_idx, headers[name], value)
+        sheet.cell(
+            row_idx,
+            headers["approved_machine_digest"],
+            sheet.cell(row_idx, headers["machine_digest"]).value,
+        )
     workbook.save(str(form))
+    workbook.close()
 
 
-def test_default_audit(root):
-    build_target(root)
-    result = run_stage(root)
-    require(result.returncode == 0, "audit_only failed:\n%s\n%s" % (result.stdout, result.stderr))
-    require(result.stdout.count("Author: Howard") == 1, "author stdout count is not exactly one")
-
-    inventory = root / "20_middle/scenario/common/channel_inventory.csv"
-    rows = read_rows(inventory)
-    require({row["connection_id"] for row in rows} == {"CONN_NORMAL", "CONN_EXCEPTION"}, "20 ownership/filtering mismatch")
-    require(all(row["mode"] == "audit_only" for row in rows), "inventory mode mismatch")
-    require(all(row["owner_stage"] == "20" for row in rows), "20->30 owner_stage enum mismatch")
-    normal = next(row for row in rows if row["connection_id"] == "CONN_NORMAL")
-    exception = next(row for row in rows if row["connection_id"] == "CONN_EXCEPTION")
-    require(normal["channel_disposition"] == "no_soc_budget_required", "normal channel did not auto-close")
-    require(exception["channel_disposition"] == "route_to_30", "known exception did not route to 30")
-    require(exception["apply"] == "yes" and exception["review_status"] == "approved", "known exception route is not a formal 20 owner decision")
-    require("CONN_FT" not in inventory.read_text(encoding="utf-8"), "feedthrough direct edge leaked into 20")
-    require("CONN_CLOCK" not in inventory.read_text(encoding="utf-8"), "clock edge leaked into 20")
-    workbook = load_workbook(str(root / "20_middle/20_harden_x_if.xlsx"), data_only=True)
-    metadata = {workbook["run_metadata"].cell(row, 1).value: workbook["run_metadata"].cell(row, 2).value for row in range(2, workbook["run_metadata"].max_row + 1)}
-    require(metadata.get("author") == "Howard", "author missing from workbook metadata")
-    require(metadata.get("sdc_consumption") == "disabled", "workbook consumption metadata mismatch")
-    channel_sheet = workbook["channel_inventory"]
-    channel_headers = [cell.value for cell in channel_sheet[1]]
-    workbook_connections = {
-        channel_sheet.cell(row_idx, channel_headers.index("connection_id") + 1).value
-        for row_idx in range(2, channel_sheet.max_row + 1)
+def approved_budget(independent=""):
+    return {
+        "channel_disposition": "emit_budget",
+        "budget_required": "yes",
+        "budget_model": "manual_budget",
+        "converted_max": "1.2",
+        "max_source": "architecture_review",
+        "derivation_basis": "reviewed physical interconnect allocation",
+        "tool_surface": "sta",
+        "datapath_only": "yes",
+        "apply": "yes",
+        "emit_max": "yes",
+        "emit_min": "no",
+        "review_status": "approved",
+        "owner": "soc_timing_owner",
+        "reviewer": "soc_timing_reviewer",
+        "review_date": "2026-07-17",
+        "budget_basis": "approved normal interface interconnect budget",
+        "relationship_override_basis": "reviewed budget is valid without synchronous clock inference",
+        "sdc_independent_basis": independent,
     }
-    require(workbook_connections == {row["connection_id"] for row in rows}, "workbook/CSV resolved views differ")
-    inventory_meta = json.loads((root / "20_middle/scenario/common/channel_inventory.meta").read_text(encoding="utf-8"))
-    require(inventory_meta["scenario"] == "common", "inventory meta scenario mismatch")
-    require(inventory_meta["channel_inventory_digest"] == sha(inventory), "inventory meta digest mismatch")
-
-    sdc = root / "20_result/common/20_harden_x_if.sdc"
-    require(executable_tcl_lines(sdc) == [], "audit SDC contains executable Tcl")
-    require("Author: Howard" in sdc.read_text(encoding="utf-8"), "author missing from SDC")
-    report = root / "20_result/reports/harden_x_if_check_report_common.txt"
-    report_text = report.read_text(encoding="utf-8")
-    require("timing-command count: 0" in report_text, "audit report command count mismatch")
-    require("SDC consumption: disabled" in report_text, "audit report consumption mismatch")
-
-    require("data_o[0]" not in (root / "00_middle/scenario/common/pending/u_a.ports").read_text(encoding="utf-8"), "source direct bit not removed")
-    require("data_i[0]" not in (root / "00_middle/scenario/common/pending/u_c.ports").read_text(encoding="utf-8"), "destination direct bit not removed")
-    require("fti_0_path[0]" in (root / "00_middle/scenario/common/pending/u_b.ports").read_text(encoding="utf-8"), "feedthrough endpoint was removed by 20")
-    require("cfg_o" in (root / "00_middle/scenario/common/pending/u_a.ports").read_text(encoding="utf-8"), "route_to_30 endpoint was removed")
-
-    removed = root / "20_middle/scenario/common/removed_log/20_harden_x_if.removed"
-    before_pending = (root / "00_middle/scenario/common/pending/u_a.ports").read_bytes()
-    before_removed = removed.read_bytes()
-    write_text(root / "03_middle/relation_map/common.meta", "stale audit-only diagnostic\n")
-    rerun = run_stage(root)
-    require(rerun.returncode == 0, "audit idempotent rerun failed or incorrectly depended on 03")
-    require(before_pending == (root / "00_middle/scenario/common/pending/u_a.ports").read_bytes(), "pending changed on idempotent rerun")
-    require(before_removed == removed.read_bytes(), "removed log changed on idempotent rerun")
 
 
-def test_audit_emit_gates(base):
-    cases = [
-        ("disposition", {"channel_disposition": "emit_budget"}),
-        ("budget_required", {"budget_required": "yes"}),
-        ("emit_max", {"emit_max": "yes"}),
-        ("emit_min", {"emit_min": "yes"}),
+def run_lifecycle_contract():
+    root = WORK / "lifecycle"
+    prepare_upstreams(root)
+    before = port_bytes(root)
+    args = ("--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    first = run_20(root, *args)
+    require(first.returncode != 0, "first 20 sync did not require review publication")
+    require((root / "20_middle" / "20_harden_x_if.xlsx").is_file(), "review workbook missing")
+    require((root / "20_middle" / "channel_inventory.csv").is_file(), "review inventory missing")
+    require(port_bytes(root) == before, "review synchronization changed port workbooks")
+    require(not (root / "20_result" / "20_harden_x_if_synth_ss.sdc").exists(), "review sync wrote formal SDC")
+    require(not (root / "20_middle" / "port_accounting_delta.csv").exists(), "review sync wrote delta")
+
+    second = run_20(root, *args)
+    require(second.returncode == 0, "approved audit run failed:\n%s\n%s" % (second.stdout, second.stderr))
+    rows = inventory_rows(root)
+    require(len(rows) == 1, "normal inventory should contain exactly one non-clock/pad/feedthrough channel")
+    row = rows[0]
+    require(re.fullmatch(r"CONN_[0-9a-f]{64}", row["connection_id"]), "connection ID is not full SHA-256")
+    require(row["channel_id"] == "CH_" + row["connection_id"][5:], "channel ID does not share canonical hash")
+    require(row["src_port"] == "normal_o" and row["dst_port"] == "normal_i", "wrong normal channel classified")
+    require(row["channel_disposition"] == "no_soc_budget_required", "audit policy disposition missing")
+    sdc = (root / "20_result" / "20_harden_x_if_synth_ss.sdc").read_text(encoding="utf-8")
+    require("set_max_delay" not in sdc and "set_min_delay" not in sdc, "audit emitted timing command")
+    require(used_state(root, "u_src", "output", "normal_o") == "0", "source bit was not accounted")
+    require(used_state(root, "u_dst", "input", "normal_i") == "0", "destination bit was not accounted")
+    delta = read_csv(root / "20_middle" / "port_accounting_delta.csv")
+    require(delta and all(item["owner_object_id"] == row["channel_id"] for item in delta), "delta owner is not channel_id")
+    view_completion = read_json(root / "20_middle" / "completion" / "synth_ss.meta")
+    run_completion = read_json(root / "20_middle" / "stage_completion.meta")
+    require(view_completion["completion_status"] == "complete", "view completion is not complete")
+    require(run_completion["completion_status"] == "complete", "run-wide completion is not complete")
+    require("Mode: audit_only" in second.stdout, "stdout mode metadata missing")
+    require("accounting digest before" in report_text(root).lower(), "coverage/report digest metadata missing")
+
+    third = run_20(root, *args)
+    require(third.returncode == 0, "idempotent rerun failed")
+    require(used_state(root, "u_src", "output", "normal_o") == "0", "idempotent rerun changed source state")
+
+    protected_paths = [
+        root / "20_result" / "20_harden_x_if_synth_ss.sdc",
+        root / "20_middle" / "completion" / "synth_ss.meta",
+        root / "20_middle" / "stage_completion.meta",
+        root / "20_middle" / "20_harden_x_if.xlsx",
     ]
-    for name, updates in cases:
-        root = base / name
-        build_target(root)
-        initial = run_stage(root)
-        require(initial.returncode == 0, "initial audit failed for gate " + name)
-        form = root / "20_middle/20_harden_x_if.xlsx"
-        mutate_row(form, NORMAL_CHANNEL, updates)
-        sdc = root / "20_result/common/20_harden_x_if.sdc"
-        pending = root / "00_middle/scenario/common/pending/u_a.ports"
-        before_sdc = sdc.read_bytes()
-        before_pending = pending.read_bytes()
-        result = run_stage(root)
-        require(result.returncode != 0, "audit gate accepted " + name)
-        report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-        require("audit_only forbids emit intent" in report, "missing audit gate diagnostic for " + name)
-        require(before_sdc == sdc.read_bytes(), "failed audit overwrote formal SDC for " + name)
-        require(before_pending == pending.read_bytes(), "failed audit changed pending for " + name)
-
-
-def test_budget_output(root):
-    build_target(root)
-    first = run_stage(root, "budget_output")
-    require(first.returncode != 0, "first budget run should stop after workbook sync")
-    report_text = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("Errors  : 0" in report_text, "first budget run failed for reasons other than sync")
-    form = root / "20_middle/20_harden_x_if.xlsx"
-    mutate_row(
-        form,
-        NORMAL_CHANNEL,
-        {
-            "channel_disposition": "emit_budget",
-            "budget_required": "yes",
-            "budget_model": "interconnect_budget",
-            "converted_max": "",
-            "max_source": "",
-            "derivation_basis": "",
-            "tool_surface": "sta",
-            "datapath_only": "yes",
-            "budget_basis": "interconnect budget approved by both block owners",
-            "apply": "yes",
-            "emit_max": "yes",
-            "emit_min": "no",
-            "review_status": "approved",
-        },
+    protected_before = {str(path): path.read_bytes() for path in protected_paths}
+    undeclared = run_20(
+        root, "--mode", "audit_only", "--stage", "postcts", "--corner", "ff_0"
     )
-    second = run_stage(root, "budget_output")
-    require(second.returncode == 0, "approved budget run failed:\n%s\n%s" % (second.stdout, second.stderr))
-    sdc = root / "20_result/common/20_harden_x_if.sdc"
-    commands = executable_tcl_lines(sdc)
-    require(commands == ["set_max_delay 1.5 -datapath_only -from [get_pins {u_a/data_o[0]}] -to [get_pins {u_c/data_i[0]}]"], "budget output command mismatch: %r" % commands)
-    require("CONN_FT" not in sdc.read_text(encoding="utf-8"), "budget output contains feedthrough command")
-
-
-def test_view_specific_budget(root):
-    build_target(root)
-    view = ["--stage", "prects", "--corner", "ss_125"]
-    first = run_stage(root, "budget_output", view)
-    require(first.returncode != 0, "view-specific first run should sync workbook")
-    form = root / "20_middle/20_harden_x_if.xlsx"
-    _, sheet, headers, row_idx = workbook_row(form, NORMAL_CHANNEL)
-    require(sheet.cell(row_idx, headers["stage"]).value == "prects", "view-specific stage was not seeded")
-    require(sheet.cell(row_idx, headers["corner"]).value == "ss_125", "view-specific corner was not seeded")
-    mutate_row(
-        form,
-        NORMAL_CHANNEL,
-        {
-            "channel_disposition": "emit_budget",
-            "budget_required": "yes",
-            "budget_model": "manual_budget",
-            "converted_max": "1.0",
-            "tool_surface": "sta",
-            "datapath_only": "yes",
-            "budget_basis": "view-specific manual interconnect budget",
-            "derivation_basis": "architecture review",
-            "apply": "yes",
-            "emit_max": "yes",
-            "emit_min": "no",
-            "review_status": "approved",
-        },
+    require(undeclared.returncode != 0, "undeclared formal 20 view was accepted")
+    protected_after = {str(path): path.read_bytes() for path in protected_paths}
+    require(
+        protected_before == protected_after,
+        "undeclared 20 view changed a completed required view or run-wide completion",
     )
-    second = run_stage(root, "budget_output", view)
-    require(second.returncode == 0, "view-specific approved run failed")
-    output = root / "20_result/common/20_harden_x_if_prects_ss_125.sdc"
-    require(len(executable_tcl_lines(output)) == 1, "view-specific SDC command missing")
-    audit = run_stage(root)
-    require(audit.returncode == 0, "all/all audit after view-specific budget failed")
-    workbook = load_workbook(str(form), data_only=True)
-    sheet = workbook["interface_budget"]
+    require(
+        not (root / "20_middle" / "completion" / "postcts_ff_0.meta").exists(),
+        "undeclared 20 view wrote a per-view completion",
+    )
+
+
+def run_budget_contract():
+    root = WORK / "budget"
+    prepare_upstreams(root)
+    args = ("--mode", "budget_output", "--stage", "synth", "--corner", "ss")
+    first = run_20(root, *args)
+    require(first.returncode != 0, "budget first sync did not stop")
+    form = root / "20_middle" / "20_harden_x_if.xlsx"
+    unreviewed = run_20(root, *args)
+    require(unreviewed.returncode != 0, "pending budget review was published as complete")
+    require(
+        not (root / "20_result" / "20_harden_x_if_synth_ss.sdc").exists(),
+        "pending budget review wrote formal SDC",
+    )
+    require(
+        not (root / "20_middle" / "port_accounting_delta.csv").exists(),
+        "pending budget review wrote accounting delta",
+    )
+    approve_20(form, approved_budget())
+    second = run_20(root, *args)
+    require(second.returncode == 0, "approved budget failed:\n%s\n%s" % (second.stdout, second.stderr))
+    output = root / "20_result" / "20_harden_x_if_synth_ss.sdc"
+    commands = [line for line in output.read_text(encoding="utf-8").splitlines() if line.startswith("set_")]
+    require(len(commands) == 1, "budget output command count mismatch: %s" % commands)
+    require("u_src/normal_o" in commands[0] and "u_dst/normal_i" in commands[0], "budget command endpoints are wrong")
+    require("-datapath_only" in commands[0], "datapath strategy was lost")
+
+    stale = load_workbook(str(form), data_only=False)
+    sheet = stale["interface_budget"]
     headers = {cell.value: cell.column for cell in sheet[1] if cell.value}
-    views = {
-        (sheet.cell(row_idx, headers["stage"]).value, sheet.cell(row_idx, headers["corner"]).value)
-        for row_idx in range(2, sheet.max_row + 1)
-        if sheet.cell(row_idx, headers["channel_id"]).value == NORMAL_CHANNEL
-    }
-    require({("all", "all"), ("prects", "ss_125")}.issubset(views), "cross-view workbook rows were deleted")
+    sheet.cell(2, headers["approved_machine_digest"], "0" * 64)
+    stale.save(str(form))
+    stale.close()
+    before = port_bytes(root)
+    blocked = run_20(root, *args)
+    require(blocked.returncode != 0, "stale approved machine digest was accepted")
+    require(port_bytes(root) == before, "failed review validation changed accounting")
 
 
-def test_stale_budget_review(root):
-    build_target(root)
-    first = run_stage(root, "budget_output")
-    require(first.returncode != 0, "stale-review fixture did not create workbook")
-    form = root / "20_middle/20_harden_x_if.xlsx"
-    mutate_row(
-        form,
-        NORMAL_CHANNEL,
-        {
-            "channel_disposition": "emit_budget",
-            "budget_required": "yes",
-            "budget_model": "manual_budget",
-            "converted_max": "1.0",
-            "tool_surface": "sta",
-            "datapath_only": "yes",
-            "budget_basis": "manual interconnect budget",
-            "derivation_basis": "architecture review",
-            "apply": "yes",
-            "emit_max": "yes",
-            "emit_min": "no",
-            "review_status": "approved",
-        },
+def run_cli_diagnostic_contract():
+    missing = T10.run_script(EX20, [], BASE)
+    require(missing.returncode != 0, "20 accepted invocation without --run-root")
+    root = WORK / "cli"
+    prepare_upstreams(root)
+    obsolete = run_20(root, "--scenario", "common")
+    require(obsolete.returncode != 0, "20 accepted obsolete --scenario")
+    before = port_bytes(root)
+    diagnostic = run_20(
+        root, "--mode", "audit_only", "--stage", "postroute",
+        "--corner", "ff", "--diagnose-only",
     )
-    source = root / "inputs/u_a.sdc"
-    write_text(source, source.read_text(encoding="utf-8").replace("-max 2.0", "-max 2.2", 1))
-    pending = root / "00_middle/scenario/common/pending/u_a.ports"
-    before = pending.read_bytes()
-    result = run_stage(root, "budget_output")
-    require(result.returncode != 0, "changed SDC retained stale budget approval")
-    _, sheet, headers, row_idx = workbook_row(form, NORMAL_CHANNEL)
-    require(sheet.cell(row_idx, headers["review_status"]).value == "pending", "material change did not reset review")
-    require(sheet.cell(row_idx, headers["emit_max"]).value == "no", "material change did not disable emit")
-    require(before == pending.read_bytes(), "stale review failure changed pending")
-    require(not (root / "20_result/common/20_harden_x_if.sdc").exists(), "stale review wrote formal SDC")
+    require(diagnostic.returncode == 0, "non-required diagnostic run failed")
+    require(port_bytes(root) == before, "diagnostic mode changed workbooks")
+    require(not (root / "20_result" / "20_harden_x_if_postroute_ff.sdc").exists(), "diagnostic wrote formal SDC")
+    text = report_text(root, "postroute", "ff").lower()
+    require("port accounting: diagnostic/read-only" in text, "diagnostic accounting metadata missing")
+    require("accounting closure: not evaluated" in text, "diagnostic closure metadata missing")
 
 
-def test_async_relation_gate(root):
-    build_target(root)
-    first = run_stage(root, "budget_output")
-    require(first.returncode != 0, "async fixture did not create workbook")
-    form = root / "20_middle/20_harden_x_if.xlsx"
-    mutate_row(
-        form,
-        NORMAL_CHANNEL,
-        {
-            "channel_disposition": "emit_budget",
-            "budget_required": "yes",
-            "budget_model": "manual_budget",
-            "converted_max": "1.0",
-            "tool_surface": "sta",
-            "datapath_only": "yes",
-            "budget_basis": "manual interconnect budget",
-            "derivation_basis": "architecture review",
-            "apply": "yes",
-            "emit_max": "yes",
-            "emit_min": "no",
-            "review_status": "approved",
-        },
+def run_upstream_and_lock_contract():
+    root = WORK / "stale_10"
+    prepare_upstreams(root)
+    completion_path = root / "10_middle" / "stage_completion.meta"
+    payload = read_json(completion_path)
+    payload["accounting_digest_after"] = "0" * 64
+    completion_path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    blocked = run_20(root, "--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(blocked.returncode != 0, "stale 10 completion was accepted")
+    require(not (root / "20_result" / "20_harden_x_if_synth_ss.sdc").exists(), "stale upstream wrote SDC")
+
+    lock_root = WORK / "lock"
+    prepare_upstreams(lock_root)
+    lock = lock_root / "inputs" / ".port_accounting.lock"
+    lock.write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname(), "stage": "test"}) + "\n", encoding="utf-8")
+    locked = run_20(lock_root, "--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(locked.returncode != 0, "active accounting lock was ignored")
+    lock.unlink()
+
+    final_root = WORK / "final_token"
+    prepare_upstreams(final_root)
+    T10.set_used_state(final_root, "u_src", "output", "normal_o", "ALL USED")
+    final = run_20(final_root, "--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(final.returncode != 0, "20 accepted final accounting token")
+
+
+def run_partial_sdc_contract():
+    root = WORK / "partial"
+    prepare_upstreams(root, missing_sdcs={"u_dst"})
+    audit_args = ("--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(run_20(root, *audit_args).returncode != 0, "partial audit first sync did not stop")
+    allowed = run_20(root, *audit_args)
+    require(allowed.returncode == 0, "SDC-independent audit policy failed")
+    rows = inventory_rows(root)
+    require(rows[0]["evidence_status"] == "incomplete_missing_sdc", "partial evidence status missing")
+    require(rows[0]["sdc_independent_basis"], "audit independent basis missing")
+
+    strict_root = WORK / "partial_strict"
+    prepare_upstreams(strict_root, missing_sdcs={"u_dst"})
+    strict = run_20(
+        strict_root, "--mode", "budget_output", "--stage", "synth",
+        "--corner", "ss", "--require-complete-harden-sdc",
     )
-    relation = root / "03_middle/relation_map/common.csv"
-    rows = read_rows(relation)
-    headers = list(rows[0].keys())
-    rows[0]["relation_type"] = "asynchronous"
-    write_csv(relation, headers, rows)
-    meta_path = root / "03_middle/relation_map/common.meta"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["relation_map_digest"] = sha(relation)
-    write_json(meta_path, meta)
-    result = run_stage(root, "budget_output")
-    require(result.returncode != 0, "asynchronous relation allowed normal 20 budget")
-    report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("clock_relation=asynchronous blocks normal 20 budget" in report, "async relation diagnostic missing")
-    require(not (root / "20_result/common/20_harden_x_if.sdc").exists(), "async relation wrote formal SDC")
+    require(strict.returncode != 0, "strict missing-SDC run was accepted")
+    require(not (strict_root / "20_result" / "20_harden_x_if_synth_ss.sdc").exists(), "strict failure wrote SDC")
 
 
-def test_partial_and_strict(base):
-    partial = base / "partial"
-    build_target(partial, missing_dst=True)
-    result = run_stage(partial)
-    require(result.returncode == 0, "partial audit failed")
-    normal = next(row for row in read_rows(partial / "20_middle/scenario/common/channel_inventory.csv") if row["connection_id"] == "CONN_NORMAL")
-    require(normal["run_completeness"] == "partial", "partial completeness missing")
-    require(normal["dst_sdc_status"] == "missing", "missing destination status lost")
-    require(normal["evidence_status"] == "incomplete_missing_sdc", "missing evidence status lost")
-    require(normal["sdc_independent_basis"] == "project_pr_adjacent_policy_independent_of_block_sdc_v1", "SDC-independent policy missing")
-    report = (partial / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("incomplete exception evidence rows" in report, "partial exception coverage not reported")
-
-    strict = base / "strict"
-    build_target(strict, missing_dst=True)
-    pending = strict / "00_middle/scenario/common/pending/u_a.ports"
-    before = pending.read_bytes()
-    result = run_stage(strict, extra=["--require-complete-harden-sdc"])
-    require(result.returncode != 0, "strict missing SDC gate did not fail")
-    require(before == pending.read_bytes(), "strict failure changed pending")
-    strict_report = (strict / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("HARDEN_SDC_COMPLETENESS_REQUIRED" in strict_report, "strict diagnostic missing")
-    require(not (strict / "20_result/common/20_harden_x_if.sdc").exists(), "strict failure wrote formal SDC")
+def run_exception_route_contract():
+    root = WORK / "route_to_30"
+    prepare_upstreams_with_normal_exception(root)
+    args = ("--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(run_20(root, *args).returncode != 0, "exception route first sync did not stop")
+    rows = inventory_rows(root)
+    require(len(rows) == 1, "exception route normal channel missing")
+    require(rows[0]["channel_disposition"] == "route_to_30", "known exception was not routed to 30")
+    require(rows[0]["review_status"] == "approved", "automatic exception evidence was not reviewed")
+    second = run_20(root, *args)
+    require(second.returncode == 0, "approved route_to_30 run failed")
+    require(used_state(root, "u_src", "output", "normal_o") == "", "route_to_30 source was incorrectly accounted by 20")
+    require(used_state(root, "u_dst", "input", "normal_i") == "", "route_to_30 destination was incorrectly accounted by 20")
 
 
-def test_missing_10_inventory(root):
-    build_target(root, include_feedthrough_inventory=False)
-    before = (root / "00_middle/scenario/common/pending/u_a.ports").read_bytes()
-    result = run_stage(root)
-    require(result.returncode != 0, "missing 10 inventory did not block")
-    require(before == (root / "00_middle/scenario/common/pending/u_a.ports").read_bytes(), "missing 10 failure changed pending")
-    report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("feedthrough edge inventory not found" in report, "missing 10 diagnostic absent")
-
-
-def test_no_update_pending(root):
-    build_target(root, create_pending=False)
-    result = run_stage(root, extra=["--no-update-pending"])
-    require(result.returncode == 0, "--no-update-pending diagnostic run failed")
-    report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("Port accounting: disabled by explicit option" in report, "disabled accounting missing from report")
-    sdc = (root / "20_result/common/20_harden_x_if.sdc").read_text(encoding="utf-8")
-    require("Port accounting: disabled by explicit option" in sdc, "disabled accounting missing from SDC header")
-
-
-def test_noncanonical_edge(root):
-    build_target(root)
-    path = root / "00_middle/connection_inventory.csv"
-    rows = read_rows(path)
-    headers = list(rows[0].keys())
-    for row in rows:
-        if row["connection_id"] == "CONN_NORMAL":
-            row["src_port"] = "data_o[1:0]"
-            row["src_bit_index"] = ""
-            row["src_endpoint_key"] = "u_a:output:data_o[1:0]"
-            row["src_soc_object"] = "u_a/data_o[1:0]"
-    write_csv(path, headers, rows)
-    result = run_stage(root)
-    require(result.returncode != 0, "noncanonical range edge did not block")
-    report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("not a canonical scalar/bit key" in report, "noncanonical diagnostic missing")
-
-
-def test_unbalanced_tcl_blocks_accounting(root):
-    build_target(root)
-    source = root / "inputs/u_a.sdc"
-    write_text(source, source.read_text(encoding="utf-8") + "set_false_path -from [get_ports {data_o[0]}\n")
-    pending = root / "00_middle/scenario/common/pending/u_a.ports"
-    before = pending.read_bytes()
-    result = run_stage(root)
-    require(result.returncode != 0, "unbalanced Tcl did not block audit")
-    require(before == pending.read_bytes(), "unbalanced Tcl changed pending")
-    report = (root / "20_result/reports/harden_x_if_check_report_common.txt").read_text(encoding="utf-8")
-    require("unbalanced Tcl brace/bracket/quote" in report, "unbalanced Tcl diagnostic missing")
-    require(not (root / "20_result/common/20_harden_x_if.sdc").exists(), "unbalanced Tcl wrote formal SDC")
-
-
-def test_delay_value_parser():
-    spec = importlib.util.spec_from_file_location("stage20_parser", str(SCRIPT))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    cases = [
-        ("set_input_delay 0.2 -min -clock [get_clocks {clk}] [get_ports {data}]", ("0.2", "", "")),
-        ("set_output_delay -0.2 -min -clock [get_clocks {clk}] [get_ports {data}]", ("-0.2", "", "")),
-        ("set_input_delay -max 1.5 -min -0.1 -clock [get_clocks {clk}] [get_ports {data}]", ("-0.1", "1.5", "")),
-        ("set_input_delay 0.4 -clock [get_clocks {clk}] [get_ports {data}]", ("0.4", "0.4", "")),
-    ]
-    for command, expected in cases:
-        actual = module.parse_delay_values(module.tokenize_tcl_words(command))
-        require(actual == expected, "delay parser mismatch for %s: %r" % (command, actual))
-    for value in ("abc", "nan", "inf", "-inf"):
-        require(module.parse_number(value) is None, "non-finite/non-numeric value accepted: " + value)
-
-
-def test_legacy_layout(root):
-    build_target(root)
-    legacy_00 = root / "00_harden_port_inventory"
-    legacy_00.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(root / "00_middle/connection_inventory.csv"), str(legacy_00 / "connection_inventory.csv"))
-    shutil.copytree(str(root / "00_middle/scenario/common/pending"), str(legacy_00 / "pending"))
-    for name in ("u_a.sdc", "u_b.sdc", "u_c.sdc"):
-        shutil.copy2(str(root / "inputs" / name), str(root / name))
-    shutil.copy2(str(root / "01_middle/assembled/common/clock_inventory.csv"), str(root / "clock_inventory.csv"))
-    shutil.copy2(str(root / "10_middle/scenario/common/feedthrough_edge_inventory.csv"), str(root / "feedthrough_edge_inventory.csv"))
-    for name in ("00_middle", "01_middle", "01_result", "03_middle", "10_middle"):
-        shutil.rmtree(str(root / name))
-    result = run_legacy(root)
-    require(result.returncode == 0, "legacy compatibility run failed:\n%s\n%s" % (result.stdout, result.stderr))
-    require(executable_tcl_lines(root / "common/20_harden_x_if.sdc") == [], "legacy audit SDC contains Tcl")
-    require((root / "channel_inventory.csv").is_file(), "legacy machine inventory missing")
-    require(not (root / "20_middle").exists(), "legacy run mixed target 20_middle state")
-
-
-def test_scenario_required(root):
-    root.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--run-root", str(root)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
+def run_runwide_audit_contract():
+    root = WORK / "runwide_audit"
+    prepare_upstreams(root, require_20=False)
+    args = ("--mode", "audit_only")
+    first = run_20(root, *args)
+    require(first.returncode != 0, "run-wide audit first sync did not stop")
+    second = run_20(root, *args)
+    require(second.returncode == 0, "run-wide audit completion failed")
+    require((root / "20_middle" / "channel_inventory.csv").is_file(), "run-wide inventory missing")
+    require((root / "20_middle" / "port_accounting_delta.csv").is_file(), "run-wide accounting delta missing")
+    require(
+        read_json(root / "20_middle" / "stage_completion.meta")["completion_status"] == "complete",
+        "run-wide audit completion is not complete",
     )
-    require(result.returncode == 2, "missing --scenario did not fail CLI parsing")
-    require("--scenario" in result.stderr and "required" in result.stderr, "missing scenario diagnostic absent")
+    require(
+        not (root / "20_result" / "20_harden_x_if.sdc").exists(),
+        "run with no require_20=yes view wrote a formal SDC",
+    )
+    require(
+        not (root / "20_middle" / "completion" / "all_all.meta").exists(),
+        "run with no require_20=yes view wrote a view completion",
+    )
+    invalid_view = run_20(root, "--mode", "audit_only", "--stage", "synth", "--corner", "ss")
+    require(invalid_view.returncode != 0, "non-diagnostic view was accepted without require_20=yes")
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="soc_sdc_20_regression.") as tmp:
-        base = Path(tmp)
-        test_default_audit(base / "audit")
-        test_audit_emit_gates(base / "gates")
-        test_budget_output(base / "budget")
-        test_view_specific_budget(base / "view_budget")
-        test_stale_budget_review(base / "stale_review")
-        test_async_relation_gate(base / "async_relation")
-        test_partial_and_strict(base / "missing")
-        test_missing_10_inventory(base / "missing_10")
-        test_no_update_pending(base / "no_accounting")
-        test_noncanonical_edge(base / "noncanonical")
-        test_unbalanced_tcl_blocks_accounting(base / "unbalanced_tcl")
-        test_delay_value_parser()
-        test_legacy_layout(base / "legacy")
-        test_scenario_required(base / "scenario_required")
-    print("20_harden_x_if target regression passed")
+    if WORK.exists():
+        shutil.rmtree(str(WORK))
+    WORK.mkdir(parents=True)
+    run_lifecycle_contract()
+    run_budget_contract()
+    run_cli_diagnostic_contract()
+    run_upstream_and_lock_contract()
+    run_partial_sdc_contract()
+    run_exception_route_contract()
+    run_runwide_audit_contract()
+    print("20 harden-x-if latest-runtime regression: PASS")
+    print("  cases: lifecycle, budget, cli_diagnostic, upstream_lock, partial_sdc, route_to_30, runwide_audit")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
