@@ -28,7 +28,7 @@ except ImportError as exc:  # pragma: no cover - deployment guard
 
 
 SCRIPT_NAME = "00_harden_port_inventory.py"
-SCRIPT_VERSION = "2.0.0"
+SCRIPT_VERSION = "2.0.1"
 STAGE_NAME = "00_harden_port_inventory"
 SCHEMA_VERSION = "1.0"
 REQUIRED_PORT_COLUMNS = (
@@ -93,6 +93,9 @@ FINAL_USED_RE = re.compile(r"^(?:ALL\s+USED|USED:.*;\s*UNUSED:.*)$", re.IGNORECA
 STRUCTURAL_NC = {"NC", "N/C", "NO_CONNECT", "UNCONNECTED"}
 STRUCTURAL_OPEN = {"OPEN"}
 STRUCTURAL_TIE = {"TIE0", "TIE1"}
+STRUCTURAL_PARSE_NONE = "not_structural"
+STRUCTURAL_PARSE_VALID = "valid_structural"
+STRUCTURAL_PARSE_INVALID = "invalid_structural"
 YES_NO = {"yes", "no"}
 STAGE_DELTA_DIRS = ("00_middle", "01_middle", "04_middle", "10_middle", "20_middle", "30_middle")
 
@@ -217,6 +220,7 @@ class PortRecord:
         self.used_value = used_value
         self.used_bits = set()
         self.added_bits = set()
+        self.structural_status = STRUCTURAL_PARSE_NONE
         self.structural_reason = ""
         self.modified = False
 
@@ -695,6 +699,31 @@ def read_port_workbooks(paths, run_root, instances, resume, report):
     return models, records
 
 
+def parse_structural_token(value, shape):
+    text = clean_cell(value)
+    upper = text.upper().replace(" ", "")
+    if upper in STRUCTURAL_NC:
+        return STRUCTURAL_PARSE_VALID, "structural_nc", ""
+    if upper in STRUCTURAL_OPEN:
+        return STRUCTURAL_PARSE_VALID, "structural_open", ""
+    if upper in STRUCTURAL_TIE:
+        return STRUCTURAL_PARSE_VALID, "structural_tie_off", ""
+    literal = VERILOG_LITERAL_RE.fullmatch(text.replace(" ", ""))
+    if literal:
+        literal_width = int(literal.group("width")) if literal.group("width") else None
+        if literal_width is not None and literal_width != shape.count:
+            return (
+                STRUCTURAL_PARSE_INVALID,
+                "",
+                "sized Verilog literal width %d does not match port width %d"
+                % (literal_width, shape.count),
+            )
+        return STRUCTURAL_PARSE_VALID, "structural_tie_off", ""
+    if re.fullmatch(r"\d+", text):
+        return STRUCTURAL_PARSE_VALID, "structural_tie_off", ""
+    return STRUCTURAL_PARSE_NONE, "", ""
+
+
 def structural_reason(value, shape, location, report):
     text = clean_cell(value)
     upper = text.upper().replace(" ", "")
@@ -747,9 +776,15 @@ def validate_connections(records, instances, report):
 
     for record in records:
         connection = clean_cell(record.connection_value)
-        if not connection:
+        status, reason, diagnostic = parse_structural_token(connection, record.shape)
+        record.structural_status = status
+        record.structural_reason = reason
+        if status == STRUCTURAL_PARSE_INVALID:
+            report.error("%s: %s" % (record.location(), diagnostic))
             continue
-        if structural_reason(connection, record.shape, record.location(), report):
+        if status == STRUCTURAL_PARSE_VALID:
+            continue
+        if not connection:
             continue
         if record.direction == "output":
             if connection.lower() in ("y", "yes", "true"):
@@ -855,12 +890,11 @@ def structural_id(record, bit, reason):
 def apply_structural_defaults(records, report):
     terminals = []
     for record in records:
-        reason = structural_reason(record.connection_value, record.shape, record.location(), report)
-        if not reason:
+        if record.structural_status != STRUCTURAL_PARSE_VALID:
             continue
+        reason = record.structural_reason
         legal = set(record.shape.bits())
         added = legal - record.used_bits
-        record.structural_reason = reason
         record.added_bits = added
         record.used_bits |= legal
         if added:
