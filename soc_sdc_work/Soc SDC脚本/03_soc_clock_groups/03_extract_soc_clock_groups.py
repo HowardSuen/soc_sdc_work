@@ -107,7 +107,7 @@ RELATION_TYPE_ALIASES = {
     "physically_exclusive": "physically_exclusive",
     "physically exclusive": "physically_exclusive",
 }
-ANALYSIS_STYLES = {"", "normal", "merged_exclusive", "per_scenario_case"}
+ANALYSIS_STYLES = {"", "normal", "merged_exclusive", "per_scenario_case", "per_run_case"}
 APPLY_VALUES = {"yes", "no"}
 REVIEW_STATUS_VALUES = {"draft", "reviewed", "approved", "rejected"}
 YES_NO = {"", "yes", "no"}
@@ -124,6 +124,8 @@ CANDIDATE_SHEET = "clock_group_candidates"
 
 SCHEMA_VERSION = "1"
 DOMAIN_MEMBERSHIP_TYPES = {"seed", "explicit_member", "exclude_descendant"}
+TARGET_SYNC_VALUES = {"", "OK", "NEW_FROM_01", "STALE_NOT_IN_01", "BLOCKED_BY_MISSING_SDC"}
+TARGET_ANALYSIS_STYLES = {"", "normal", "merged_exclusive", "per_run_case"}
 
 BASE_RULE_HEADERS = [
     "scenario",
@@ -142,6 +144,43 @@ DOMAIN_HEADERS = [
     "owner",
     "basis",
     "note",
+]
+TARGET_DOMAIN_HEADERS = [
+    "domain_id",
+    "clock_name",
+    "membership_type",
+    "root_clock",
+    "include_descendants",
+    "source_instance",
+    "apply",
+    "review_status",
+    "owner",
+    "basis",
+    "note",
+    "sync_status",
+    "clock_kind",
+    "root_source",
+    "source_inventory_digest",
+]
+TARGET_RULE_HEADERS = [
+    "group_id",
+    "relation_type",
+] + [
+    value
+    for idx in range(1, DEFAULT_GROUP_COLUMNS + 1)
+    for value in (f"group_{idx}_domains", f"group_{idx}_clocks")
+] + [
+    "exclude_descendant_clocks",
+    "analysis_style",
+    "apply",
+    "review_status",
+    "owner",
+    "basis",
+    "note",
+]
+TARGET_CANDIDATE_HEADERS = [
+    "candidate_id", "candidate_type", "clock_a", "clock_b", "tree_root_a",
+    "tree_root_b", "reason", "evidence", "recommended_action", "decision", "note",
 ]
 TRAILING_RULE_HEADERS = [
     "exclude_descendant_clocks",
@@ -175,6 +214,7 @@ SUBTITLE_FILL = PatternFill("solid", fgColor="EAF3F6")
 WARNING_FILL = PatternFill("solid", fgColor="FFF2CC")
 ERROR_FILL = PatternFill("solid", fgColor="F4CCCC")
 BLOCKED_FILL = PatternFill("solid", fgColor="FCE5CD")
+NEW_FILL = PatternFill("solid", fgColor="D9EAF7")
 THIN_BORDER = Border(
     left=Side(style="thin", color="B8C6CC"),
     right=Side(style="thin", color="B8C6CC"),
@@ -222,6 +262,20 @@ class InventoryContext:
     final_sdc_digest: str = ""
     inventory_digest: str = ""
     clock_universe_digest: str = ""
+    run_id: str = ""
+    mode_label: str = ""
+    design_revision: str = ""
+    structure_digest: str = ""
+    completion_path: Optional[Path] = None
+    completion_digest: str = ""
+
+
+@dataclass
+class TargetRunContext:
+    run_id: str
+    mode_label: str
+    design_revision: str = ""
+    note: str = ""
 
 
 @dataclass
@@ -1052,7 +1106,7 @@ def read_domain_rows(ws) -> List[DomainMemberRow]:
 
 def validate_and_build_domains(
     rows: Sequence[DomainMemberRow],
-    scenario: str,
+    scenario: Optional[str],
     inventory_context: InventoryContext,
     report: Report,
 ) -> Dict[str, ClockDomain]:
@@ -1106,7 +1160,16 @@ def validate_and_build_domains(
     domains: Dict[str, ClockDomain] = {}
     include_rows: Dict[str, List[DomainMemberRow]] = defaultdict(list)
     exclude_rows: Dict[str, List[DomainMemberRow]] = defaultdict(list)
+    membership_rows_by_clock: Dict[str, int] = {}
     for row in active_rows:
+        previous_row = membership_rows_by_clock.get(row.clock_name)
+        if previous_row is not None:
+            report.error(
+                f"{DOMAIN_SHEET} duplicate active membership for clock {row.clock_name} "
+                f"at rows {previous_row} and {row.row_idx}"
+            )
+        else:
+            membership_rows_by_clock[row.clock_name] = row.row_idx
         domain = domains.setdefault(row.domain_id, ClockDomain(domain_id=row.domain_id))
         domain.source_rows.append(row.row_idx)
         if row.clock_name not in active_clock_names:
@@ -1160,7 +1223,7 @@ def validate_and_build_domains(
             previous = clock_to_domain.get(clock_name)
             if previous and previous != domain_id:
                 report.error(
-                    f"clock {clock_name} belongs to multiple active domains in assembled scenario: "
+                    f"clock {clock_name} belongs to multiple active domains in the assembled run: "
                     f"{previous}, {domain_id}"
                 )
             clock_to_domain[clock_name] = domain_id
@@ -1196,7 +1259,7 @@ def output_rules(rows: Sequence[ParsedRule], scenario: str) -> List[ParsedRule]:
 
 def validate_and_expand_rules(
     rows: Sequence[ParsedRule],
-    scenario: str,
+    scenario: Optional[str],
     inventory: Inventory,
     domains: Dict[str, ClockDomain],
     report: Report,
@@ -1248,6 +1311,11 @@ def validate_and_expand_rules(
             report.error(f"clock_group_rules row {rule.row_idx} {rule.group_id}: common rule basis is required")
         if len(rule.explicit_groups) < 2:
             report.error(f"clock_group_rules row {rule.row_idx} {rule.group_id}: at least two non-empty groups required")
+        if rule.analysis_style == "per_run_case":
+            report.error(
+                f"clock_group_rules row {rule.row_idx} {rule.group_id}: "
+                "analysis_style=per_run_case records a pre-setup case selection and must not apply=yes"
+            )
         if rule.relation_type == "asynchronous" and rule.cdc_required != "yes":
             report.warn(
                 f"clock_group_rules row {rule.row_idx} {rule.group_id}: asynchronous rule should set cdc_required=yes"
@@ -1267,7 +1335,7 @@ def validate_and_expand_rules(
             if rule.analysis_style == "per_scenario_case":
                 report.error(
                     f"clock_group_rules row {rule.row_idx} {rule.group_id}: "
-                    "logically_exclusive with analysis_style=per_scenario_case must not apply=yes"
+                    f"logically_exclusive with analysis_style={rule.analysis_style} must not apply=yes"
                 )
             if rule.analysis_style == "merged_exclusive" and not basis_says_no_single_leg_case(rule.basis):
                 report.error(
@@ -1810,8 +1878,10 @@ def write_coverage_report(
     relation_pairs: Dict[Tuple[str, str], List[PairOccurrence]],
     participation: Dict[str, List[str]],
     domains: Dict[str, ClockDomain],
-    scenario: str,
+    scenario: Optional[str],
     assembled_view_digest: str,
+    complete_rows: Optional[Sequence[Dict[str, object]]] = None,
+    stale_invalid_rows: Optional[Sequence[Dict[str, object]]] = None,
 ) -> None:
     inventory = inventory_context.inventory
     wb = Workbook()
@@ -1851,14 +1921,129 @@ def write_coverage_report(
     set_widths(ws, [28, 24, 28, 32, 32, 18, 12, 70])
     ensure_table(ws, "ClockParticipation", f"A4:H{max(row_idx - 1, 5)}")
 
-    write_pair_relation_sheet(wb, relation_pairs)
-    write_uncovered_pairs_sheet(wb, inventory, relation_pairs)
+    if complete_rows is None:
+        write_pair_relation_sheet(wb, relation_pairs)
+    else:
+        write_explicit_relation_coverage_sheet(wb, relation_pairs)
+        write_complete_pair_relation_sheet(wb, complete_rows)
+    incomplete_review = bool(
+        complete_rows is not None
+        and any(clean_cell(row.get("relation_type")) == "unknown" for row in complete_rows)
+    )
+    write_uncovered_pairs_sheet(wb, inventory, relation_pairs, incomplete_review)
     write_root_pair_summary_sheet(wb, inventory, relation_pairs)
-    write_rule_effective_groups_sheet(wb, rules)
+    write_rule_effective_groups_sheet(wb, rules, include_scenario=complete_rows is None)
     write_domain_membership_sheet(wb, domains)
     write_coverage_metadata_sheet(wb, inventory_context, scenario, assembled_view_digest)
+    if complete_rows is not None:
+        write_relation_subset_sheet(
+            wb,
+            "default_synchronous_pairs",
+            complete_rows,
+            lambda row: clean_cell(row.get("relation_type")) == "synchronous",
+        )
+        write_relation_subset_sheet(
+            wb,
+            "unknown_incomplete_pairs",
+            complete_rows,
+            lambda row: clean_cell(row.get("relation_type")) == "unknown",
+        )
+        write_stale_invalid_sheet(wb, stale_invalid_rows or [])
 
     atomic_save_workbook(wb, path)
+
+
+def write_relation_subset_sheet(wb, name, rows, predicate) -> None:
+    ws = wb.create_sheet(name)
+    headers = [
+        "clock_a", "clock_b", "relation_type", "relation_source",
+        "source_rule_ids", "clock_universe_digest", "assembled_view_digest",
+    ]
+    write_coverage_sheet_title(
+        ws,
+        "03 Clock Group Coverage - " + name,
+        "Subset of the same complete pair map used to publish relation_map.csv.",
+        len(headers),
+    )
+    write_header(ws, headers)
+    row_idx = 5
+    for row in rows:
+        if not predicate(row):
+            continue
+        for col_idx, header in enumerate(headers, start=1):
+            ws.cell(row_idx, col_idx, row.get(header, ""))
+        style_body_row(ws, row_idx, len(headers), WARNING_FILL if name.startswith("unknown") else None)
+        row_idx += 1
+    set_widths(ws, [28, 28, 24, 24, 36, 70, 70])
+    ensure_table(ws, safe_filename_token(name).replace("-", "_")[:25] + "Table", f"A4:G{max(row_idx - 1, 5)}")
+
+
+def write_stale_invalid_sheet(wb, rows: Sequence[Dict[str, object]]) -> None:
+    ws = wb.create_sheet("stale_invalid_rules")
+    headers = ["sheet", "row", "object_id", "status", "reason"]
+    write_coverage_sheet_title(
+        ws,
+        "03 Clock Group Coverage - stale_invalid_rules",
+        "Workbook rows that are stale, blocked, or invalid in the current run.",
+        len(headers),
+    )
+    write_header(ws, headers)
+    row_idx = 5
+    for row in rows:
+        for col_idx, header in enumerate(headers, start=1):
+            ws.cell(row_idx, col_idx, row.get(header, ""))
+        style_body_row(ws, row_idx, len(headers), ERROR_FILL)
+        row_idx += 1
+    set_widths(ws, [28, 12, 34, 28, 80])
+    ensure_table(ws, "StaleInvalidRules", f"A4:E{max(row_idx - 1, 5)}")
+
+
+def write_complete_pair_relation_sheet(wb, rows: Sequence[Dict[str, object]]) -> None:
+    ws = wb.create_sheet("pair_relation_map")
+    headers = [
+        "clock_a", "clock_b", "relation_type", "relation_source",
+        "source_rule_ids", "clock_universe_digest", "assembled_view_digest",
+    ]
+    write_coverage_sheet_title(
+        ws,
+        "03 Clock Group Coverage - pair_relation_map",
+        "Review view of the same complete canonical pair map published as relation_map.csv.",
+        len(headers),
+    )
+    write_header(ws, headers)
+    row_idx = 5
+    for row in rows:
+        for col_idx, header in enumerate(headers, start=1):
+            ws.cell(row_idx, col_idx, row.get(header, ""))
+        style_body_row(ws, row_idx, len(headers))
+        row_idx += 1
+    set_widths(ws, [28, 28, 24, 24, 36, 70, 70])
+    ensure_table(ws, "CompletePairRelationMap", f"A4:G{max(row_idx - 1, 5)}")
+
+
+def write_explicit_relation_coverage_sheet(
+    wb: Workbook,
+    relation_pairs: Dict[Tuple[str, str], List[PairOccurrence]],
+) -> None:
+    ws = wb.create_sheet("explicit_relation_coverage")
+    headers = ["clock_a", "clock_b", "relation_type", "group_id", "group_a", "group_b"]
+    write_coverage_sheet_title(
+        ws,
+        "03 Clock Group Coverage - explicit_relation_coverage",
+        "Every canonical clock pair covered by an approved explicit clock-group rule.",
+        len(headers),
+    )
+    write_header(ws, headers)
+    row_idx = 5
+    for (clock_a, clock_b), occurrences in sorted(relation_pairs.items()):
+        for occ in occurrences:
+            values = [clock_a, clock_b, occ.relation_type, occ.group_id, occ.group_a, occ.group_b]
+            for col_idx, value in enumerate(values, start=1):
+                ws.cell(row_idx, col_idx, value)
+            style_body_row(ws, row_idx, len(headers))
+            row_idx += 1
+    set_widths(ws, [28, 28, 22, 30, 12, 12])
+    ensure_table(ws, "ExplicitRelationCoverage", f"A4:F{max(row_idx - 1, 5)}")
 
 
 def write_domain_membership_sheet(wb: Workbook, domains: Dict[str, ClockDomain]) -> None:
@@ -1892,7 +2077,7 @@ def write_domain_membership_sheet(wb: Workbook, domains: Dict[str, ClockDomain])
 def write_coverage_metadata_sheet(
     wb: Workbook,
     inventory_context: InventoryContext,
-    scenario: str,
+    scenario: Optional[str],
     assembled_view_digest: str,
 ) -> None:
     ws = wb.create_sheet("metadata", 0)
@@ -1908,12 +2093,17 @@ def write_coverage_metadata_sheet(
         ("author", author_name()),
         ("stage", "03_soc_clock_groups"),
         ("script", "03_extract_soc_clock_groups.py"),
-        ("scenario", scenario),
+        ("run_id", inventory_context.run_id),
+        ("mode_label", inventory_context.mode_label),
+        ("design_revision", inventory_context.design_revision),
         ("run_completeness", inventory_context.completeness),
         ("missing_instances", ",".join(inventory_context.missing_instances)),
+        ("structure_digest", inventory_context.structure_digest),
         ("clock_universe_digest", inventory_context.clock_universe_digest),
         ("assembled_view_digest", assembled_view_digest),
     ]
+    if scenario is not None:
+        values.insert(6, ("scenario", scenario))
     for row_idx, (key, value) in enumerate(values, start=5):
         ws.cell(row_idx, 1, key)
         ws.cell(row_idx, 2, value)
@@ -1952,6 +2142,7 @@ def write_uncovered_pairs_sheet(
     wb: Workbook,
     inventory: Inventory,
     relation_pairs: Dict[Tuple[str, str], List[PairOccurrence]],
+    incomplete_review: bool = False,
 ) -> None:
     ws = wb.create_sheet("uncovered_cross_root_pairs")
     headers = [
@@ -1990,7 +2181,11 @@ def write_uncovered_pairs_sheet(
             b.root_source,
             a.clock_kind,
             b.clock_kind,
-            "default synchronous; coverage uses genealogy tree_root and does not model set_case_analysis",
+            (
+                "unknown; workbook synchronization/review is incomplete"
+                if incomplete_review
+                else "default synchronous; coverage uses genealogy tree_root and does not model case analysis"
+            ),
         ]
         for col_idx, value in enumerate(values, start=1):
             ws.cell(row_idx, col_idx, value)
@@ -2062,10 +2257,13 @@ def write_root_pair_summary_sheet(
     ensure_table(ws, "RootPairSummary", f"A4:F{max(row_idx - 1, 5)}")
 
 
-def write_rule_effective_groups_sheet(wb: Workbook, rules: Sequence[ParsedRule]) -> None:
+def write_rule_effective_groups_sheet(
+    wb: Workbook,
+    rules: Sequence[ParsedRule],
+    include_scenario: bool = True,
+) -> None:
     ws = wb.create_sheet("rule_effective_groups")
     headers = [
-        "scenario",
         "group_id",
         "relation_type",
         "group_index",
@@ -2077,6 +2275,8 @@ def write_rule_effective_groups_sheet(wb: Workbook, rules: Sequence[ParsedRule])
         "explicit_domains",
         "blocked_instances",
     ]
+    if include_scenario:
+        headers.insert(0, "scenario")
     write_coverage_sheet_title(
         ws,
         "03 Clock Group Coverage - rule_effective_groups",
@@ -2103,7 +2303,6 @@ def write_rule_effective_groups_sheet(wb: Workbook, rules: Sequence[ParsedRule])
             if rule.blocked_instances:
                 review_note = "blocked_by_missing_sdc"
             values = [
-                rule.scenario,
                 rule.group_id,
                 rule.relation_type,
                 group_idx,
@@ -2115,12 +2314,1059 @@ def write_rule_effective_groups_sheet(wb: Workbook, rules: Sequence[ParsedRule])
                 "\n".join(explicit_domains),
                 "\n".join(sorted(rule.blocked_instances)),
             ]
+            if include_scenario:
+                values.insert(0, rule.scenario)
             for col_idx, value in enumerate(values, start=1):
                 ws.cell(row_idx, col_idx, value)
             style_body_row(ws, row_idx, len(headers), fill)
             row_idx += 1
-    set_widths(ws, [12, 30, 22, 12, 40, 40, 34, 50, 55, 34, 34])
-    ensure_table(ws, "RuleEffectiveGroups", f"A4:K{max(row_idx - 1, 5)}")
+    widths = [30, 22, 12, 40, 40, 34, 50, 55, 34, 34]
+    if include_scenario:
+        widths.insert(0, 12)
+    set_widths(ws, widths)
+    end_col = get_column_letter(len(headers))
+    ensure_table(ws, "RuleEffectiveGroups", f"A4:{end_col}{max(row_idx - 1, 5)}")
+
+
+def target_read_csv(path: Path, label: str, report: Report) -> Tuple[List[str], List[Dict[str, str]]]:
+    if not path.is_file():
+        report.error(f"required {label} is missing: {path}")
+        return [], []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            reader = csv.DictReader(file_obj)
+            headers = [clean_cell(item) for item in (reader.fieldnames or [])]
+            if len(headers) != len(set(headers)):
+                report.error(f"{label} has duplicate headers: {path}")
+            return headers, [dict(row) for row in reader]
+    except (OSError, csv.Error) as exc:
+        report.error(f"cannot read {label} {path}: {exc}")
+        return [], []
+
+
+def target_read_json(path: Path, label: str, report: Report) -> Dict[str, object]:
+    if not path.is_file():
+        report.error(f"required {label} is missing: {path}")
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        report.error(f"cannot read {label} {path}: {exc}")
+        return {}
+    if not isinstance(payload, dict):
+        report.error(f"{label} must contain a JSON object: {path}")
+        return {}
+    return payload
+
+
+def read_target_run_context(path: Path, report: Report) -> TargetRunContext:
+    headers, rows = target_read_csv(path, "run context", report)
+    expected = ["run_id", "mode_label", "design_revision", "note"]
+    if headers != expected:
+        report.error("run_context.csv headers must be exactly: " + ",".join(expected))
+    if len(rows) != 1:
+        report.error("run_context.csv must contain exactly one data row")
+    row = rows[0] if rows else {}
+    run = TargetRunContext(
+        clean_cell(row.get("run_id")),
+        clean_cell(row.get("mode_label")),
+        clean_cell(row.get("design_revision")),
+        clean_cell(row.get("note")),
+    )
+    if not run.run_id:
+        report.error("run_context.csv run_id is required")
+    if not run.mode_label:
+        report.error("run_context.csv mode_label is required")
+    return run
+
+
+def validate_target_required_views(path: Path, report: Report) -> str:
+    headers, rows = target_read_csv(path, "required views", report)
+    expected = [
+        "view_id", "stage", "corner", "require_02", "require_04",
+        "require_20", "require_30", "note",
+    ]
+    if headers != expected:
+        report.error("required_views.csv headers must be exactly: " + ",".join(expected))
+    seen_ids: Set[str] = set()
+    seen_views: Set[Tuple[str, str]] = set()
+    for row_idx, row in enumerate(rows, start=2):
+        view_id = clean_cell(row.get("view_id"))
+        stage = clean_cell(row.get("stage"))
+        corner = clean_cell(row.get("corner"))
+        if not view_id or not stage or not corner:
+            report.error(f"required_views.csv row {row_idx} has blank view_id/stage/corner")
+        if view_id in seen_ids:
+            report.error(f"required_views.csv duplicate view_id {view_id}")
+        if (stage, corner) in seen_views:
+            report.error(f"required_views.csv duplicate stage/corner {stage}/{corner}")
+        seen_ids.add(view_id)
+        seen_views.add((stage, corner))
+        for flag in ("require_02", "require_04", "require_20", "require_30"):
+            if normalize_key(row.get(flag)) not in {"yes", "no"}:
+                report.error(f"required_views.csv row {row_idx} {flag} must be yes/no")
+    return sha256_file(path) if path.is_file() else ""
+
+
+def target_validate_provenance(
+    payload: Dict[str, object],
+    label: str,
+    run: TargetRunContext,
+    report: Report,
+) -> None:
+    for field in ("run_id", "mode_label", "design_revision"):
+        expected = clean_cell(getattr(run, field))
+        actual = clean_cell(payload.get(field))
+        if actual != expected:
+            report.error(
+                f"{label} {field} mismatch: expected {expected or '<blank>'}, "
+                f"got {actual or '<blank>'}"
+            )
+
+
+def load_target_inventory_context(
+    run_root: Path,
+    run: TargetRunContext,
+    report: Report,
+) -> Optional[InventoryContext]:
+    inventory_path = run_root / "01_middle/clock_inventory.csv"
+    meta_path = run_root / "01_middle/clock_inventory.meta"
+    completion_path = run_root / "01_middle/stage_completion.meta"
+    final_sdc_path = run_root / "01_result/01_soc_clocks.sdc"
+    meta = target_read_json(meta_path, "01 clock inventory meta", report)
+    completion = target_read_json(completion_path, "01 stage completion", report)
+    if not inventory_path.is_file() or not meta or not completion:
+        if not inventory_path.is_file():
+            report.error(f"required 01 clock inventory is missing: {inventory_path}")
+        return None
+    try:
+        inventory = read_clock_inventory(inventory_path, report)
+    except Exception as exc:
+        report.error(str(exc))
+        return None
+
+    target_validate_provenance(meta, "01 clock inventory meta", run, report)
+    target_validate_provenance(completion, "01 stage completion", run, report)
+    if clean_cell(meta.get("stage_name")) != "01_soc_clocks":
+        report.error("01 clock inventory meta stage_name must be 01_soc_clocks")
+    if clean_cell(completion.get("stage_name")) != "01_soc_clocks":
+        report.error("01 stage completion stage_name must be 01_soc_clocks")
+    if clean_cell(meta.get("completion_status")) != "complete":
+        report.error("01 clock inventory meta is not complete")
+    if clean_cell(completion.get("completion_status")) != "complete":
+        report.error("01 stage completion is not complete")
+    if clean_cell(completion.get("sync_changed")).lower() != "no":
+        report.error("01 stage completion sync_changed must be no")
+    try:
+        if int(completion.get("error_count", 1)) != 0:
+            report.error("01 stage completion error_count must be zero")
+    except (TypeError, ValueError):
+        report.error("01 stage completion error_count is invalid")
+
+    inventory_digest = sha256_file(inventory_path)
+    if clean_cell(meta.get("inventory_digest")) != inventory_digest:
+        report.error("01 inventory digest does not match clock_inventory.meta")
+    if clean_cell(completion.get("clock_inventory_digest")) != inventory_digest:
+        report.error("01 inventory digest does not match stage_completion.meta")
+    structure_digest = clean_cell(meta.get("structure_digest"))
+    if not structure_digest or clean_cell(completion.get("structure_digest")) != structure_digest:
+        report.error("01 structure_digest is blank or inconsistent")
+    clock_digest = sha256_clock_set(inventory.active)
+    if clean_cell(meta.get("clock_set_digest")) != clock_digest:
+        report.error("01 clock_set_digest does not match active inventory clocks")
+    try:
+        if int(meta.get("clock_count", -1)) != len(inventory.active):
+            report.error("01 clock_count does not match active inventory clocks")
+    except (TypeError, ValueError):
+        report.error("01 clock_count is invalid")
+
+    final_sdc_digest = ""
+    if not final_sdc_path.is_file():
+        report.error(f"required 01 final SDC is missing: {final_sdc_path}")
+    else:
+        final_sdc_digest = sha256_file(final_sdc_path)
+        if clean_cell(meta.get("final_sdc_digest")) != final_sdc_digest:
+            report.error("01 final SDC digest does not match clock_inventory.meta")
+        if clean_cell(completion.get("output_sdc_digest")) != final_sdc_digest:
+            report.error("01 final SDC digest does not match stage_completion.meta")
+        sdc_names = extract_clock_names_from_sdc(final_sdc_path)
+        if sdc_names != set(inventory.active):
+            report.error(
+                "01 final SDC clock set differs from inventory; "
+                f"missing_in_sdc={sorted(set(inventory.active) - sdc_names)}; "
+                f"extra_in_sdc={sorted(sdc_names - set(inventory.active))}"
+            )
+
+    completeness = normalize_key(meta.get("run_completeness")) or "complete"
+    missing_raw = meta.get("missing_instances", [])
+    missing_instances = tuple(
+        sorted(clean_cell(item) for item in missing_raw if clean_cell(item))
+    ) if isinstance(missing_raw, list) else ()
+    if completeness == "partial":
+        report.warn(
+            "01 run completeness is partial; candidate evidence may be incomplete: "
+            + (", ".join(missing_instances) or "<unspecified>")
+        )
+    elif completeness != "complete":
+        report.error(f"01 run completeness must be complete or partial, got {completeness}")
+    return InventoryContext(
+        inventory=inventory,
+        path=inventory_path,
+        scenario="common",
+        completeness=completeness,
+        missing_instances=missing_instances,
+        meta_path=meta_path,
+        final_sdc_path=final_sdc_path,
+        final_sdc_digest=final_sdc_digest,
+        inventory_digest=inventory_digest,
+        clock_universe_digest=clock_digest,
+        run_id=run.run_id,
+        mode_label=run.mode_label,
+        design_revision=run.design_revision,
+        structure_digest=structure_digest,
+        completion_path=completion_path,
+        completion_digest=sha256_file(completion_path),
+    )
+
+
+def target_style_header(ws, headers: Sequence[str]) -> None:
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(1, col_idx, header)
+        cell.fill = HEADER_FILL
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(13, min(34, len(header) + 4))
+    ws.freeze_panes = "A2"
+
+
+def target_setup_sheet(wb: Workbook, name: str, headers: Sequence[str]):
+    ws = wb.create_sheet(name)
+    target_style_header(ws, headers)
+    return ws
+
+
+def target_metadata_rows(
+    run: TargetRunContext,
+    inventory_context: InventoryContext,
+    required_views_digest: str,
+) -> List[Tuple[str, str]]:
+    return [
+        ("Author", author_name()),
+        ("run_id", run.run_id),
+        ("mode_label", run.mode_label),
+        ("design_revision", run.design_revision),
+        ("structure_digest", inventory_context.structure_digest),
+        ("required_views_digest", required_views_digest),
+        ("01_inventory_path", str(inventory_context.path.resolve())),
+        ("01_inventory_digest", inventory_context.inventory_digest),
+        ("01_completion_path", str(inventory_context.completion_path.resolve())),
+        ("01_completion_digest", inventory_context.completion_digest),
+        ("run_completeness", inventory_context.completeness),
+        ("Port accounting", "not_applicable; added_bits=0"),
+    ]
+
+
+def update_target_metadata(
+    wb: Workbook,
+    run: TargetRunContext,
+    inventory_context: InventoryContext,
+    required_views_digest: str,
+) -> bool:
+    expected = target_metadata_rows(run, inventory_context, required_views_digest)
+    if "run_metadata" in wb.sheetnames:
+        ws = wb["run_metadata"]
+        current = [
+            (clean_cell(ws.cell(row, 1).value), clean_cell(ws.cell(row, 2).value))
+            for row in range(2, ws.max_row + 1)
+        ]
+        if current == expected:
+            return False
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("run_metadata", 0)
+    target_style_header(ws, ["Field", "Value"])
+    for row_idx, (field_name, value) in enumerate(expected, start=2):
+        ws.cell(row_idx, 1, field_name).font = Font(bold=True)
+        ws.cell(row_idx, 2, value)
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 90
+    return True
+
+
+def append_target_domain_row(
+    ws,
+    clock: ClockInfo,
+    inventory_digest: str,
+    sync_status: str,
+    is_root: bool,
+) -> None:
+    mapping = {header: idx + 1 for idx, header in enumerate(TARGET_DOMAIN_HEADERS)}
+    row_idx = ws.max_row + 1
+    values = {
+        "clock_name": clock.clock_name,
+        "root_clock": "yes" if is_root else "no",
+        "apply": "",
+        "review_status": "draft",
+        "sync_status": sync_status,
+        "clock_kind": clock.clock_kind,
+        "root_source": clock.root_source,
+        "source_inventory_digest": inventory_digest,
+    }
+    for header, value in values.items():
+        ws.cell(row_idx, mapping[header], value)
+    fill = NEW_FILL if sync_status == "NEW_FROM_01" else None
+    style_body_row(ws, row_idx, len(TARGET_DOMAIN_HEADERS), fill)
+
+
+def target_candidate_id(clock_a: str, clock_b: str) -> str:
+    payload = "\n".join(pair_key(clock_a, clock_b)).encode("utf-8")
+    return "CG_CAND_" + hashlib.sha256(payload).hexdigest()[:16]
+
+
+def append_target_candidate_rows(ws, inventory: Inventory, existing: Set[str], max_pairs: int) -> int:
+    mapping = {header: idx + 1 for idx, header in enumerate(TARGET_CANDIDATE_HEADERS)}
+    added = 0
+    active = sorted(inventory.active)
+    for clock_a, clock_b in itertools.combinations(active, 2):
+        if len(existing) >= max_pairs:
+            break
+        if same_tree(clock_a, clock_b, inventory):
+            continue
+        candidate_id = target_candidate_id(clock_a, clock_b)
+        if candidate_id in existing:
+            continue
+        values = {
+            "candidate_id": candidate_id,
+            "candidate_type": "cross_tree_pair",
+            "clock_a": clock_a,
+            "clock_b": clock_b,
+            "tree_root_a": inventory.tree_root.get(clock_a, clock_a),
+            "tree_root_b": inventory.tree_root.get(clock_b, clock_b),
+            "reason": "active clocks belong to different 01 genealogy roots",
+            "evidence": "genealogy tree_root differs; human CDC/STA review required",
+            "recommended_action": "review_only",
+            "decision": "draft",
+        }
+        row_idx = ws.max_row + 1
+        for header, value in values.items():
+            ws.cell(row_idx, mapping[header], value)
+        style_body_row(ws, row_idx, len(TARGET_CANDIDATE_HEADERS))
+        existing.add(candidate_id)
+        added += 1
+    return added
+
+
+def create_target_workbook(
+    path: Path,
+    run: TargetRunContext,
+    inventory_context: InventoryContext,
+    required_views_digest: str,
+    max_candidate_pairs: int,
+) -> Workbook:
+    wb = Workbook()
+    wb.remove(wb.active)
+    domain_ws = target_setup_sheet(wb, DOMAIN_SHEET, TARGET_DOMAIN_HEADERS)
+    target_setup_sheet(wb, RULE_SHEET, TARGET_RULE_HEADERS)
+    candidate_ws = target_setup_sheet(wb, CANDIDATE_SHEET, TARGET_CANDIDATE_HEADERS)
+    update_target_metadata(wb, run, inventory_context, required_views_digest)
+    for clock_name in sorted(inventory_context.inventory.active):
+        append_target_domain_row(
+            domain_ws,
+            inventory_context.inventory.active[clock_name],
+            inventory_context.inventory_digest,
+            "NEW_FROM_01",
+            inventory_context.inventory.tree_root.get(clock_name, clock_name) == clock_name,
+        )
+    append_target_candidate_rows(
+        candidate_ws, inventory_context.inventory, set(), max_candidate_pairs
+    )
+    atomic_save_workbook(wb, path)
+    return wb
+
+
+def target_sheet_mapping(ws, expected: Sequence[str], label: str, report: Report) -> Dict[str, int]:
+    headers = [clean_cell(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+    duplicate = sorted(item for item in set(headers) if item and headers.count(item) > 1)
+    if duplicate:
+        report.error(f"{label} has duplicate headers: {','.join(duplicate)}")
+    for header in expected:
+        if header not in headers:
+            ws.cell(1, ws.max_column + 1, header)
+            headers.append(header)
+            report.warn(f"{label} added missing header {header}")
+            report.sync_changed = True
+    target_style_header(ws, headers)
+    return {header: headers.index(header) + 1 for header in expected}
+
+
+def target_domain_row_has_intent(values: Dict[str, object]) -> bool:
+    apply_value = normalize_key(values.get("apply"))
+    review = normalize_key(values.get("review_status"))
+    if apply_value == "yes" and review == "approved":
+        return bool(clean_cell(values.get("domain_id")) and clean_cell(values.get("membership_type")))
+    if apply_value == "no" and review in {"reviewed", "approved", "rejected"}:
+        return bool(clean_cell(values.get("note")) or clean_cell(values.get("basis")))
+    return False
+
+
+def sync_target_workbook(
+    wb: Workbook,
+    form_path: Path,
+    run: TargetRunContext,
+    inventory_context: InventoryContext,
+    required_views_digest: str,
+    max_candidate_pairs: int,
+    report: Report,
+) -> Tuple[object, Dict[str, int]]:
+    for sheet_name, headers in (
+        (DOMAIN_SHEET, TARGET_DOMAIN_HEADERS),
+        (RULE_SHEET, TARGET_RULE_HEADERS),
+        (CANDIDATE_SHEET, TARGET_CANDIDATE_HEADERS),
+    ):
+        if sheet_name not in wb.sheetnames:
+            target_setup_sheet(wb, sheet_name, headers)
+            report.warn(f"workbook added missing sheet {sheet_name}")
+            report.sync_changed = True
+    domain_ws = wb[DOMAIN_SHEET]
+    domain_mapping = target_sheet_mapping(domain_ws, TARGET_DOMAIN_HEADERS, DOMAIN_SHEET, report)
+    target_sheet_mapping(wb[RULE_SHEET], TARGET_RULE_HEADERS, RULE_SHEET, report)
+    candidate_ws = wb[CANDIDATE_SHEET]
+    candidate_mapping = target_sheet_mapping(
+        candidate_ws, TARGET_CANDIDATE_HEADERS, CANDIDATE_SHEET, report
+    )
+
+    rows: List[Tuple[int, Dict[str, object]]] = []
+    by_clock: Dict[str, List[Tuple[int, Dict[str, object]]]] = defaultdict(list)
+    for row_idx in range(2, domain_ws.max_row + 1):
+        values = {
+            header: domain_ws.cell(row_idx, col_idx).value
+            for header, col_idx in domain_mapping.items()
+        }
+        if not any(clean_cell(value) for value in values.values()):
+            continue
+        rows.append((row_idx, values))
+        by_clock[clean_cell(values.get("clock_name"))].append((row_idx, values))
+    for clock_name in sorted(inventory_context.inventory.active):
+        if clock_name not in by_clock:
+            append_target_domain_row(
+                domain_ws,
+                inventory_context.inventory.active[clock_name],
+                inventory_context.inventory_digest,
+                "NEW_FROM_01",
+                inventory_context.inventory.tree_root.get(clock_name, clock_name) == clock_name,
+            )
+            report.warn(f"added new 01 clock to domain membership review: {clock_name}")
+            report.sync_changed = True
+
+    for row_idx, values in rows:
+        clock_name = clean_cell(values.get("clock_name"))
+        status = clean_cell(values.get("sync_status"))
+        if clock_name not in inventory_context.inventory.active:
+            desired = (
+                "BLOCKED_BY_MISSING_SDC"
+                if inventory_context.completeness == "partial"
+                else "STALE_NOT_IN_01"
+            )
+            if status != desired:
+                domain_ws.cell(row_idx, domain_mapping["sync_status"], desired)
+                report.sync_changed = True
+            style_body_row(domain_ws, row_idx, domain_ws.max_column, BLOCKED_FILL if desired.startswith("BLOCKED") else ERROR_FILL)
+            continue
+        clock = inventory_context.inventory.active[clock_name]
+        expected_machine = {
+            "clock_kind": clock.clock_kind,
+            "root_source": clock.root_source,
+            "source_inventory_digest": inventory_context.inventory_digest,
+        }
+        machine_changed = False
+        for column, expected in expected_machine.items():
+            if clean_cell(values.get(column)) != expected:
+                domain_ws.cell(row_idx, domain_mapping[column], expected)
+                machine_changed = True
+        if machine_changed:
+            domain_ws.cell(row_idx, domain_mapping["sync_status"], "NEW_FROM_01")
+            report.warn(f"synchronized machine context for clock {clock_name}")
+            report.sync_changed = True
+        elif status in {"NEW_FROM_01", "STALE_NOT_IN_01", "BLOCKED_BY_MISSING_SDC"} and target_domain_row_has_intent(values):
+            domain_ws.cell(row_idx, domain_mapping["sync_status"], "OK")
+            report.info(f"reset reviewed sync_status to OK for clock {clock_name}")
+            report.sync_changed = True
+
+    existing_candidates = set()
+    for row_idx in range(2, candidate_ws.max_row + 1):
+        candidate_id = clean_cell(candidate_ws.cell(row_idx, candidate_mapping["candidate_id"]).value)
+        if candidate_id:
+            existing_candidates.add(candidate_id)
+    added_candidates = append_target_candidate_rows(
+        candidate_ws,
+        inventory_context.inventory,
+        existing_candidates,
+        max_candidate_pairs,
+    )
+    if added_candidates:
+        report.warn(f"added {added_candidates} new clock-group candidate(s)")
+        report.sync_changed = True
+    if update_target_metadata(wb, run, inventory_context, required_views_digest):
+        report.warn("updated run_metadata machine context")
+        report.sync_changed = True
+    if report.sync_changed:
+        report.info(f"workbook synchronization changed {form_path}")
+    return domain_ws, domain_mapping
+
+
+def read_target_domain_rows(
+    ws,
+    mapping: Dict[str, int],
+    inventory_context: InventoryContext,
+    report: Report,
+) -> List[DomainMemberRow]:
+    rows: List[DomainMemberRow] = []
+    for row_idx in range(2, ws.max_row + 1):
+        values = {header: ws.cell(row_idx, col_idx).value for header, col_idx in mapping.items()}
+        if not any(clean_cell(value) for value in values.values()):
+            continue
+        sync_status = clean_cell(values.get("sync_status"))
+        if sync_status not in TARGET_SYNC_VALUES:
+            report.error(f"{DOMAIN_SHEET} row {row_idx}: invalid sync_status {sync_status}")
+        source_instance = clean_cell(values.get("source_instance"))
+        allowed_blocked = (
+            sync_status == "BLOCKED_BY_MISSING_SDC"
+            and inventory_context.completeness == "partial"
+            and source_instance in set(inventory_context.missing_instances)
+        )
+        if sync_status != "OK" and not allowed_blocked:
+            report.error(
+                f"{DOMAIN_SHEET} row {row_idx}: clock {clean_cell(values.get('clock_name')) or '<blank>'} "
+                f"has blocking sync_status {sync_status or '<blank>'}"
+            )
+        root_clock = normalize_key(values.get("root_clock"))
+        if root_clock not in {"", "yes", "no"}:
+            report.error(f"{DOMAIN_SHEET} row {row_idx}: root_clock must be yes/no/blank")
+        membership_type = normalize_key(values.get("membership_type"))
+        include_descendants = normalize_key(values.get("include_descendants"))
+        if not include_descendants:
+            include_descendants = "yes" if membership_type == "seed" or root_clock == "yes" else "no"
+        rows.append(
+            DomainMemberRow(
+                row_idx=row_idx,
+                scenario="common",
+                domain_id=clean_cell(values.get("domain_id")),
+                clock_name=clean_cell(values.get("clock_name")),
+                membership_type=membership_type,
+                include_descendants=include_descendants,
+                source_instance=source_instance,
+                apply=normalize_key(values.get("apply")),
+                review_status=normalize_key(values.get("review_status")),
+                owner=clean_cell(values.get("owner")),
+                basis=clean_cell(values.get("basis")),
+                note=clean_cell(values.get("note")),
+            )
+        )
+    return rows
+
+
+def read_target_rule_rows(ws, report: Report) -> List[ParsedRule]:
+    mapping = target_sheet_mapping(ws, TARGET_RULE_HEADERS, RULE_SHEET, report)
+    numbered = group_indices(mapping)
+    rows: List[ParsedRule] = []
+    for row_idx in range(2, ws.max_row + 1):
+        values = {header: ws.cell(row_idx, col_idx).value for header, col_idx in mapping.items()}
+        if not any(clean_cell(value) for value in values.values()):
+            continue
+        explicit_groups: List[List[str]] = []
+        explicit_domains: List[List[str]] = []
+        used_indices: List[int] = []
+        for group_idx in numbered:
+            clocks = parse_clock_list(values.get(f"group_{group_idx}_clocks"))
+            domains = parse_clock_list(values.get(f"group_{group_idx}_domains"))
+            if clocks or domains:
+                explicit_groups.append(clocks)
+                explicit_domains.append(domains)
+                used_indices.append(group_idx)
+        apply_value = normalize_key(values.get("apply"))
+        review = normalize_key(values.get("review_status"))
+        analysis_style = normalize_key(values.get("analysis_style"))
+        if analysis_style not in TARGET_ANALYSIS_STYLES:
+            report.error(
+                f"{RULE_SHEET} row {row_idx}: invalid target analysis_style {analysis_style}"
+            )
+        owner = clean_cell(values.get("owner"))
+        basis = clean_cell(values.get("basis"))
+        if apply_value == "yes" and review == "approved":
+            if not owner:
+                report.error(f"{RULE_SHEET} row {row_idx}: active rule requires owner")
+            if not basis:
+                report.error(f"{RULE_SHEET} row {row_idx}: active rule requires basis")
+        rows.append(
+            ParsedRule(
+                row_idx=row_idx,
+                scenario="common",
+                group_id=clean_cell(values.get("group_id")),
+                relation_type=canonical_relation_type(values.get("relation_type")),
+                analysis_style=analysis_style,
+                apply=apply_value,
+                review_status=review,
+                owner=owner,
+                basis=basis,
+                cdc_required="yes",
+                note=clean_cell(values.get("note")),
+                explicit_groups=explicit_groups,
+                explicit_domain_groups=explicit_domains,
+                group_indices=used_indices,
+                excluded=set(parse_clock_list(values.get("exclude_descendant_clocks"))),
+            )
+        )
+    return rows
+
+
+def collect_target_stale_invalid_rows(wb: Workbook) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    if DOMAIN_SHEET in wb.sheetnames:
+        ws = wb[DOMAIN_SHEET]
+        headers = [clean_cell(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+        mapping = {header: headers.index(header) + 1 for header in headers if header}
+        for row_idx in range(2, ws.max_row + 1):
+            clock_name = clean_cell(ws.cell(row_idx, mapping.get("clock_name", 0)).value) if mapping.get("clock_name") else ""
+            if not clock_name:
+                continue
+            status = clean_cell(ws.cell(row_idx, mapping.get("sync_status", 0)).value) if mapping.get("sync_status") else ""
+            apply_value = normalize_key(ws.cell(row_idx, mapping.get("apply", 0)).value) if mapping.get("apply") else ""
+            domain_id = clean_cell(ws.cell(row_idx, mapping.get("domain_id", 0)).value) if mapping.get("domain_id") else ""
+            reason = ""
+            if status != "OK":
+                reason = "blocking sync_status " + (status or "<blank>")
+            elif apply_value == "yes" and not domain_id:
+                reason = "active membership has blank domain_id"
+            if reason:
+                result.append({
+                    "sheet": DOMAIN_SHEET, "row": row_idx, "object_id": clock_name,
+                    "status": status, "reason": reason,
+                })
+    if RULE_SHEET in wb.sheetnames:
+        ws = wb[RULE_SHEET]
+        headers = [clean_cell(ws.cell(1, col).value) for col in range(1, ws.max_column + 1)]
+        mapping = {header: headers.index(header) + 1 for header in headers if header}
+        for row_idx in range(2, ws.max_row + 1):
+            group_id = clean_cell(ws.cell(row_idx, mapping.get("group_id", 0)).value) if mapping.get("group_id") else ""
+            if not group_id:
+                continue
+            apply_value = normalize_key(ws.cell(row_idx, mapping.get("apply", 0)).value) if mapping.get("apply") else ""
+            review = normalize_key(ws.cell(row_idx, mapping.get("review_status", 0)).value) if mapping.get("review_status") else ""
+            owner = clean_cell(ws.cell(row_idx, mapping.get("owner", 0)).value) if mapping.get("owner") else ""
+            basis = clean_cell(ws.cell(row_idx, mapping.get("basis", 0)).value) if mapping.get("basis") else ""
+            reason = ""
+            if apply_value == "yes" and review != "approved":
+                reason = "apply=yes requires review_status=approved"
+            elif apply_value == "yes" and not owner:
+                reason = "active rule requires owner"
+            elif apply_value == "yes" and not basis:
+                reason = "active rule requires basis"
+            if reason:
+                result.append({
+                    "sheet": RULE_SHEET, "row": row_idx, "object_id": group_id,
+                    "status": review, "reason": reason,
+                })
+    return result
+
+
+def target_workbook_snapshot_digest(wb: Workbook) -> str:
+    """Hash the complete target workbook for review-state diagnostics only."""
+    payload: Dict[str, object] = {}
+    for sheet_name in (DOMAIN_SHEET, RULE_SHEET, CANDIDATE_SHEET, "run_metadata"):
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        payload[sheet_name] = [
+            [clean_cell(ws.cell(row, col).value) for col in range(1, ws.max_column + 1)]
+            for row in range(1, ws.max_row + 1)
+        ]
+    return sha256_payload(payload)
+
+
+def target_workbook_semantic_digest(
+    domain_rows: Sequence[DomainMemberRow],
+    rules: Sequence[ParsedRule],
+) -> str:
+    """Hash reviewed constraint decisions, excluding machine provenance/context."""
+    return workbook_semantic_digest(domain_rows, rules)
+
+
+def generate_target_sdc(
+    rules: Sequence[ParsedRule],
+    run: TargetRunContext,
+    inventory_context: InventoryContext,
+    workbook_digest: str,
+) -> str:
+    lines = [
+        "# Auto-generated by 03_extract_soc_clock_groups.py",
+        f"# Author: {author_name()}",
+        f"# Run ID: {run.run_id}",
+        f"# Mode label: {run.mode_label}",
+        f"# Design revision: {run.design_revision}",
+        f"# Structure digest: {inventory_context.structure_digest}",
+        f"# 01 inventory digest: {inventory_context.inventory_digest}",
+        f"# Run completeness: {inventory_context.completeness}",
+        f"# Missing harden SDC instances: {', '.join(inventory_context.missing_instances) or '<none>'}",
+        f"# Workbook semantic digest: {workbook_digest}",
+        "# Port accounting: not_applicable; added_bits=0",
+        "",
+    ]
+    emitted = 0
+    for rule in rules:
+        if not active_rule(rule) or rule.blocked_instances or not rule.effective_groups:
+            continue
+        lines.append(f"# clock_group_rules row {rule.row_idx}: {rule.group_id}")
+        lines.append(f"# Basis: {rule.basis}")
+        lines.append(f"set_clock_groups -{rule.relation_type} \\")
+        for list_idx, group in enumerate(rule.effective_groups):
+            suffix = " \\" if list_idx != len(rule.effective_groups) - 1 else ""
+            lines.append(f"  -group {get_clocks(group)}{suffix}")
+        lines.append("")
+        emitted += 1
+    if not emitted:
+        lines.append("# No approved clock-group commands emitted for this run.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def target_relation_rows(
+    inventory_context: InventoryContext,
+    relation_pairs: Dict[Tuple[str, str], List[PairOccurrence]],
+    view_digest: str,
+) -> List[Dict[str, object]]:
+    rows = []
+    for row in complete_relation_rows("common", inventory_context, relation_pairs, view_digest):
+        rows.append({key: value for key, value in row.items() if key != "scenario"})
+    return rows
+
+
+def target_review_required_relation_rows(
+    inventory_context: InventoryContext,
+    view_digest: str,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for clock_a, clock_b in itertools.combinations(sorted(inventory_context.inventory.active), 2):
+        rows.append({
+            "schema_version": SCHEMA_VERSION,
+            "clock_a": clock_a,
+            "clock_b": clock_b,
+            "relation_type": "unknown",
+            "relation_source": "workbook_review_incomplete",
+            "source_rule_ids": "",
+            "clock_universe_digest": inventory_context.clock_universe_digest,
+            "assembled_view_digest": view_digest,
+        })
+    return rows
+
+
+def write_target_review_required_coverage(
+    path: Path,
+    wb: Workbook,
+    inventory_context: InventoryContext,
+    report: Report,
+) -> None:
+    view_digest = sha256_payload({
+        "state": "review_required",
+        "clock_universe_digest": inventory_context.clock_universe_digest,
+        "workbook_snapshot_digest": target_workbook_snapshot_digest(wb),
+    })
+    relation_rows = target_review_required_relation_rows(inventory_context, view_digest)
+    stale_invalid_rows = collect_target_stale_invalid_rows(wb)
+    write_coverage_report(
+        path,
+        inventory_context,
+        [],
+        {},
+        {},
+        {},
+        None,
+        view_digest,
+        relation_rows,
+        stale_invalid_rows,
+    )
+    report.warn(
+        f"coverage marks {len(relation_rows)} active clock pair(s) unknown while workbook review is incomplete"
+    )
+
+
+def write_target_report(
+    path: Path,
+    report: Report,
+    run: TargetRunContext,
+    inventory_context: Optional[InventoryContext],
+    form_path: Path,
+    output_path: Path,
+    relation_path: Path,
+    completion_path: Path,
+    completion_status: str,
+) -> None:
+    lines = [
+        "03_soc_clock_groups extraction report",
+        "=====================================",
+        "",
+        f"Author: {author_name()}",
+        "Stage: 03_soc_clock_groups",
+        "Script: 03_extract_soc_clock_groups.py",
+        f"Run ID: {run.run_id}",
+        f"Mode label: {run.mode_label}",
+        f"Design revision: {run.design_revision}",
+        f"Completion status: {completion_status}",
+        "Port accounting: not_applicable; added_bits=0",
+        f"Form: {form_path}",
+        f"Output: {output_path}",
+        f"Relation map: {relation_path}",
+        f"Completion: {completion_path}",
+        f"Warnings: {report.warning_count}",
+        f"Errors: {report.error_count}",
+        f"Sync changed: {'yes' if report.sync_changed else 'no'}",
+    ]
+    if completion_status == "diagnostic":
+        lines.extend([
+            "Port accounting mode: diagnostic/read-only",
+            "Accounting closure: not evaluated",
+        ])
+    if inventory_context is not None:
+        lines.extend([
+            f"Run completeness: {inventory_context.completeness}",
+            f"Structure digest: {inventory_context.structure_digest}",
+            f"01 inventory digest: {inventory_context.inventory_digest}",
+            f"Missing instances: {', '.join(inventory_context.missing_instances) or '<none>'}",
+        ])
+    lines.extend(["", "Messages:"])
+    lines.extend(report.lines or ["INFO: no messages"])
+    atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
+
+
+def run_target_single_run_03(args: argparse.Namespace) -> int:
+    print(f"Author: {author_name()}")
+    report = Report()
+    run_root = Path(args.run_root).expanduser().resolve()
+    input_root = run_root / "inputs"
+    form_path = run_root / "03_middle/03_soc_clock_groups.xlsx"
+    relation_path = run_root / "03_middle/relation_map.csv"
+    relation_meta_path = run_root / "03_middle/relation_map.meta"
+    completion_path = run_root / "03_middle/stage_completion.meta"
+    output_path = run_root / "03_result/03_soc_clock_groups.sdc"
+    report_path = run_root / "03_result/reports/clock_group_check_report.txt"
+    coverage_path = run_root / "03_result/reports/clock_group_coverage_report.xlsx"
+    run = read_target_run_context(input_root / "run_context.csv", report)
+    required_views_digest = validate_target_required_views(
+        input_root / "required_views.csv", report
+    )
+    inventory_context = load_target_inventory_context(run_root, run, report)
+    print(f"Run root: {run_root}")
+    print(f"Run ID: {run.run_id}")
+    print(f"Mode label: {run.mode_label}")
+    print("Port accounting: not_applicable; added_bits=0")
+
+    if not args.diagnose_only and completion_path.exists():
+        completion_path.unlink()
+        report.info("invalidated prior 03 completion meta before formal rerun")
+    if report.error_count or inventory_context is None:
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "failed",
+        )
+        print(f"Report: {report_path}")
+        return 1
+    if args.require_complete_harden_sdc and inventory_context.completeness != "complete":
+        report.error("01 inventory is partial and strict completeness was requested")
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "failed",
+        )
+        return 1
+    if not form_path.is_file():
+        wb = create_target_workbook(
+            form_path, run, inventory_context, required_views_digest,
+            args.max_candidate_pairs,
+        )
+        report.sync_changed = True
+        report.warn("created 03 review workbook with NEW_FROM_01 membership rows")
+        write_target_review_required_coverage(
+            coverage_path, wb, inventory_context, report
+        )
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "review_required",
+        )
+        print(f"Workbook: {form_path}")
+        print(f"Report: {report_path}")
+        return 1
+    try:
+        wb = load_workbook(str(form_path))
+    except Exception as exc:
+        report.error(f"cannot load workbook {form_path}: {exc}")
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "failed",
+        )
+        return 1
+
+    domain_ws, domain_mapping = sync_target_workbook(
+        wb, form_path, run, inventory_context, required_views_digest,
+        args.max_candidate_pairs, report,
+    )
+    if report.sync_changed:
+        atomic_save_workbook(wb, form_path)
+        report.warn("workbook changed during synchronization; review and rerun")
+        write_target_review_required_coverage(
+            coverage_path, wb, inventory_context, report
+        )
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "review_required",
+        )
+        print(f"Workbook: {form_path}")
+        print(f"Report: {report_path}")
+        return 1
+
+    domain_rows = read_target_domain_rows(
+        domain_ws, domain_mapping, inventory_context, report
+    )
+    domains = validate_and_build_domains(domain_rows, "common", inventory_context, report)
+    rules = read_target_rule_rows(wb[RULE_SHEET], report)
+    stale_invalid_rows = collect_target_stale_invalid_rows(wb)
+    assembled = validate_and_expand_rules(
+        rules, "common", inventory_context.inventory, domains, report
+    )
+    relation_pairs, same_group_pairs, participation = build_pair_maps(assembled)
+    check_assembled_view(
+        assembled, relation_pairs, same_group_pairs, inventory_context.inventory, report
+    )
+    view_digest = assembled_view_digest(
+        "single_run", assembled, domains, inventory_context.clock_universe_digest
+    )
+    relation_rows = target_relation_rows(inventory_context, relation_pairs, view_digest)
+    write_coverage_report(
+        coverage_path, inventory_context, assembled, relation_pairs, participation,
+        domains, None, view_digest, relation_rows, stale_invalid_rows,
+    )
+    report.info(f"wrote coverage report: {coverage_path}")
+    if report.error_count:
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "failed",
+        )
+        return 1
+
+    workbook_digest = target_workbook_semantic_digest(domain_rows, rules)
+    if args.diagnose_only:
+        report.info("diagnose-only completed; formal SDC/relation/completion were not published")
+        write_target_report(
+            report_path, report, run, inventory_context, form_path, output_path,
+            relation_path, completion_path, "diagnostic",
+        )
+        print("Diagnostic validation passed.")
+        return 0
+
+    sdc_text = generate_target_sdc(assembled, run, inventory_context, workbook_digest)
+    atomic_write_text(output_path, sdc_text)
+    relation_fields = [
+        "schema_version", "clock_a", "clock_b", "relation_type",
+        "relation_source", "source_rule_ids", "clock_universe_digest",
+        "assembled_view_digest",
+    ]
+    atomic_write_csv(relation_path, relation_fields, relation_rows)
+    relation_meta = {
+        "schema_version": SCHEMA_VERSION,
+        "author": author_name(),
+        "stage_name": "03_soc_clock_groups",
+        "run_id": run.run_id,
+        "mode_label": run.mode_label,
+        "design_revision": run.design_revision,
+        "completion_status": "complete",
+        "structure_digest": inventory_context.structure_digest,
+        "required_views_digest": required_views_digest,
+        "upstream_01_inventory_path": str(inventory_context.path.resolve()),
+        "upstream_01_inventory_digest": inventory_context.inventory_digest,
+        "upstream_01_inventory_meta_path": str(inventory_context.meta_path.resolve()),
+        "upstream_01_inventory_meta_digest": sha256_file(inventory_context.meta_path),
+        "upstream_01_completion_path": str(inventory_context.completion_path.resolve()),
+        "upstream_01_completion_digest": inventory_context.completion_digest,
+        "upstream_artifact_digests": {
+            "01_clock_inventory": inventory_context.inventory_digest,
+            "01_clock_inventory_meta": sha256_file(inventory_context.meta_path),
+            "01_stage_completion": inventory_context.completion_digest,
+        },
+        "workbook_path": str(form_path.resolve()),
+        "workbook_semantic_digest": workbook_digest,
+        "workbook_file_digest": sha256_file(form_path),
+        "output_sdc_path": str(output_path.resolve()),
+        "output_sdc_digest": sha256_file(output_path),
+        "relation_map_path": str(relation_path.resolve()),
+        "relation_map_digest": sha256_file(relation_path),
+        "clock_universe_digest": inventory_context.clock_universe_digest,
+        "assembled_view_digest": view_digest,
+        "run_completeness": inventory_context.completeness,
+        "missing_instances": list(inventory_context.missing_instances),
+        "active_rule_ids": sorted(
+            rule.group_id for rule in assembled if not rule.blocked_instances
+        ),
+        "blocked_rule_ids": sorted(
+            rule.group_id for rule in assembled if rule.blocked_instances
+        ),
+    }
+    atomic_write_text(
+        relation_meta_path,
+        json.dumps(relation_meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+    )
+    completion = {
+        "schema_version": "1.0",
+        "author": author_name(),
+        "stage_name": "03_soc_clock_groups",
+        "stage": "all",
+        "corner": "all",
+        "run_id": run.run_id,
+        "mode_label": run.mode_label,
+        "design_revision": run.design_revision,
+        "completion_status": "complete",
+        "error_count": 0,
+        "sync_changed": "no",
+        "structure_digest": inventory_context.structure_digest,
+        "required_views_digest": required_views_digest,
+        "upstream_01_inventory_path": str(inventory_context.path.resolve()),
+        "upstream_01_inventory_digest": inventory_context.inventory_digest,
+        "upstream_01_inventory_meta_path": str(inventory_context.meta_path.resolve()),
+        "upstream_01_inventory_meta_digest": sha256_file(inventory_context.meta_path),
+        "upstream_01_completion_path": str(inventory_context.completion_path.resolve()),
+        "upstream_01_completion_digest": inventory_context.completion_digest,
+        "upstream_artifact_digests": {
+            "01_clock_inventory": inventory_context.inventory_digest,
+            "01_clock_inventory_meta": sha256_file(inventory_context.meta_path),
+            "01_stage_completion": inventory_context.completion_digest,
+        },
+        "workbook_path": str(form_path.resolve()),
+        "workbook_semantic_digest": workbook_digest,
+        "workbook_file_digest": sha256_file(form_path),
+        "relation_map_path": str(relation_path.resolve()),
+        "relation_map_digest": sha256_file(relation_path),
+        "relation_meta_path": str(relation_meta_path.resolve()),
+        "relation_meta_digest": sha256_file(relation_meta_path),
+        "output_sdc_path": str(output_path.resolve()),
+        "output_sdc_digest": sha256_file(output_path),
+        "run_completeness": inventory_context.completeness,
+        "port_accounting": "not_applicable",
+        "added_bits": 0,
+        "accounting_digest_before": "not_applicable",
+        "accounting_digest_after": "not_applicable",
+        "accounting_delta_digest": "not_applicable",
+        "port_accounting_summary": "Port accounting: not_applicable; added_bits=0",
+    }
+    atomic_write_text(
+        completion_path,
+        json.dumps(completion, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+    )
+    report.info("published formal SDC, relation map/meta, and stage completion")
+    write_target_report(
+        report_path, report, run, inventory_context, form_path, output_path,
+        relation_path, completion_path, "complete",
+    )
+    print(f"SDC: {output_path}")
+    print(f"Relation map: {relation_path}")
+    print(f"Completion: {completion_path}")
+    print(f"Report: {report_path}")
+    return 0
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -2129,9 +3375,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-root",
-        help="target runtime root; reads 01_middle/assembled and writes 03_middle/03_result",
+        help="target runtime root; reads flat 01_middle artifacts and writes flat 03_middle/03_result artifacts",
     )
-    parser.add_argument("-scenario", "--scenario", required=True, choices=sorted(SCENARIOS), help="timing scenario")
+    parser.add_argument(
+        "-scenario", "--scenario", choices=sorted(SCENARIOS),
+        help="legacy mode only; target --run-root mode accepts no scenario selector",
+    )
     parser.add_argument(
         "-input",
         "--input",
@@ -2159,6 +3408,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="block when the 01 assembled inventory reports partial harden SDC availability",
     )
+    parser.add_argument(
+        "--diagnose-only",
+        action="store_true",
+        help="validate target inputs/workbook without publishing formal SDC or completion meta",
+    )
     return parser.parse_args(argv)
 
 
@@ -2171,6 +3425,34 @@ def resolve_path(base: Path, value: Optional[str], default: str) -> Path:
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.run_root:
+        target_overrides = [
+            name
+            for name, value in (
+                ("--scenario", args.scenario),
+                ("--input", args.input),
+                ("--inventory-meta", args.inventory_meta),
+                ("--clock-sdc", args.clock_sdc),
+                ("--form", args.form),
+                ("--report", args.report),
+                ("--coverage", args.coverage),
+                ("--relation-map", args.relation_map),
+                ("--relation-meta", args.relation_meta),
+            )
+            if value
+        ]
+        if target_overrides:
+            print(f"Author: {author_name()}")
+            print(
+                "ERROR: target single-run mode uses fixed paths and accepts no override(s): "
+                + ", ".join(target_overrides),
+                file=sys.stderr,
+            )
+            return 2
+        return run_target_single_run_03(args)
+    if not args.scenario:
+        print("ERROR: legacy mode requires --scenario; target mode requires --run-root", file=sys.stderr)
+        return 2
     print(f"Author: {author_name()}")
     scenario = args.scenario
     cwd = Path.cwd()

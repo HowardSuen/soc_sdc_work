@@ -1,46 +1,58 @@
 # 03_soc_clock_groups.sdc Rules
 
-本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。目标迁移后，表单/relation map 写入 `03_middle/`，最终 SDC/report 写入 `03_result/`。
-
-本文档记录 `03_soc_clock_groups.sdc` 的规则边界、建议表单格式和后续脚本机制。
+本 stage 遵守 [Shared Script Runtime Rules](../docs/shared_script_runtime_rules.md)。03 的 clock relationship 主体功能不变；一个 run root 只有一个场景，03 不接收 scenario，也不做 port accounting。
 
 ## 1. 目标
 
-`03_soc_clock_groups.sdc` 定义 SoC 级 clock relationship，即 clock domain 之间的 STA 分析关系。
+03 生成 SoC clock relationship：
 
-03 只表达 clock 之间的关系，不定义 clock 自身，也不表达 path-level exception。
-
-03 主要生成：
-
-```tcl
-set_clock_groups -asynchronous
-set_clock_groups -logically_exclusive
-set_clock_groups -physically_exclusive
+```text
+asynchronous
+logically_exclusive
+physically_exclusive
 ```
 
-03 依赖当前 `01_middle/assembled/<scenario>/clock_inventory.csv` 定义的 effective clock universe，并通过 assembled meta 检查最终 01 SDC digest 和 clock set 一致性。manual overlay clock 必须进入当前 scenario assembled inventory 后才能被 03 使用。`--run-root` 模式强制使用 assembled inventory/meta；无 `--run-root` 时保留 legacy 相对路径模式用于旧工程迁移和回归。
+输出：
 
-03 不读取或删除任何 target/legacy pending。若某个 vector harden clock port 被 01 展开为 per-bit clock object，03 只按 01 inventory 中的实际 `clock_name` 分组；表单不得用整 bus/range 代替这些 clock name。
+```text
+03_result/03_soc_clock_groups.sdc
+03_middle/relation_map.csv
+03_middle/relation_map.meta
+03_middle/stage_completion.meta
+03_result/reports/clock_group_check_report.txt
+03_result/reports/clock_group_coverage_report.xlsx
+```
 
-01 assembled meta 可以是 partial。03 对当前已存在的 clock universe 继续生成 group、coverage 和 relation map，并在 relation-map meta/report 中传递 missing harden 列表和 `Run completeness: partial`。
+03 不创建 clock，不设置 clock timing budget，不处理 IO delay、data interface budget 或 path exception。
 
-- active rule 引用的 clock 因 missing harden SDC 暂未进入 01 inventory 时，该 rule 标记 `blocked_by_missing_sdc`，不生成，但不阻断其它无关 rule。
-- 未进入当前 partial clock universe 的未知 clock 不参与 pair map；因此 `relation_map/<scenario>.meta` 必须记录 clock-universe digest 和 completeness，10/20/30 不得把缺失 clock 对应关系默认为 synchronous。
-- active rule 引用不在 01 inventory 且无法追溯到 missing SDC 的 clock，仍是真实 error。
+## 2. Clock Universe
 
-### 1.1 默认 STA 姿态
+唯一输入 clock universe：
 
-当前 03 规则采用 **默认 synchronous + 显式枚举 asynchronous / logically_exclusive / physically_exclusive** 的姿态：
+```text
+inputs/run_context.csv
+inputs/required_views.csv
+01_middle/clock_inventory.csv
+01_middle/clock_inventory.meta
+01_middle/stage_completion.meta
+```
 
-- 未被 `set_clock_groups` 覆盖的 clock pair，在 STA 中保持默认 synchronous 分析。
-- 表单主要枚举需要切断或互斥处理的 `asynchronous` / `logically_exclusive` / `physically_exclusive` 关系。
-- coverage report 中的 `uncovered_cross_root_pairs` 表示这些跨 03 genealogy `tree_root` clock pair 仍按默认 synchronous 分析，供 reviewer 判断是否应新增 group 或保留默认。
+inventory 必须与最终 `01_result/01_soc_clocks.sdc` digest 和 active clock set 一致。manual overlay、SoC top clock、SoC virtual clock 和 SoC-visible harden output clock 只有进入 01 inventory 后才能被 03 引用。
 
-如果项目决定采用 **默认 async + 显式声明 synchronous 例外** 的反向姿态，需要单独规划 03 表单语义、检查规则和 coverage report 读法；不能与当前规则混用。
+以下对象不进入 03：
 
-### 1.2 共享 clock relation 枚举
+- harden boundary input 上的重复 clock declaration。
+- harden internal/local clock。
+- private virtual clock。
+- 不在当前 run 01 inventory 中的 mode clock。
 
-03 是 SoC clock relationship 的权威来源。后续 10/20/30 若需要记录两端 clock 关系，必须使用同一套 canonical enum：
+03 不读取 port connectivity，也不修改 Used 状态列。
+
+## 3. 默认 STA 姿态
+
+没有显式 rule 的 clock pair 默认保持 synchronous。03 不根据 clock 名称自动异步，也不因为 pair 没有普通数据 path 就自动切断。
+
+共享 relation enum：
 
 ```text
 synchronous
@@ -50,475 +62,137 @@ physically_exclusive
 unknown
 ```
 
-规则：
+03 输出前三种非默认 relation；`synchronous` 和 `unknown` 主要进入 relation map / coverage。
 
-- 03 `relation_type` 生成时只使用 `asynchronous` / `logically_exclusive` / `physically_exclusive`。
-- `synchronous` 表示在当前 assembled view 中没有被 03 group 切断或互斥，仍按默认同步/相关时钟关系分析。
-- `unknown` 表示尚未完成 03 assembled view 查询或人工判断，不应被脚本当作 safe relation。
-- 下游表单可接受旧别名作为输入，例如 `async`、`sync`、`logically exclusive`，但脚本必须归一成 canonical enum 后再检查、报告和回写 xlsx。文档、review 记录和跨 stage 接口只使用 canonical enum。
+## 4. Relation 语义
 
-## 2. 放什么
+### 4.1 `asynchronous`
 
-03 可以放：
-
-- 架构上确认的 asynchronous clock group。
-- 架构上确认的 logically exclusive clock group。
-- 架构上确认的 physically exclusive clock group。
-- scenario 专属 clock relationship，例如 scan/test/mbist/gpio mode 下才成立的 exclusive group。
-
-03 不放：
-
-- `create_clock` / `create_generated_clock`，这些放 `01_soc_clocks.sdc`。
-- `set_clock_uncertainty` / `set_clock_latency` / `set_clock_transition` / `set_propagated_clock`，这些放 02。
-- IO delay / driving / load / input transition，这些放 04。
-- `set_false_path` / `set_multicycle_path` / `set_max_delay` / `set_min_delay`。
-- harden-to-harden 特定 path exception，这些放 30。
-
-## 3. 与 01 的关系
-
-03 的 clock universe 严格等于当前 `01_middle/assembled/<scenario>/clock_inventory.csv` 与其 meta 声明的最终 common/scenario SDC 一致交集。对 harden-origin clock，自动提升或 manual overlay 到 harden output port 的 clock 可以进入 03；harden input boundary declaration、internal/local/generated clock 和 private virtual clock 都不进入 03。
-
-03 不应独立重建另一套完整 Tcl parser。它使用 final inventory 的结构化 genealogy，并通过最终 01 SDC 的 digest/clock name 集合检查 inventory 是否 stale。最终 SDC 与 inventory 不一致时必须 error，不能只信其中一个继续生成 clock group。
-
-除 harden output clock 外，03 仍可使用 01 中的 SoC top clock、项目显式声明的 SoC virtual clock 和 scenario-visible clock。03 表单若直接引用不在 01 inventory 中的 harden internal/private clock，应报 error，不能按名字猜测或隐式创建。
-
-01 能提供 clock genealogy，例如：
-
-- clock name。
-- `clock_kind`：primary / generated / virtual。
-- direct source / root source。
-- generated clock 的 source/master 关系。
-- harden output clock 与下游 harden input clock 的连接证据。
-
-这些信息主要有两个用途：
-
-- 生成 clock group candidate，辅助人工 review。
-- 对已批准的 clock group 做 domain closure 展开和完整性检查，避免只把 master clock 放进 group、漏掉 generated/forwarded 子时钟。
-
-01 信息不能直接决定两个 domain 是否 asynchronous/exclusive，但可以判断一个已确认 domain 内还包含哪些派生 clock。
-
-重要原则：
-
-- 同 root source 不必然同步。
-- 不同 root source 不必然异步。
-- generated clock 不必然需要切异步；很多 PLL/divider generated clock 仍应做同步 timing。
-- clock mux 输入是否 exclusive，必须结合 mux select、mode、case analysis 和硬件结构确认。
-- test/scan/mbist/bypass clock 的关系通常 scenario-dependent，不能仅凭名字放进 common。
-- `set_clock_groups` 的 group 成员应按 clock domain closure 检查：如果某个 master/root/forwarded clock 被放入 group，它在 01 genealogy 中可追溯的 generated/forwarded descendants 也应进入同一 group，或有显式排除说明。
-- domain closure 只在 01 inventory 的 SoC-visible clock 图中展开，不跨入 harden internal/private clock namespace。
-- 不应默认依赖工具自动把 master clock 的 group 关系继承给 generated clock；这类行为存在工具/版本差异，03 输出应显式覆盖有效成员。
-
-因此，03 脚本后续可以从 01 自动生成候选关系，但最终输出必须来自人工确认的表单行。
-
-### 3.1 Domain Closure 展开
-
-03 表单中的 `group_N_clocks` 可以理解为人工确认的 domain seed/member clock。脚本生成 SDC 前，应基于 01 `clock_inventory.csv` 计算每个 group 的 effective members：
-
-```text
-effective_group = explicit_group_clocks
-                + descendants(explicit_group_clocks)
-                - explicitly_excluded_descendants
-```
-
-descendants 至少包括：
-
-- 由该 clock 作为 source/master 派生、且 target 为 SoC-visible top/output object 并已进入 01 inventory 的 `create_generated_clock`。
-- `create_generated_clock -combinational` 形成的 forwarded clock。
-- 经 harden output -> harden input -> harden output 转发后仍可由 01 genealogy 追溯到该 clock/domain 的 forwarded descendants。
-
-注意：
-
-- 不建议用“同 root_source 的所有 clock”无条件合并为一个 domain；同一个 root 下也可能存在需要单独分析的 generated clock。更安全的做法是从人工写入 group 的 clock 出发向下展开 descendants，并要求例外显式记录。
-- 如果某个 descendant 不应进入同一 group，必须在表单中明确排除并写明 `basis` / `note`，不能静默漏掉。
-- 对 `logically_exclusive` 组，descendant 展开必须特别 review。mux 两条输入腿可能在 mux 输出处重新汇合成同一个下游 clock；01 genealogy 可能因为 harden SDC 的 `-source` 只能把该 mux output clock 归到其中一条腿。脚本不能把这类汇合点 clock 静默塞进某一条 exclusive group，必须在 report 中突出显示，要求人工确认归属或显式排除。
-- 脚本应在 report 中列出每条 rule 自动加入的 descendants，便于 review。
-
-## 4. Common 与 Scenario
-
-03 采用 common + scenario 叠加模型，不采用 02 的 resolved-single-file 模型。
-
-输出建议：
-
-```text
-common/03_soc_clock_groups.sdc
-scenarios/<scenario>_clock_groups.sdc
-```
-
-归属规则：
-
-- `scenario = common`：只放所有 mode 都成立的 clock relationship。
-- `scenario != common`：只放该 scenario 下才成立的额外 clock relationship。
-- scenario 文件可以追加 common 中没有的 group，但不应与 common group 语义冲突。
-- 如果某条 common group 在某个 scenario 下不成立，说明它不应该在 common，应下沉到对应 scenario。
-- `--run-root` 模式生成非 common scenario 前必须先用同一版 workbook 生成 common 03 SDC；脚本通过稳定的 workbook semantic digest 阻止 scenario relation map 引用 stale common SDC。
-
-## 5. Relation Type 语义
-
-### 5.1 `asynchronous`
-
-用于两个或多个 clock domain 之间没有固定相位/频率关系，普通同步 STA 不应分析跨域 setup/hold。
-
-使用条件：
-
-- 有架构依据说明这些 domain 异步。
-- CDC/RDC signoff 有对应同步器、握手或协议检查。
-- 不是为了消除 timing violation 临时添加。
-- 如果 A/B/C 三个或更多 domain 是两两异步，应在同一条 `set_clock_groups -asynchronous` rule 中列出多个 `-group`。不要只拆成 `(A,B)`、`(A,C)` 两条 rule，否则 B/C 仍保持默认 synchronous。
-
-多域建模示例：
+用于没有固定 setup/hold 相位关系的 clock domain。命令示例：
 
 ```tcl
-# Correct: A/B/C are pairwise asynchronous.
-set_clock_groups -asynchronous \
-  -group [get_clocks {clk_a}] \
-  -group [get_clocks {clk_b}] \
-  -group [get_clocks {clk_c}]
-
-# Risky if A/B/C are intended pairwise async:
-# This leaves clk_b <-> clk_c uncovered and still default synchronous.
 set_clock_groups -asynchronous \
   -group [get_clocks {clk_a}] \
   -group [get_clocks {clk_b}]
-set_clock_groups -asynchronous \
-  -group [get_clocks {clk_a}] \
-  -group [get_clocks {clk_c}]
 ```
 
-风险：
+若 A/B/C 需要 pairwise async，必须明确生成足以覆盖所有 pair 的 group 语义，不能只写三组到一个命令后误以为每组内部也互相异步。
 
-- `set_clock_groups -asynchronous` 很强，会切断 group 间所有 timing path。
-- 不能替代 CDC signoff。
-- 不能滥用于某几个 violating path；局部 path exception 应放 20 或 scenario exception。
+### 4.2 `logically_exclusive`
 
-### 5.2 `logically_exclusive`
+用于逻辑 mux 等结构中不会同时传播/有效的 clock。必须有 mux/功能依据。
 
-用于同一个 STA view 中多个 clock 逻辑上互斥、但又没有通过 `set_case_analysis` 预先裁掉某一路的情况。
+如果当前 run 的 pre-setup 已经通过 `set_case_analysis` 选定单腿，通常不再对同一 mux leg 追加 logically exclusive；项目应在 `per_run_case` 与 `merged_exclusive` 两种方法学中选择一种。
 
-典型例子是 all-mode / merged STA view 中保留 clock mux 的多条输入腿，并用 `set_clock_groups -logically_exclusive` 告诉工具这些 clock 不会同时活动。
+### 4.3 `physically_exclusive`
 
-使用条件：
+用于物理上不能同时存在的 clock source，要求更强的硬件依据。不能把普通逻辑互斥升级为 physical exclusive。
 
-- 有明确的 mux/select/mode 证据。
-- 对于 **merged view**，即不通过 `set_case_analysis` 预先选定 mux 单腿的合并视图，可以用 `logically_exclusive` 告诉工具这些 clock 不会同时活动。
-- 对于 **per-scenario view**，如果 scenario pre-setup 已经用 `set_case_analysis` 选定 mux 单腿，未选中的 clock leg 通常不会传播，此时不应再对同一个 mux/clock pair 追加 `logically_exclusive`。
-- 如果 mux select 是 mode-specific，且该 scenario 已经通过 `set_case_analysis` 固定单腿，该 exclusive 关系不应进入该 scenario 的 03。
+## 5. Domain Closure
 
-方法学选择：
-
-- merged view：保留多条 mux clock leg，不打单腿 `set_case_analysis`，用 `logically_exclusive` 表达互斥。
-- per-scenario view：先在 `scenarios/<scenario>_pre.sdc` 用 `set_case_analysis` 选定单腿，再让 clock propagation/clock creation 只保留该 scenario 生效的 clock；不再对同一个 mux 额外打 exclusive。
-- 对同一个 mux，项目应先选择 `per_scenario_case` 或 `merged_exclusive` 方法学，再决定 03 是否生成 `logically_exclusive`。这不是两条约束的叠加问题，而是同一硬件关系的两种 STA 建模方式。
-
-硬规则：
-
-- 同一个 mux/clock pair 不要同时用 `set_case_analysis` 和 `logically_exclusive` 表达同一层互斥语义。
-- 如果 `set_case_analysis` 已经让某条 clock leg 在该 scenario 中不传播，相关 exclusive 约束应视为冗余，不能作为掩盖约束方法学问题的手段。
-- scan/mbist/test clock mux 必须先确认采用 per-scenario 单腿 case 还是 all-mode merged exclusive，再决定 03 是否生成对应 `logically_exclusive`。
-- per-scenario signoff run 中，如果 pre-setup 已经 case-select 了 scan/func/mbist mux，不应再用 scenario 03 对同一 mux leg 生成 `logically_exclusive`。
-
-### 5.3 `physically_exclusive`
-
-用于物理上不可能同时存在的 clock，例如不同 package/config/strap/physical source 互斥。
-
-使用条件：
-
-- 有物理配置、strap、power domain、package option 或 mode 依据。
-- 若只在特定 mode/config 成立，应下沉到 scenario 或后续 config-specific 机制。
-
-## 6. 建议表单
-
-建议第一版使用一个 workbook：
+表单允许先定义 domain membership，再用 domain 建 group rule。一个 domain 的 closure 至少包括：
 
 ```text
-03_soc_clock_groups.xlsx
+root clock
+所有应继承该 relationship 的 generated/forwarded descendants
+manual 声明的附加成员
+明确排除的 member
 ```
 
-建议包含三个 sheet：
+`exclude_descendant_clocks=yes` 只有在架构确认 descendants 不继承关系时使用。
+
+同一 active clock 默认只能属于一个 active domain；重复 membership 必须 error 或有明确 override 机制。
+
+## 6. Review Workbook
+
+```text
+03_middle/03_soc_clock_groups.xlsx
+```
+
+建议包含：
 
 ```text
 clock_domain_membership
 clock_group_rules
 clock_group_candidates
+run_metadata
 ```
 
-`clock_domain_membership` 是人工 clock-domain 归属的权威表单，解决 manual overlay clock、private naming 和无法从 SDC genealogy 可靠推断同步归属的问题。第一版脚本只生成 `clock_group_rules` 中 `apply = yes` 的行；`clock_group_candidates` 只作为 01 自动分析后的人工 review 辅助。
-
-### 6.1 Sheet: `clock_domain_membership`
-
-一行声明一个 clock 在一个 domain 中的角色：
-
-```text
-scenario
-domain_id
-clock_name
-membership_type
-include_descendants
-source_instance
-apply
-review_status
-owner
-basis
-note
-```
-
-字段语义：
-
-```text
-scenario             common / func / scan / mbist / gpio_in / gpio_out
-domain_id            稳定的人工 domain ID，例如 DOM_CPU、DOM_AON
-clock_name           01 assembled inventory 中的 canonical clock_name
-membership_type      seed / explicit_member / exclude_descendant
-include_descendants  yes/no；是否从该 clock 向下做 01 genealogy closure
-source_instance      可选；该 clock 依赖的 harden instance。partial run 中用于把缺失 clock 追溯到 missing SDC
-apply                yes/no
-review_status        draft / reviewed / approved / rejected
-owner                 domain 归属确认人
-basis                 同步归属、手动 clock 或排除 descendant 的架构依据
-note                  人工备注
-```
-
-规则：
-
-- `seed` 和 `explicit_member` 都把 `clock_name` 加入 domain；两者的差别是 `seed` 表示主要 domain 起点，`explicit_member` 表示人工确认的额外同域 clock。
-- `include_descendants = yes` 时，脚本使用 01 genealogy 自动加入 SoC-visible descendants。
-- `exclude_descendant` 从同一 `domain_id` 的 closure 中删除该 clock，且必须填写 `basis` / `note`。
-- manual overlay clock 或其它无法由 genealogy 推导的同域 clock 使用 `explicit_member`，不得依赖名字相似性自动归组。
-- active membership 的 clock 必须存在于当前 01 assembled inventory。若 inventory 为 partial，且 `source_instance` 明确命中 assembled meta 的 missing instance，则该 membership 标记 `blocked_by_missing_sdc`，不作为真实 unknown-clock error。
-- 同一 assembled scenario 中，一个 clock 默认只能属于一个 active `domain_id`。common 与 scenario 把同一 clock 分入不同 domain 时应 error。
-- domain membership 本身不生成 `set_clock_groups`，也不自动证明两个不同 domain synchronous；它只提供可复用的 group member 集合。
-
-### 6.2 Sheet: `clock_group_rules`
-
-一行描述一条 `set_clock_groups` 约束。
+### 6.1 `clock_domain_membership`
 
 建议字段：
 
 ```text
-scenario
+domain_id
+clock_name
+membership_type
+root_clock
+apply
+review_status
+basis
+note
+```
+
+`clock_name` 必须存在于 01 inventory。
+
+### 6.2 `clock_group_rules`
+
+建议字段：
+
+```text
 group_id
 relation_type
 group_1_domains
-group_1_clocks
 group_2_domains
-group_2_clocks
-...
-group_N_domains
-group_N_clocks
 exclude_descendant_clocks
 analysis_style
 apply
 review_status
 owner
 basis
-cdc_required
 note
 ```
 
-字段含义：
+`analysis_style` 可使用：
 
 ```text
-scenario          common / func / scan / mbist / gpio_in / gpio_out
-group_id          规则 ID，建议稳定且可 review，例如 CG_ASYNC_CPU_AON_001
-relation_type     asynchronous / logically_exclusive / physically_exclusive
-group_N_domains   该 group 引用的 domain_id 列表，空格或换行分隔
-group_N_clocks    该 group 中的 clock name 列表，空格或换行分隔
-exclude_descendant_clocks  不随 domain closure 自动加入的 descendant clock；非空时必须在 basis/note 解释
-analysis_style    normal / merged_exclusive / per_scenario_case；per_scenario_case 通常只作记录/检查，不生成 logically_exclusive
-apply             yes/no
-review_status     draft / reviewed / approved / rejected
-owner             约束 owner 或确认人
-basis             架构依据，例如 CDC spec、clock tree spec、mux select、DFT mode 说明
-cdc_required      yes/no；asynchronous group 通常应有 CDC/RDC signoff 依据
-note              人工备注
+normal
+merged_exclusive
+per_run_case
 ```
 
-示例：
+`per_run_case` 通常 `apply=no`，只记录当前 run 已由 pre-setup case-select。
 
-```text
-scenario | group_id              | relation_type        | group_1_domains       | group_2_domains      | exclude_descendant_clocks | apply | review_status | basis
-common   | CG_ASYNC_CPU_AON_001  | asynchronous         | DOM_CPU                | DOM_AON               |                          | yes   | approved      | CDC spec section 3.2
-common   | CG_EXCL_PLL_MERGED_001| logically_exclusive  | DOM_PLL_FUNC           | DOM_PLL_BYPASS        |                          | yes   | approved      | all-mode merged view, mux select not case-fixed
-```
+### 6.3 `clock_group_candidates`
 
-`group_N_domains` 与 `group_N_clocks` 可以并用，解析后取并集。manual clock 较多的项目应优先维护 domain membership，再让 relation rule 引用 domain ID；`group_N_clocks` 保留给小范围直接成员和旧表单兼容。
+脚本可根据 root source、harden SDC evidence、命名和 topology 生成候选，但 candidate 不能直接生成 SDC。candidate 至少记录 reason、evidence 和 recommended action。
 
-group 列不建议固定上限。脚本应识别所有满足 `group_<number>_domains` / `group_<number>_clocks` 命名的列；demo 表单可以先预留 8 或 16 组，但规则本身不限制为 4 组。
+## 7. 脚本机制
 
-允许中间 group 列留空，例如只填 `group_1_*` 和 `group_3_*`；coverage/relation provenance 必须保留原始 group number，不得把 `group_3` 重编号为 `group_2`。
-
-rule-level `exclude_descendant_clocks` 可排除 direct clock closure 或 `group_N_domains` 带入的 domain closure descendant；若对应 clock 只是 explicit domain member 而不是 descendant，仍应 warning。可复用的 domain 固定排除应优先写在 `clock_domain_membership` 的 `exclude_descendant` 行。
-
-对应生成示例：
-
-```tcl
-set_clock_groups -asynchronous \
-  -group [get_clocks {cpu_clk}] \
-  -group [get_clocks {aon_clk}]
-
-set_clock_groups -logically_exclusive \
-  -group [get_clocks {pll_func_clk}] \
-  -group [get_clocks {pll_bypass_clk}]
-```
-
-如果采用 per-scenario 单腿 case 方法学，则不应把同一 mux 写成 `logically_exclusive` 规则。例如：
-
-```tcl
-# scenarios/func_pre.sdc
-set_case_analysis 1 [get_pins u_pll_clk_mux/func_sel]
-
-# 此时不再为 pll_func_clk / pll_bypass_clk 生成 logically_exclusive。
-```
-
-如果表单中为了 review 记录这一类 mux 关系，建议 `analysis_style = per_scenario_case` 且 `apply = no`；真正生效的约束放在 `scenarios/<scenario>_pre.sdc` 的 `set_case_analysis`。
-
-### 6.3 Sheet: `clock_group_candidates`
-
-候选 sheet 只用于辅助 review，不直接生成 SDC。
-
-建议字段：
-
-```text
-candidate_id
-candidate_type
-clock_a
-clock_b
-tree_root_a
-tree_root_b
-root_source_a
-root_source_b
-evidence
-suggested_relation
-decision
-target_group_id
-note
-```
-
-候选来源可以包括：
-
-- 第一版脚本自动生成的 candidate 只覆盖 03 genealogy `tree_root` 不同的 clock pair；01 `root_source` 仅作为参考字段保留。
-- 01 中明确经过 mux/bypass/test source 的 clock。
-- integration 表中跨 harden 的 clock domain 边界。
-- 用户手工导入的 clock relationship review list。
-
-注意：candidate 不能自动生成 `set_clock_groups`，必须转成 `clock_group_rules` 且 `review_status = approved` 后才可生成。
-
-## 7. 脚本机制建议
-
-运行方式：
+### 7.1 命令行
 
 ```bash
-python3 03_extract_soc_clock_groups.py -scenario common
-python3 03_extract_soc_clock_groups.py -scenario func
-python3 03_extract_soc_clock_groups.py --run-root <run_root> -scenario common
-python3 03_extract_soc_clock_groups.py --run-root <run_root> -scenario func
+python3 03_extract_soc_clock_groups.py \
+  --run-root <run_root>
 ```
 
-选项：
+不接受 scenario 选择。
 
-```text
--scenario / --scenario        必填；common / func / scan / mbist / gpio_in / gpio_out
---run-root                    target runtime root；指定后强制使用 01_middle/assembled 和 03_middle/03_result
--input / --input              可选覆盖 01 clock inventory CSV
---inventory-meta              可选覆盖 01 assembled inventory meta
---clock-sdc                   可选覆盖最终 01 SDC；未指定时使用 meta 中的 final_sdc_path
---form                        可选覆盖 03 workbook
---report                      check report 路径；默认 clock_group_check_report_<scenario>.txt
---coverage                    可选覆盖 coverage workbook
---relation-map                可选覆盖 complete relation CSV
---relation-meta               可选覆盖 relation meta
---max-candidate-pairs         首次创建 workbook 时写入 candidate sheet 的最大 cross-tree pair 数量；默认 500
---require-complete-harden-sdc partial inventory 时阻断，用于 signoff/CI completeness gate
-```
+### 7.2 同步和 review gate
 
-target runtime 中 `-scenario` 解析到 `01_middle/assembled/<scenario>/clock_inventory.csv` 及 meta，不依赖 `../01_soc_clocks` 相对路径或单一 common inventory。
+1. 读取 01 inventory/meta。
+2. 创建或更新 review workbook 的 machine context。
+3. 新 clock 添加 candidate/membership 待 review。
+4. 01 已删除的 clock 标记 stale。
+5. workbook 同步变化时不生成正式 SDC。
+6. 只对 `apply=yes + review_status=approved` 的 rule 生成。
 
-默认输入（`--run-root`）：
+## 8. Relation Map
 
-```text
-01_middle/assembled/<scenario>/clock_inventory.csv
-01_middle/assembled/<scenario>/clock_inventory.meta
-meta.final_sdc_path
-03_middle/03_soc_clock_groups.xlsx
-```
-
-输出：
-
-```text
-scenario = common:
-  03_result/common/03_soc_clock_groups.sdc
-
-scenario != common:
-  03_result/scenarios/<scenario>_clock_groups.sdc
-
-reports:
-  03_result/reports/clock_group_check_report_<scenario>.txt
-  03_result/reports/clock_group_coverage_report_<scenario>.xlsx
-
-machine interface:
-  03_middle/relation_map/<scenario>.csv
-  03_middle/relation_map/<scenario>.meta
-```
-
-`--run-root` 模式使用上述固定产物路径。legacy 模式同样生成 relation map，但不得作为下游固定路径接口。
-
-生成规则：
-
-- 读取 `clock_domain_membership` 解析人工 domain，只由 `clock_group_rules` 中的 active rule 生成 `set_clock_groups`；`clock_group_candidates` 不参与生成。
-- 只生成 `scenario = 当前 -scenario` 的行。
-- 只生成 `apply = yes` 且 `review_status = approved` 的行。
-- 至少两个 numbered group 在合并 `group_N_domains` 与 `group_N_clocks` 后非空。
-- 自动识别所有 `group_<number>_clocks` 列，不把有效 group 数量限制在 4 组。
-- 自动识别所有 `group_<number>_domains` 列，将 resolved domain member 与同组 direct clock 取并集。
-- 每个 group 内至少一个 clock。
-- 每个 clock 必须存在于当前 01 assembled inventory 的有效 clock list。
-- 01 assembled meta 中的 common/scenario SDC digest、clock-universe digest 和 scenario 必须与当前运行一致。
-- 对每个 group 做 domain closure 展开，自动加入 01 中可追溯的 generated/forwarded descendants。
-- 输出 SDC 使用展开后的 effective group，而不是只使用表单中手写的 explicit group。
-- report 中列出每条 rule 的 explicit group、auto-added descendants、excluded descendants 和最终 effective group。
-- 同一个 `group_id` 不允许重复。
-
-### 7.1 Assembled View 与 Pair Relation Map
-
-03 的检查不能只看单条 rule，还必须检查某个 scenario 最终 source 后的 assembled view。
-
-assembled view 定义：
-
-```text
-scenario = common:
-  active_rules = common approved rules
-
-scenario != common:
-  active_rules = common approved rules + current scenario approved rules
-```
-
-脚本应在 domain closure 展开后，为 assembled view 建立完整 clock-pair relation map：
-
-```text
-pair(clock_a, clock_b) -> relation_type, relation_source, source_rule_ids, scenario
-```
-
-建图规则：
-
-- 对每条 `set_clock_groups` rule，只有不同 `-group` 之间的 clock pair 会得到该 rule 的 `relation_type`。
-- 同一个 `-group` 内部的 clock pair 不会被该 rule 切断，但它们代表同一侧 domain 成员；如果它们在另一条 active rule 中被分到不同 group，应作为一致性风险检查。
-- pair key 使用无序 clock pair，例如 `{clk_a, clk_b}`，避免 A/B 顺序造成重复。
-- relation map 必须遍历当前 01 assembled clock universe 的所有无序 pair。未命中任何 active clock-group rule 的 pair 仍写入 CSV，并标记 `relation_type=synchronous, relation_source=default_synchronous`。
-- 命中 active rule 的 pair 标记 `relation_source=explicit_rule`，`source_rule_ids` 记录所有来源 rule。多条 rule 对同一 pair 给出不同 relation 时必须在写 CSV 前 error，不得靠输出顺序裁决。
-
-### 7.2 Machine-readable Relation Map
-
-03 必须在 SDC 和 assembled-view 检查成功后生成：
-
-```text
-03_middle/relation_map/<scenario>.csv
-03_middle/relation_map/<scenario>.meta
-```
-
-CSV 最少字段：
+`03_middle/relation_map.csv` 是 10/20/30 的机器接口。每行表示一个 canonical unordered clock pair：
 
 ```text
 schema_version
-scenario
 clock_a
 clock_b
 relation_type
@@ -528,110 +202,67 @@ clock_universe_digest
 assembled_view_digest
 ```
 
-契约：
+规则：
 
-- `clock_a < clock_b` 按稳定字符串顺序写入，保证 pair 唯一。
-- `relation_type` 只能是 `synchronous` / `asynchronous` / `logically_exclusive` / `physically_exclusive`。
-- `relation_source` 只能是 `default_synchronous` / `explicit_rule`。
-- `source_rule_ids` 对 default synchronous 留空；对 explicit rule 按稳定顺序记录 rule id 列表。
-- `clock_universe_digest` 来自 `01_middle/assembled/<scenario>/clock_inventory.meta`。
-- `assembled_view_digest` 覆盖 scenario、active common/scenario rule、effective group、relation type 和 01 clock-universe digest。
-- `<scenario>.meta` 记录 schema version、resolved input/output absolute path、01 assembled inventory/meta digest、03 workbook semantic digest、workbook file digest、common/scenario 03 SDC digest 和 relation-map CSV digest。
-- 10/20/30 只能消费该 CSV，不得各自解析 coverage workbook 或重建 clock relation。
-- 10/20/30 使用 relation map 只做约束语义检查，不用它判定 port ownership，也不自动生成 exception。
+- `clock_a < clock_b` 使用稳定字典序。
+- 所有 active clock pair 都应有记录，未显式分组的 pair 记为 `synchronous/default_synchronous`。
+- 同一 pair 不能有多个冲突 relation。
+- `unknown` 只用于 evidence 不完整，不能自动降级为 synchronous。
+- `assembled_view_digest` 覆盖当前 run 的 active rule、effective group、relation 和 01 universe digest。
 
-### 7.3 Coverage Report
+`relation_map.meta` 至少记录 01 inventory/meta digest、03 workbook semantic/file digest、03 SDC digest 和 relation-map digest。
 
-第一版脚本应生成 `clock_group_coverage_report_<scenario>.xlsx`，用于 review 而不是直接生成 SDC。
+`03_middle/stage_completion.meta` 必须记录 run provenance、structure digest、01 completion/inventory digest、03 workbook/relation-map/SDC digest、`error_count=0`、`sync_changed=no` 和 `Port accounting: not_applicable; added_bits=0`。review-required、stale 或 diagnose-only 不得标 complete。
 
-建议 sheet：
+## 9. Coverage Report
+
+coverage workbook 至少包含：
 
 ```text
-clock_participation
-pair_relation_map
-uncovered_cross_root_pairs
-root_pair_summary
+clock participation
+explicit relation coverage
+default synchronous pairs
+unknown/incomplete pairs
+stale/invalid rules
+pair_relation_map review view
 ```
 
-建议内容：
+coverage workbook 的 pair map 和 `relation_map.csv` 必须来自同一计算结果。
 
-- `clock_participation`：每个 01 有效 clock 的 `clock_name`、`clock_kind`、03 genealogy `tree_root`、01 `root_source`、参与的 `group_id`、所在 effective group、relation type。
-- `pair_relation_map`：assembled view 中每个被 `set_clock_groups` 覆盖的 clock pair、relation type、来源 rule。
-- `uncovered_cross_root_pairs`：03 genealogy `tree_root` 不同、但未被任何 active clock group 覆盖的 clock pair；这些 pair 在 STA 中仍按默认 synchronous 分析。01 `root_source` 仅作为诊断参考列。
-- `root_pair_summary`：按 `tree_root_a/tree_root_b` 聚合 uncovered pair 数量和样例，避免大 SoC 中 pair 清单过长难以 review。
-- coverage workbook 中的 `pair_relation_map` sheet 是人工 review 视图；`03_middle/relation_map/<scenario>.csv` 才是 10/20/30 的机器接口。两者应来自同一份 assembled relation map，不得分别计算。
+## 10. 检查项
 
-注意：
+### Error
 
-- `uncovered_cross_root_pairs` 只是 review 抓手，不表示这些 pair 一定应该 asynchronous/exclusive。
-- 脚本不能因为 01 `root_source` 字符串不同就自动生成 asynchronous group；报告使用 03 基于 parent map 计算的 genealogy `tree_root` 判断独立时钟树，只报告“当前仍默认同步”的跨 tree pair，等待架构/CDC owner 决策。
-- 已知限制：coverage report 不建模 `set_case_analysis`；被 scenario case 掉的时钟参与的 pair 可能仍显示为 uncovered，实际在该 scenario 中并不分析。后续可让 03 读取 scenario pre-setup 的 case_analysis 列表再过滤。
+- 01 inventory/meta 缺失或 stale。
+- rule/member 引用未知 clock。
+- duplicate domain membership 或 group id。
+- relation_type 非法。
+- active rule 缺 owner/basis/review。
+- 同一 pair 出现冲突 relation。
+- `per_run_case` 仍 `apply=yes` 生成 exclusive。
+- generated descendant 漏入/漏出导致 domain closure 不一致。
 
-## 8. 检查项
+### Warning
 
-第一版脚本至少做 rule-local、assembled-view 和 coverage 三类检查。
+- async/exclusive 依据不足。
+- clock 名看似 test/scan/mbist，但当前 run 输入没有清晰说明。
+- relation map 存在 unknown pair。
+- partial harden SDC 可能导致 candidate 不完整。
 
-### 8.1 Rule-local 检查
+## 11. 与 CDC / Exception 的边界
 
-- `scenario` 合法。
-- `relation_type` 合法。
-- `analysis_style` 合法。
-- `apply` 合法。
-- `review_status` 合法。
-- `apply = yes` 时 `review_status` 必须为 `approved`。
-- `group_id` 非空且唯一。
-- 至少两个 non-empty group。
-- 所有 clock name 存在于 01 clock inventory。
-- group 引用 harden internal/private clock，或试图直接使用 harden input boundary clock declaration 时应 error；03 不允许绕过 01 inventory 扩展 clock universe。
-- 同一条 rule 中同一个 clock 不应同时出现在多个 group。
-- 同一条 rule 的 effective group 之间不应出现同一个 clock。
-- 若 explicit group 中的 clock 在 01 中存在 generated/forwarded descendants，则这些 descendants 必须进入同一 effective group，或出现在 `exclude_descendant_clocks` 并有明确 `basis` / `note`；否则至少 strong warning，signoff 模式建议 error。
-- `exclude_descendant_clocks` 中的 clock 必须确实是某个 direct explicit clock 或引用 domain seed/member closure 中的 descendant，否则 warning。
-- `relation_type = logically_exclusive` 时，auto-added descendants 必须在 report 中单独标记为需要 review；若 suspected mux merge / shared downstream clock 无法自动判定归属，应 warning，并要求人工放入正确 group 或加入 `exclude_descendant_clocks`。
-- common rule 的 `basis` 不能为空。
-- asynchronous rule 建议 `cdc_required = yes`，否则 warning。
-- relation_type 与 basis 不匹配时 warning，例如 logically_exclusive 但 basis 未提 mux/select/mode。
-- `relation_type = logically_exclusive` 且 `apply = yes` 时必须显式填写 `analysis_style`，不能依赖空值默认为 normal。
-- `relation_type = logically_exclusive` 且 `analysis_style = per_scenario_case` 且 `apply = yes` 时应 error，因为该方法学应依赖 `set_case_analysis` 单腿传播，不应再生成 exclusive。
-- `relation_type = logically_exclusive` 且 `analysis_style = merged_exclusive` 时，basis 必须说明该 view 未对同一 mux select 打单腿 `set_case_analysis`。
+- 03 只描述 clock-domain relation，不生成 path-level false path/MCP/max/min。
+- CDC 数据稳定窗口若需要 max/min override，由 30 处理并验证 03/30 exception priority。
+- 局部 violating path 不能用 clock group 掩盖。
 
-### 8.2 Assembled-view 一致性检查
+## 12. Port Accounting
 
-对 `common + 当前 scenario` 的 active rules，至少检查：
+03 永远不修改：
 
-- 同一个 clock pair 在 assembled view 中不应同时出现多个不同 `relation_type`；例如 common 说 A/B asynchronous，scenario 又说 A/B logically_exclusive，应 error。
-- scenario rule 不应与 common rule 对同一 clock pair 表达不同语义；若 scenario 需要不同关系，说明 common rule 归属错误，应下沉或拆分。
-- 同一个 clock pair 被多条 rule 重复声明相同 `relation_type` 时，建议 warning 并在 report 中列出来源 rule，方便去重。
-- 如果两个 clock 在某条 active rule 的同一个 effective group 内，但又在另一条 active rule 中被分到不同 group 并赋予 `asynchronous` / `logically_exclusive` / `physically_exclusive` 关系，应 warning 或 error。
-- 对同一种 `relation_type`，若 assembled view 中存在 A/B 和 A/C 关系、但 B/C 未覆盖，应 warning 提醒 reviewer 确认是否需要 B/C 也同属该关系；若 A/B/C 本意是两两异步或两两互斥，应合并到同一条多 group rule 或补齐缺失 pair。
-- 若 B/C 已在同一 genealogy tree 内，则可视为默认同步兄弟，脚本可跳过该条 non-clique warning。
-- scenario 03 只能追加该 scenario 专属关系，不能靠 source 顺序覆盖 common 03。
-- non-clique warning 允许截断，达到上限后应提示 `limit reached` 并依赖 coverage report 继续 review；v1 上限建议 50 条。
+```text
+Input Used Width
+Output Used Width
+Inout Name
+```
 
-### 8.3 Coverage 检查
-
-基于 01 的有效 clock list 和 assembled view，至少输出：
-
-- 每个 clock 的 group 参与情况；没有参与任何 clock group 的 clock 应在 `clock_participation` 中标出。
-- 每个 genealogy `tree_root` pair 的覆盖情况：covered pair 数量、uncovered pair 数量、relation type 分布。
-- genealogy `tree_root` 不同且未被任何 active clock group 覆盖的 clock pair 清单；这些 pair 仍是默认 synchronous。
-- 对 coverage report 不直接报错；是否要求某些 cross-tree pair 必须被标注，由项目 CDC/STA review 决定。
-
-## 9. 与 CDC / SpyGlass 的边界
-
-03 对 SpyGlass CDC 有复用价值，但不是 CDC signoff 的完整输入。
-
-- 01 clock 定义和 03 async group 可以辅助 CDC clock setup。
-- `set_clock_groups -asynchronous` 说明 STA 不做同步 timing，不代表 CDC 已经安全。
-- CDC/RDC 需要额外的 synchronizer、reset、protocol、waiver 信息，不能只靠 SDC 表达。
-
-## 10. 第一版暂不处理
-
-第一版暂不自动推断并生成 clock group：
-
-- 不根据 clock 名字自动判断 test/scan/mbist。
-- 不根据 01 `root_source` 或 03 genealogy `tree_root` 不同自动生成 asynchronous。
-- 不根据 generated/master 关系自动生成 synchronous 或 exclusive。
-- 不做 path-level exception 替代。
-
-这些信息只能进入 candidate/report，等待人工 review。
+clock relationship 不能单独成为 harden port 销账依据。
