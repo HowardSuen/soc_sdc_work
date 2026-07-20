@@ -44,8 +44,9 @@ inputs/port_*.xlsx
 00_middle/stage_completion.meta
 01_middle/clock_inventory.csv
 01_middle/stage_completion.meta
-03_middle/stage_completion.meta
 ```
+
+00/01 completion 必须存在、为 `complete`、provenance/structure 一致且无 error/sync change；01 completion 声明的 `clock_inventory_digest` 必须匹配实际 `01_middle/clock_inventory.csv`。04 不依赖 03 relation completion。
 
 pad connection 由以下字段建立：
 
@@ -53,7 +54,7 @@ pad connection 由以下字段建立：
 - `To Top = top.<pad>` 或 `<pad>`：harden output 驱动 top output pad。
 - `Inout Connectivity = top.<pad>`：harden inout 与 top inout pad 相连。
 
-04 必须按 actual HDL bit 展开 range。一个 top pad bit 对应多 destination harden input 时可以 fanout，但每条 direct mapping 单独记录。
+04 必须按 actual HDL bit 展开 range。完整 range、subrange 和 exact-bit harden SDC evidence 均须替换为 exact top/harden bit review row；任一 selected bit 不能唯一映射时整条 evidence fail closed，不得只发布已匹配子集。一个 top pad bit 对应多 destination harden input 时可以 fanout：IO command 每个 exact top bit 只发一次，但每条 direct mapping 在 `pad_inventory` 中单独记录。
 
 04 不读取 00 connection inventory。
 
@@ -117,6 +118,8 @@ input_delay max/min
 input_transition 或 driving_cell/drive
 ```
 
+approved row 的 effective direction 必须仍为 `input`，不得通过同时修改 constraint type 和 direction 绕过 integration direction。
+
 ### 4.2 Output pad
 
 可能需要：
@@ -127,14 +130,17 @@ load
 max_transition
 ```
 
+approved row 的 effective direction 必须仍为 `output`。
+
 ### 4.3 Inout / GPIO
 
-inout 必须明确当前 run 的方向和 case 条件。实际连接来自 `Inout Connectivity`；`Inout Name` 是销账状态列。
+inout 必须明确当前 run 的方向和 case 条件。实际连接只来自 `Inout Connectivity`；`Inout Name` 是销账状态列，后续重跑不得把其中的 Used bit 当成 top pad 名。
 
 - 当前 run 作为 input：按 input rule 生成。
 - 当前 run 作为 output：按 output rule 生成。
-- 方向未确定：保持 review，不生成 broad 双向约束。
+- approved row 必须把 effective direction 显式改为 `input` 或 `output`；保留 `inout`、blank 或 `bidirectional` 时保持 review，不生成 broad 双向约束。
 - `bidirectional` 不属于单场景 runtime 的合法 effective direction；若硬件需要同一分析中双向计时，必须拆成独立 run。本规则只要求当前 run 的 input 或 output 一类覆盖。
+- inout `route_to_30` 还必须在 pad review row 填写 `effective_direction`。当前 30 oriented edge contract 只支持 `input`（top→harden）handoff；`output`（harden→top）必须 fail closed，待 30 发布反向 edge contract 后再开放，不能输出方向错误的 canonical endpoint。
 
 ## 5. Timing 分类
 
@@ -156,7 +162,7 @@ config
 
 ## 6. Stage / Corner
 
-一个 run 可有多个 timing stage/corner row。生成时按 `--stage` / `--corner` 选择当前 view；不再按 scenario 分层。
+一个 run 可有多个 timing stage/corner row。生成时按 `--stage` / `--corner` 选择当前 view；不再按 scenario 分层。若 required views 中存在真实 `all/all` view，显式 `--stage all --corner all` 必须选择该 view；仅当不存在真实 `all/all` required view 时，默认 `all/all` 才可回落到首个 required 04 view。
 
 04 只允许正式生成 `required_views.csv` 中 `require_04=yes` 的 view；非 required view 只能显式 diagnostic 运行。
 
@@ -225,7 +231,9 @@ coverage_status
 note
 ```
 
-该 sheet 是 04 owner inventory，不替代原始 port workbook。多 view row 按 `pad_id/view_id` 共存，resolved CSV 不得在后续 view 运行时删除其它已 committed view。
+该 sheet 是 04 owner inventory，不替代原始 port workbook。多 view row 按 `pad_id/view_id` 共存，resolved CSV 不得在后续 view 运行时删除其它已 committed view。当前 view 已不存在的 machine row 必须在同步阶段移除并要求重新 review，不能继续作为 stale owner 发布。
+
+即使 inventory 只有 header、没有 pad row，`pad_inventory.meta.view_ids` 也必须累计所有已认证 required view，不能因空 inventory 丢失 prior view completion。
 
 04 必须把该 sheet 的 resolved machine view 发布为：
 
@@ -234,7 +242,22 @@ note
 04_middle/pad_inventory.meta
 ```
 
-除上述字段外，machine view 还必须记录 `pad_disposition`、`apply/review_status`、`related_exception_intent`、structure digest、source digest 和当前 exact endpoint。`pad_id` 使用 canonical pad tuple 的完整 SHA-256，不得使用易碰撞的可读字符串替换。
+除上述字段外，machine view 还必须记录 `pad_disposition`、`effective_direction`、`apply/review_status`、`related_exception_intent`、structure digest、source digest 和当前 exact endpoint。04/30 跨阶段 owner identity 与 exact direct edge 使用同一 canonical tuple：
+
+```text
+[schema_version,
+ src_instance,src_direction,src_port_base,src_bit_index,
+ dst_instance,dst_direction,dst_port_base,dst_bit_index]
+```
+
+对该 UTF-8 canonical JSON array 计算完整 lowercase SHA-256：
+
+```text
+pad_id        = <64-lowercase-hex>
+connection_id = CONN_<same-64-lowercase-hex>
+```
+
+`pad_id` 不带 `PAD_` 前缀；view、stage/corner、review 状态、workbook 行号和 digest 均不进入 identity。这样 30 的 `related_04_pad_id` 可直接引用同一 exact edge owner，且不得使用易碰撞的可读字符串替换。
 
 `pad_disposition` 使用：
 
@@ -245,8 +268,9 @@ route_to_30
 pending
 ```
 
-- async/config pad path 需要 exception 时必须是 `route_to_30`；04 不为该 path 销账。
-- `route_to_30` 必须 `apply=yes + review_status=approved`，并保留 pad electrical owner 状态供 30 引用。
+- async/config pad path 需要 exception 时必须是 `route_to_30`；flat 04 不生成 `set_false_path`，也不为该 exception path 销账。
+- `route_to_30` 必须 `apply=yes + review_status=approved`，并保留 pad electrical owner 状态供 30 引用。它可以与 04 的 `load/drive/input_transition/max_transition/max_capacitance` electrical command 共存，但不得与 active input/output delay 或 04 exception 共存。
+- inout route 还必须与 active electrical row 使用相同 effective direction；当前 output-oriented inout route 不得发布给 30。
 
 ### 7.3 `extraction_log`
 
@@ -259,7 +283,8 @@ pending
 - max/min 配对按 constraint_type 明确，不能把 blank 当 0。
 - numeric value 必须 finite。
 - `set_driving_cell` 必须有 library cell/pin 信息。
-- 每条命令 target 必须是 exact top port/bit；不允许未 review 的 wildcard/range 扩大。
+- 每条命令 target 必须是 exact top port/bit。自动提取的 range/subrange evidence 必须先拆成 `object_granularity=single_pad` exact-bit row；flat formal generation 不接受 `port_list/pattern` approval，也不允许 wildcard/range 扩大。
+- 同一 top bit 的 reviewed IO command 覆盖该 bit 的全部 fanout direct edge；normal input/output delay 与任一 fanout edge 的 `route_to_30` 冲突，electrical-only command 可与逐 edge `route_to_30` 共存。
 - 同一 assembled view 的重复 rule 必须数值一致，否则 error。
 
 ## 9. Port Accounting
@@ -275,7 +300,7 @@ inout  -> Inout Name
 允许 terminal：
 
 - 已生成所需 IO timing/electrical constraint。
-- 已批准 `untimed/not_applicable`，且 owner/basis/reviewer 完整。
+- 已批准 `untimed/not_applicable`，且 owner/basis/reviewer/review_date 完整。
 - missing SDC 情况下存在独立的 board/pad architecture basis。
 
 不销账：
@@ -285,9 +310,17 @@ inout  -> Inout Name
 - async/config 但 exception 尚未由 30 批准。
 - mapping unresolved 或 direction 未确定。
 
-`route_to_30` intent 即使已 approved 也不由 04 销账；30 正式 exception 成功后负责该 exception-only endpoint。
+销账必须以 resolved `pad_inventory` 状态为最终 gate：
 
-写回采用 exact bit union，不再生成 pending/removed log。若 top pad fanout 到多个 harden sink，每个 sink bit 分别更新。04 必须通过共享 transaction 提交，并输出：
+- `constrained + timing_active=yes`：04 销账；
+- approved `not_applicable`：04 销账；
+- `route_to_30` 或 `pending`：04 不销账。
+
+`route_to_30` intent 即使已 approved，或同一 pad 另有 approved NA review row，也不由 04 销账；30 正式 exception 成功后负责该 exception-only endpoint。
+
+若该 exact pad edge 已被既往 04 transaction 以 `constrained/not_applicable` 写入非空 `added_bits`，仅当所有已发布 required 04 view 都不再为该 edge 保留 `constrained/not_applicable` owner 时，才禁止在同一 run root 内改成 `route_to_30`。另一 required view 仍正常拥有该 edge 时允许 mixed-view `constrained/route_to_30`，且执行顺序不得改变结果；当最后一个 04 normal owner 也转移给 30 时，union-only accounting 无法撤销旧 owner，脚本必须 fail closed 并要求 fresh run root。
+
+写回采用 exact bit union，不再生成 pending/removed log。若 top pad fanout 到多个 harden sink，top-port command 的 resolved coverage 必须传播到全部 direct edge，每个 constrained/NA sink bit 分别更新；`route_to_30/pending` edge 不更新。04 必须通过共享 transaction 提交，并输出：
 
 ```text
 04_middle/port_accounting_delta.csv
@@ -297,7 +330,7 @@ inout  -> Inout Name
 
 delta 的 owner ID 必须引用 `pad_id`。completion 只允许在 required view、无 error/sync change、SDC/pad inventory/delta 全部发布后标 complete。
 
-所有 required 04 view complete 后，04 发布 run-wide `04_middle/stage_completion.meta`，证明 pad inventory resolved view 已稳定。即使本 run 没有 active IO timing view，04 仍须执行 pad classification/audit 并发布空或 reviewed pad inventory，供 10/20/30 排除 pad edge。
+所有 required 04 view complete 后，04 发布 run-wide `04_middle/stage_completion.meta`，证明 pad inventory resolved view 已稳定。每次累计 inventory 改变时，所有已完成 required view 的 completion 都必须刷新 `pad_inventory_digest`，run-wide `required_view_completions` 必须引用这些最终 completion 文件。复用 prior view completion 时必须重新核对其 output SDC 以及已声明的 `00_stage_completion`、`01_clock_inventory` digest；上游 artifact 变化时 prior view 必须被排除并重跑。即使本 run 没有 active IO timing view，04 仍须执行 pad classification/audit 并发布 header-only 或 reviewed pad inventory，供 10/20/30 排除 pad edge。
 
 ## 10. 检查规则
 
@@ -305,13 +338,16 @@ delta 的 owner ID 必须引用 `pad_id`。completion 只允许在 required view
 
 - port workbook 缺失或 direct pad mapping 不可解析。
 - top port/direction 与表单冲突。
+- inout approved row 未选择本 run 的 input/output effective direction。
+- range/subrange evidence 存在未映射、重复映射 bit，或 flat row 使用 wildcard/port_list/pattern。
 - duplicate pad mapping 语义冲突。
 - rule 引用未知 clock。
 - apply row 缺 value/owner/basis/review。
 - inout 仍把 connection 放在 `Inout Name`。
 - Used 状态包含非法/越界 bit。
 - workbook 在写回期间被外部修改。
-- required view、structure/accounting digest、transaction/delta/completion 校验失败。
+- 00/01 upstream completion 缺失、无效、未完成或 provenance/structure/clock inventory digest 不一致。
+- required view、structure/accounting/upstream artifact digest、transaction/delta/completion 校验失败。
 - `route_to_30` row 缺 pad_id、owner/basis/review，或仍由 04 销账。
 
 ### Warning

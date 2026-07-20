@@ -180,24 +180,74 @@ IO_HEADERS = [
     "review_status",
     "owner",
     "basis",
+    "reviewer",
+    "review_date",
     "note",
 ]
 
 PAD_HEADERS = [
+    "schema_version",
+    "run_id",
+    "mode_label",
+    "design_revision",
+    "run_completeness",
+    "structure_digest",
+    "accounting_digest_before",
+    "accounting_digest_after",
+    "pad_id",
+    "view_id",
+    "stage",
+    "corner",
     "pad_name",
     "soc_top_port",
+    "top_port",
+    "top_bit_index",
+    "top_endpoint",
     "subsys_instance",
+    "harden_instance",
     "subsys_port",
+    "harden_port",
+    "harden_bit_index",
+    "harden_endpoint",
     "direction_from_integration",
+    "direction",
+    "effective_direction",
+    "src_instance",
+    "src_direction",
+    "src_port",
+    "src_bit_index",
+    "src_soc_object",
+    "src_endpoint",
+    "dst_instance",
+    "dst_direction",
+    "dst_port",
+    "dst_bit_index",
+    "dst_soc_object",
+    "dst_endpoint",
     "is_gpio_or_inout",
     "related_scenarios",
     "source_sdc_status",
+    "sdc_status",
     "connection_id",
+    "connection_status",
     "scenario_scope",
     "connection_type",
+    "pad_disposition",
+    "timing_active",
+    "coverage_status",
+    "apply",
+    "review_status",
+    "owner",
+    "basis",
+    "related_exception_intent",
+    "reviewer",
+    "review_date",
     "source_workbook",
     "source_sheet",
     "source_row",
+    "source_digest",
+    "machine_digest",
+    "approved_machine_digest",
     "note",
 ]
 
@@ -1489,7 +1539,7 @@ def validate_integration_port_keys(instances: Dict[str, InstInfo], report: Repor
             validate_canonical_top_key(inst.inst_name, "output", port.name, clean_top_name(port.to_top), report)
         for port in inst.inouts.values():
             validate_canonical_port_key(inst.inst_name, "inout", port, report)
-            top = clean_top_name(port.inout_name) or top_port_from_connection(port.connectivity) or port.name
+            top = top_port_from_connection(port.connectivity) or clean_top_name(port.inout_name) or port.name
             validate_canonical_top_key(inst.inst_name, "inout", port.name, top, report)
 
 
@@ -1537,7 +1587,7 @@ def port_top_for(inst: InstInfo, port: str) -> str:
     if port in inst.outputs:
         return clean_top_name(inst.outputs[port].to_top)
     if port in inst.inouts:
-        return clean_top_name(inst.inouts[port].inout_name) or top_port_from_connection(inst.inouts[port].connectivity) or inst.inouts[port].name
+        return top_port_from_connection(inst.inouts[port].connectivity) or clean_top_name(inst.inouts[port].inout_name) or inst.inouts[port].name
     return ""
 
 
@@ -1957,8 +2007,9 @@ def form_row_key(values: Dict[str, object]) -> Tuple[str, ...]:
     )
 
 
-def pad_key(values: Dict[str, object]) -> Tuple[str, str, str, str]:
+def pad_key(values: Dict[str, object]) -> Tuple[str, str, str, str, str]:
     return (
+        clean_cell(values.get("view_id")),
         clean_cell(values.get("pad_name")),
         clean_cell(values.get("subsys_instance")),
         clean_cell(values.get("subsys_port")),
@@ -1966,13 +2017,48 @@ def pad_key(values: Dict[str, object]) -> Tuple[str, str, str, str]:
     )
 
 
-def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[ExtractedConstraint], report: Report) -> None:
+def sync_workbook(
+    path: Path,
+    pads: Sequence[PadRecord],
+    extracted: Sequence[ExtractedConstraint],
+    report: Report,
+    pad_context: Optional[Dict[str, object]] = None,
+) -> None:
     wb, created = create_or_load_workbook(path)
     ensure_sheet(wb, "io_constraints", IO_HEADERS)
     ensure_sheet(wb, "pad_inventory", PAD_HEADERS)
     ensure_sheet(wb, "extraction_log", LOG_HEADERS)
 
     ws_io = wb["io_constraints"]
+    if pad_context:
+        desired_rows = [item.values for item in extracted if item.include_in_form]
+        desired_keys = {form_row_key(values) for values in desired_rows}
+        desired_sources = {form_row_key(values)[:4] for values in desired_rows}
+        obsolete_rows: List[int] = []
+        for row_idx in range(2, ws_io.max_row + 1):
+            values = row_values(ws_io, row_idx, IO_HEADERS)
+            if normalize_key(values.get("source_type")) != "extracted":
+                continue
+            key = form_row_key(values)
+            if key in desired_keys or key[:4] not in desired_sources:
+                continue
+            pad_name = clean_cell(values.get("pad_name"))
+            subsys_port = clean_cell(values.get("subsys_port"))
+            soc_object = clean_cell(values.get("soc_object"))
+            if (
+                not PORT_BIT_RE.fullmatch(pad_name)
+                or not PORT_BIT_RE.fullmatch(subsys_port)
+                or any(token in soc_object for token in (":", "*", "?"))
+            ):
+                obsolete_rows.append(row_idx)
+        for row_idx in reversed(obsolete_rows):
+            ws_io.delete_rows(row_idx, 1)
+        if obsolete_rows:
+            report.warn(
+                f"removed {len(obsolete_rows)} obsolete auto-extracted broad/range IO row(s); "
+                "review the replacement exact-bit rows"
+            )
+            report.sync_changed = True
     existing_keys = {
         form_row_key(row_values(ws_io, row_idx, IO_HEADERS))
         for row_idx in range(2, ws_io.max_row + 1)
@@ -1990,18 +2076,21 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
         report.sync_changed = True
 
     ws_pad = wb["pad_inventory"]
+    pad_columns = header_map(ws_pad)
     existing_pads = {
         pad_key(row_values(ws_pad, row_idx, PAD_HEADERS)): row_idx
         for row_idx in range(2, ws_pad.max_row + 1)
-        if clean_cell(ws_pad.cell(row=row_idx, column=1).value)
+        if clean_cell(ws_pad.cell(row=row_idx, column=pad_columns["pad_name"]).value)
     }
     for pad in pads:
         values = {
+            "schema_version": "1.0",
             "pad_name": pad.pad_name,
             "soc_top_port": pad.soc_top_port,
             "subsys_instance": pad.subsys_instance,
             "subsys_port": pad.subsys_port,
             "direction_from_integration": pad.direction,
+            "effective_direction": pad.direction if pad.direction in {"input", "output"} else "",
             "is_gpio_or_inout": pad.is_gpio_or_inout,
             "related_scenarios": pad.related_scenarios,
             "source_sdc_status": pad.source_sdc_status,
@@ -2013,7 +2102,17 @@ def sync_workbook(path: Path, pads: Sequence[PadRecord], extracted: Sequence[Ext
             "source_row": pad.source_row,
             "note": pad.note,
         }
+        if pad_context:
+            values.update(pad_context)
         key = pad_key(values)
+        if key not in existing_pads and key[0]:
+            legacy_key = ("",) + key[1:]
+            legacy_row = existing_pads.get(legacy_key)
+            if legacy_row is not None:
+                ws_pad.cell(legacy_row, header_map(ws_pad)["view_id"], key[0])
+                existing_pads[key] = legacy_row
+                existing_pads.pop(legacy_key, None)
+                report.sync_changed = True
         if key not in existing_pads:
             append_dict(ws_pad, PAD_HEADERS, values, NEW_FILL)
             existing_pads[key] = ws_pad.max_row
@@ -2097,6 +2196,24 @@ def add_validations(wb: Workbook) -> None:
     add_list("delay_polarity", ["clock_rise", "clock_fall"])
     add_list("object_granularity", ["single_pad", "port_list", "pattern"])
 
+    if "pad_inventory" in wb.sheetnames:
+        pad_ws = wb["pad_inventory"]
+        pad_map = header_map(pad_ws)
+        for header, values in (
+            ("pad_disposition", ["constrained", "not_applicable", "route_to_30", "pending"]),
+            ("effective_direction", ["input", "output"]),
+            ("apply", ["yes", "no"]),
+            ("review_status", ["pending", "approved", "rejected"]),
+        ):
+            if header not in pad_map:
+                continue
+            col = get_column_letter(pad_map[header])
+            validation = DataValidation(
+                type="list", formula1='"' + ",".join(values) + '"', allow_blank=True
+            )
+            pad_ws.add_data_validation(validation)
+            validation.add(f"{col}2:{col}1048576")
+
 
 def read_form_rows(path: Path) -> List[FormRow]:
     wb = load_workbook(path, data_only=False)
@@ -2175,6 +2292,7 @@ def validate_rows(
     expected_cap_unit: str,
     tool: str,
     report: Report,
+    allow_false_path: bool = True,
 ) -> None:
     assembled = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_apply_approved(row)]
     assembled_na = [row for row in rows if row_selected_for_assembled(row, scenario, stage, corner) and is_approved_na(row)]
@@ -2187,6 +2305,11 @@ def validate_rows(
         (pad.pad_name, pad.subsys_instance, pad.subsys_port)
         for pad in pads
     }
+    pad_directions: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
+    for pad in pads:
+        pad_directions[(pad.pad_name, pad.subsys_instance, pad.subsys_port)].add(
+            normalize_key(pad.direction)
+        )
     for row in assembled_na:
         pad = clean_cell(row.values.get("pad_name"))
         if pad:
@@ -2226,9 +2349,25 @@ def validate_rows(
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but soc_object is blank")
             if not ctype and not is_na:
                 report.error(f"io_constraints row {row.row_idx}: apply=yes but constraint_type is blank")
-            if is_na and review_status == "approved" and not clean_cell(values.get("basis")):
-                report.error(f"io_constraints row {row.row_idx}: approved NA row requires basis")
+            if not is_na and review_status == "approved":
+                if not clean_cell(values.get("owner")):
+                    report.error(
+                        f"io_constraints row {row.row_idx}: approved row requires owner"
+                    )
+                if not clean_cell(values.get("basis")) and not clean_cell(values.get("note")):
+                    report.error(
+                        f"io_constraints row {row.row_idx}: approved row requires basis or note"
+                    )
             if is_na and review_status == "approved":
+                missing_review = [
+                    name for name in ("owner", "basis", "reviewer", "review_date")
+                    if not clean_cell(values.get(name))
+                ]
+                if missing_review:
+                    report.error(
+                        f"io_constraints row {row.row_idx}: approved NA row requires "
+                        + ", ".join(missing_review)
+                    )
                 identity = (
                     pad,
                     clean_cell(values.get("subsys_instance")),
@@ -2252,6 +2391,31 @@ def validate_rows(
                     report.error(
                         f"io_constraints row {row.row_idx}: approved row does not match an exact pad inventory key"
                     )
+                else:
+                    integration_directions = pad_directions.get(identity, set())
+                    effective_direction = normalize_key(values.get("direction"))
+                    if integration_directions == {"inout"}:
+                        if effective_direction not in {"input", "output"}:
+                            report.error(
+                                f"io_constraints row {row.row_idx}: inout pad requires an effective "
+                                "direction of input or output for this run"
+                            )
+                    elif effective_direction not in integration_directions:
+                        report.error(
+                            f"io_constraints row {row.row_idx}: direction {effective_direction or '<blank>'} "
+                            "conflicts with integration direction "
+                            f"{','.join(sorted(integration_directions)) or '<unknown>'}"
+                        )
+            if (
+                not allow_false_path
+                and not is_na
+                and review_status == "approved"
+                and normalize_key(values.get("object_granularity")) in {"port_list", "pattern"}
+            ):
+                report.error(
+                    f"io_constraints row {row.row_idx}: flat 04 requires one exact top pad bit; "
+                    "port_list/pattern approval is not allowed"
+                )
             if ctype in DELAY_TYPES and not clock_name:
                 report.error(f"io_constraints row {row.row_idx}: {ctype} requires clock_name")
             if ctype in DELAY_TYPES and clock_name:
@@ -2339,6 +2503,11 @@ def validate_rows(
                 report.error(
                     f"io_constraints row {row.row_idx} {pad}: timed IO has approved false_path without basis/note"
                 )
+            if ctype == "false_path" and not allow_false_path:
+                report.error(
+                    f"io_constraints row {row.row_idx} {pad}: flat 04 does not own false_path; "
+                    "approve the exact pad as route_to_30"
+                )
             direction = normalize_key(values.get("direction"))
             if direction == "output" and ctype in {"input_delay", "input_transition", "driving_cell", "drive"}:
                 report.error(
@@ -2358,7 +2527,7 @@ def validate_rows(
                     f"io_constraints row {row.row_idx} {pad}: inout/GPIO direction-specific delay is in common"
                 )
 
-        if is_apply_approved(row) and row_selected_for_output(row, scenario, stage, corner):
+        if is_apply_approved(row) and row in assembled:
             if normalize_key(values.get("constraint_type")) == "dont_touch_network" and tool == "sta":
                 continue
             if not commands_for_row(row, tool, True):
@@ -2471,8 +2640,13 @@ def generate_sdc(
     corner: str,
     tool: str,
     completeness: RunCompleteness,
+    assembled: bool = False,
 ) -> List[str]:
-    selected = [row for row in rows if row_selected_for_output(row, scenario, stage, corner) and is_apply_approved(row)]
+    selector = row_selected_for_assembled if assembled else row_selected_for_output
+    selected = [
+        row for row in rows
+        if selector(row, scenario, stage, corner) and is_apply_approved(row)
+    ]
     emitted_delay_groups: Set[Tuple[str, str, str]] = set()
 
     lines = [
@@ -3051,6 +3225,880 @@ def write_report(
     atomic_write_text(path, "\n".join(lines).rstrip() + "\n")
 
 
+FLAT_PAD_SCHEMA_VERSION = "1.0"
+FLAT_SIGNAL_RE = re.compile(
+    r"^(?P<base>[A-Za-z_][A-Za-z0-9_$]*)(?:\[(?P<left>-?\d+)(?::(?P<right>-?\d+))?\])?$"
+)
+
+
+def _flat_json_digest(value: object) -> str:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _flat_ordered_bits(shape: Any) -> List[int]:
+    if shape.scalar:
+        return [0]
+    step = 1 if shape.right >= shape.left else -1
+    return list(range(shape.left, shape.right + step, step))
+
+
+def _flat_parse_signal(value: object, location: str) -> Tuple[str, Optional[List[int]]]:
+    text = clean_cell(value)
+    match = FLAT_SIGNAL_RE.fullmatch(text)
+    if not match:
+        raise ValueError(f"{location}: invalid endpoint signal {text!r}")
+    base = match.group("base")
+    left = match.group("left")
+    right = match.group("right")
+    if left is None:
+        return base, None
+    left_value = int(left)
+    right_value = int(right) if right is not None else left_value
+    step = 1 if right_value >= left_value else -1
+    return base, list(range(left_value, right_value + step, step))
+
+
+def _flat_exact_port(base: str, bit: int, scalar: bool = False) -> str:
+    return base if scalar and bit == 0 else f"{base}[{bit}]"
+
+
+def _flat_collection(instance: str, port: str) -> str:
+    if normalize_key(instance) == "top":
+        return f"[get_ports {{{port}}}]"
+    return f"[get_pins {{{instance}/{port}}}]"
+
+
+def _flat_connection_identity(
+    src_instance: str,
+    src_direction: str,
+    src_base: str,
+    src_bit: int,
+    dst_instance: str,
+    dst_direction: str,
+    dst_base: str,
+    dst_bit: int,
+) -> Tuple[str, str]:
+    canonical = [
+        FLAT_PAD_SCHEMA_VERSION,
+        clean_cell(src_instance),
+        normalize_key(src_direction),
+        clean_cell(src_base),
+        int(src_bit),
+        clean_cell(dst_instance),
+        normalize_key(dst_direction),
+        clean_cell(dst_base),
+        int(dst_bit),
+    ]
+    digest = _flat_json_digest(canonical)
+    return "CONN_" + digest, digest
+
+
+def _flat_structural_reason(runtime: Any, record: Any, report: Report) -> str:
+    reason = clean_cell(getattr(record, "structural_reason", ""))
+    if reason or hasattr(record, "structural_status"):
+        return reason
+    legacy = getattr(runtime, "structural_reason", None)
+    if callable(legacy):
+        return clean_cell(
+            legacy(
+                clean_cell(record.connection_value),
+                record.shape,
+                record.location(),
+                report,
+            )
+        )
+    parser = getattr(runtime, "parse_structural_token", None)
+    if callable(parser):
+        _, reason, diagnostic = parser(record.connection_value, record.shape)
+        if diagnostic:
+            report.error(f"{record.location()}: {diagnostic}")
+        return clean_cell(reason)
+    return ""
+
+
+def _build_flat_exact_pads(
+    runtime: Any,
+    records: Sequence[Any],
+    instances: Dict[str, InstInfo],
+    report: Report,
+) -> List[PadRecord]:
+    pads: List[PadRecord] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+
+    def append_pad(record: Any, top_port: str, harden_port: str, direction: str, connection_id: str, connection_type: str) -> None:
+        key = (top_port, record.inst_name, harden_port, direction)
+        if key in seen:
+            report.error(f"duplicate exact pad mapping: {top_port} -> {record.inst_name}/{harden_port}")
+            return
+        seen.add(key)
+        inst = instances.get(record.inst_name)
+        pads.append(
+            PadRecord(
+                pad_name=top_port,
+                soc_top_port=top_port,
+                subsys_instance=record.inst_name,
+                subsys_port=harden_port,
+                direction=direction,
+                is_gpio_or_inout="yes" if record.direction == "inout" else "no",
+                source_sdc_status=inst.sdc_status if inst else "",
+                connection_id=connection_id,
+                connection_type=connection_type,
+                source_workbook=record.workbook,
+                source_sheet=record.sheet,
+                source_row=str(record.row),
+            )
+        )
+
+    for record in records:
+        connection = clean_cell(record.connection_value)
+        if not connection or _flat_structural_reason(runtime, record, report):
+            continue
+        if record.direction in {"input", "inout"}:
+            if not connection.startswith("top."):
+                continue
+            try:
+                top_base, selected_top_bits = _flat_parse_signal(connection[4:], record.location())
+            except ValueError as exc:
+                report.error(str(exc))
+                continue
+            harden_bits = _flat_ordered_bits(record.shape)
+            top_bits = selected_top_bits if selected_top_bits is not None else list(harden_bits)
+            if len(top_bits) != len(harden_bits):
+                report.error(f"{record.location()}: top pad width does not match harden port width")
+                continue
+            for top_bit, harden_bit in zip(top_bits, harden_bits):
+                top_port = _flat_exact_port(top_base, top_bit, len(top_bits) == 1 and selected_top_bits is None)
+                harden_port = _flat_exact_port(record.shape.base, harden_bit, record.shape.scalar)
+                connection_id, _ = _flat_connection_identity(
+                    "top", "input", top_base, top_bit,
+                    record.inst_name, record.direction, record.shape.base, harden_bit,
+                )
+                append_pad(record, top_port, harden_port, record.direction, connection_id, "top_pad_to_harden")
+        elif record.direction == "output":
+            top_signal = connection[4:] if connection.startswith("top.") else connection
+            if connection.lower() in {"y", "yes", "true"}:
+                top_signal = record.shape.raw
+            if "." in top_signal:
+                continue
+            try:
+                top_base, selected_top_bits = _flat_parse_signal(top_signal, record.location())
+            except ValueError as exc:
+                report.error(str(exc))
+                continue
+            harden_bits = _flat_ordered_bits(record.shape)
+            top_bits = selected_top_bits if selected_top_bits is not None else list(harden_bits)
+            if len(top_bits) != len(harden_bits):
+                report.error(f"{record.location()}: top pad width does not match harden port width")
+                continue
+            for harden_bit, top_bit in zip(harden_bits, top_bits):
+                harden_port = _flat_exact_port(record.shape.base, harden_bit, record.shape.scalar)
+                top_port = _flat_exact_port(top_base, top_bit, len(top_bits) == 1 and selected_top_bits is None)
+                connection_id, _ = _flat_connection_identity(
+                    record.inst_name, "output", record.shape.base, harden_bit,
+                    "top", "output", top_base, top_bit,
+                )
+                append_pad(record, top_port, harden_port, "output", connection_id, "harden_to_top_pad")
+    pads.sort(key=lambda item: (item.pad_name, item.subsys_instance, item.subsys_port, item.direction))
+    report.info(f"built {len(pads)} exact flat pad owner record(s) from port workbooks")
+    return pads
+
+
+def _without_rewritten_command(value: object) -> str:
+    return "; ".join(
+        part.strip()
+        for part in clean_cell(value).split(";")
+        if part.strip() and not part.strip().startswith("rewritten_command=")
+    )
+
+
+def _expand_flat_extracted_constraints(
+    extracted: Sequence[ExtractedConstraint],
+    pads: Sequence[PadRecord],
+    report: Report,
+) -> List[ExtractedConstraint]:
+    exact_keys = {
+        (pad.pad_name, pad.subsys_instance, pad.subsys_port)
+        for pad in pads
+    }
+    expanded: List[ExtractedConstraint] = []
+    expanded_sources = 0
+    expanded_rows = 0
+    for item in extracted:
+        values = item.values
+        key = (
+            clean_cell(values.get("pad_name")),
+            clean_cell(values.get("subsys_instance")),
+            clean_cell(values.get("subsys_port")),
+        )
+        if key in exact_keys:
+            expanded.append(item)
+            continue
+        try:
+            harden_base, selected_harden_bits = _flat_parse_signal(
+                key[2], "flat IO harden selector"
+            )
+        except ValueError:
+            expanded.append(item)
+            continue
+        base_candidates: List[Tuple[PadRecord, Optional[int]]] = []
+        for pad in pads:
+            if pad.subsys_instance != key[1]:
+                continue
+            try:
+                candidate_base, candidate_bits = _flat_parse_signal(
+                    pad.subsys_port, "flat IO exact harden endpoint"
+                )
+            except ValueError:
+                continue
+            if candidate_base != harden_base:
+                continue
+            candidate_bit = candidate_bits[0] if candidate_bits else None
+            base_candidates.append((pad, candidate_bit))
+        if not base_candidates:
+            expanded.append(item)
+            continue
+
+        invalid_reason = ""
+        matches: List[PadRecord] = []
+        if selected_harden_bits is None:
+            scalar_matches = [pad for pad, bit in base_candidates if bit is None]
+            if len(scalar_matches) == 1:
+                matches = scalar_matches
+            else:
+                invalid_reason = (
+                    f"bare vector selector {key[2]} is ambiguous; use an explicit exact bit/range"
+                )
+        else:
+            for bit in selected_harden_bits:
+                bit_matches = [pad for pad, candidate_bit in base_candidates if candidate_bit == bit]
+                if len(bit_matches) != 1:
+                    invalid_reason = (
+                        f"selector {key[2]} bit {bit} maps to {len(bit_matches)} canonical pad edge(s)"
+                    )
+                    break
+                matches.append(bit_matches[0])
+
+        if not invalid_reason and key[0]:
+            try:
+                top_base, selected_top_bits = _flat_parse_signal(
+                    key[0], "flat IO top selector"
+                )
+                mapped_top: List[Tuple[str, Optional[int]]] = []
+                for pad in matches:
+                    mapped_base, mapped_bits = _flat_parse_signal(
+                        pad.pad_name, "flat IO exact top endpoint"
+                    )
+                    mapped_top.append(
+                        (mapped_base, mapped_bits[0] if mapped_bits else None)
+                    )
+                if any(mapped_base != top_base for mapped_base, _ in mapped_top):
+                    invalid_reason = f"top selector {key[0]} does not match canonical pad base"
+                elif selected_top_bits is None:
+                    if len(mapped_top) != 1 or mapped_top[0][1] is not None:
+                        invalid_reason = (
+                            f"bare vector top selector {key[0]} is ambiguous; use an explicit exact bit/range"
+                        )
+                elif [bit for _, bit in mapped_top] != selected_top_bits:
+                    invalid_reason = (
+                        f"top/harden range order mismatch for {key[0]} and {key[2]}"
+                    )
+            except ValueError as exc:
+                invalid_reason = str(exc)
+
+        if invalid_reason:
+            message = f"flat exact-bit expansion failed: {invalid_reason}"
+            report.error(message)
+            invalid_values = dict(values)
+            invalid_values["note"] = "; ".join(
+                filter(None, [clean_cell(values.get("note")), message])
+            )
+            expanded.append(
+                ExtractedConstraint(
+                    values=invalid_values,
+                    parse_status="invalid",
+                    mapped_soc_object=item.mapped_soc_object,
+                    message="; ".join(filter(None, [item.message, message])),
+                    include_in_form=False,
+                )
+            )
+            continue
+
+        expanded_sources += 1
+        seen_top_ports: Set[str] = set()
+        for pad in matches:
+            if pad.pad_name in seen_top_ports:
+                continue
+            seen_top_ports.add(pad.pad_name)
+            exact_values = dict(values)
+            exact_values.update(
+                {
+                    "pad_name": pad.pad_name,
+                    "soc_object": _flat_collection("top", pad.pad_name),
+                    "subsys_instance": pad.subsys_instance,
+                    "subsys_port": pad.subsys_port,
+                    "direction": pad.direction,
+                    "object_granularity": "single_pad",
+                    "extra_options": _without_rewritten_command(values.get("extra_options")),
+                }
+            )
+            expansion_note = (
+                f"exact-bit expansion from {key[0]} -> {key[1]}/{key[2]}"
+            )
+            exact_values["note"] = "; ".join(
+                filter(None, [clean_cell(values.get("note")), expansion_note])
+            )
+            exact_object = _flat_collection("top", pad.pad_name)
+            expanded.append(
+                ExtractedConstraint(
+                    values=exact_values,
+                    parse_status=item.parse_status,
+                    mapped_soc_object=exact_object,
+                    message="; ".join(filter(None, [item.message, expansion_note])),
+                    include_in_form=True,
+                )
+            )
+            expanded_rows += 1
+    if expanded_sources:
+        report.info(
+            f"expanded {expanded_sources} range IO evidence row(s) into "
+            f"{expanded_rows} exact pad-bit review row(s)"
+        )
+    return expanded
+
+
+def _flat_pad_machine_values(
+    pad: PadRecord,
+    run_context: Dict[str, str],
+    completeness: RunCompleteness,
+    structure: str,
+    accounting_before: str,
+    view_id: str,
+    stage: str,
+    corner: str,
+    source_digest: str,
+) -> Dict[str, object]:
+    top_match = re.fullmatch(r"(?P<base>[^\[\]]+)(?:\[(?P<bit>-?\d+)\])?", pad.soc_top_port)
+    harden_match = re.fullmatch(r"(?P<base>[^\[\]]+)(?:\[(?P<bit>-?\d+)\])?", pad.subsys_port)
+    if not top_match or not harden_match:
+        raise RuntimeError(f"non-exact pad identity: {pad.soc_top_port} -> {pad.subsys_instance}/{pad.subsys_port}")
+    top_base = top_match.group("base")
+    harden_base = harden_match.group("base")
+    top_bit = int(top_match.group("bit") or "0")
+    harden_bit = int(harden_match.group("bit") or "0")
+    direction = normalize_key(pad.direction)
+    if direction == "output":
+        src_instance, src_direction, src_port, src_bit = pad.subsys_instance, "output", pad.subsys_port, harden_bit
+        dst_instance, dst_direction, dst_port, dst_bit = "top", "output", pad.soc_top_port, top_bit
+    else:
+        src_instance, src_direction, src_port, src_bit = "top", "input", pad.soc_top_port, top_bit
+        dst_instance, dst_direction, dst_port, dst_bit = pad.subsys_instance, direction, pad.subsys_port, harden_bit
+    connection_id, pad_id = _flat_connection_identity(
+        src_instance, src_direction, top_base if src_instance == "top" else harden_base, src_bit,
+        dst_instance, dst_direction, top_base if dst_instance == "top" else harden_base, dst_bit,
+    )
+    values: Dict[str, object] = {
+        "schema_version": FLAT_PAD_SCHEMA_VERSION,
+        "run_id": run_context.get("run_id", ""),
+        "mode_label": run_context.get("mode_label", ""),
+        "design_revision": run_context.get("design_revision", ""),
+        "run_completeness": completeness.status,
+        "structure_digest": structure,
+        "accounting_digest_before": accounting_before,
+        "accounting_digest_after": accounting_before,
+        "pad_id": pad_id,
+        "view_id": view_id,
+        "stage": stage,
+        "corner": corner,
+        "pad_name": pad.pad_name,
+        "soc_top_port": pad.soc_top_port,
+        "top_port": pad.soc_top_port,
+        "top_bit_index": str(top_bit),
+        "top_endpoint": _flat_collection("top", pad.soc_top_port),
+        "subsys_instance": pad.subsys_instance,
+        "harden_instance": pad.subsys_instance,
+        "subsys_port": pad.subsys_port,
+        "harden_port": pad.subsys_port,
+        "harden_bit_index": str(harden_bit),
+        "harden_endpoint": _flat_collection(pad.subsys_instance, pad.subsys_port),
+        "direction_from_integration": pad.direction,
+        "direction": pad.direction,
+        "effective_direction": direction if direction in {"input", "output"} else "",
+        "src_instance": src_instance,
+        "src_direction": src_direction,
+        "src_port": src_port,
+        "src_bit_index": str(src_bit),
+        "src_soc_object": src_port if src_instance == "top" else f"{src_instance}/{src_port}",
+        "src_endpoint": _flat_collection(src_instance, src_port),
+        "dst_instance": dst_instance,
+        "dst_direction": dst_direction,
+        "dst_port": dst_port,
+        "dst_bit_index": str(dst_bit),
+        "dst_soc_object": dst_port if dst_instance == "top" else f"{dst_instance}/{dst_port}",
+        "dst_endpoint": _flat_collection(dst_instance, dst_port),
+        "is_gpio_or_inout": pad.is_gpio_or_inout,
+        "related_scenarios": pad.related_scenarios,
+        "source_sdc_status": pad.source_sdc_status,
+        "sdc_status": pad.source_sdc_status,
+        "connection_id": connection_id,
+        "connection_status": "matched",
+        "scenario_scope": pad.scenario_scope,
+        "connection_type": pad.connection_type,
+        "source_workbook": pad.source_workbook,
+        "source_sheet": pad.source_sheet,
+        "source_row": pad.source_row,
+        "source_digest": source_digest,
+        "note": pad.note,
+    }
+    digest_fields = [
+        name for name in PAD_HEADERS
+        if name not in {
+            "accounting_digest_before", "accounting_digest_after",
+            "pad_disposition", "timing_active", "coverage_status",
+            "apply", "review_status", "owner", "basis", "related_exception_intent",
+            "reviewer", "review_date", "effective_direction",
+            "machine_digest", "approved_machine_digest", "note",
+        }
+    ]
+    values["machine_digest"] = _flat_json_digest([[name, clean_cell(values.get(name))] for name in digest_fields])
+    return values
+
+
+def _sync_flat_pad_machine_fields(
+    path: Path,
+    pads: Sequence[PadRecord],
+    run_context: Dict[str, str],
+    completeness: RunCompleteness,
+    structure: str,
+    accounting_before: str,
+    view_id: str,
+    stage: str,
+    corner: str,
+    report: Report,
+) -> None:
+    workbook = load_workbook(path)
+    if "pad_inventory" not in workbook.sheetnames:
+        workbook.close()
+        raise RuntimeError(f"{path} missing pad_inventory sheet")
+    sheet = workbook["pad_inventory"]
+    mapping = header_map(sheet)
+
+    machine_rows: List[Dict[str, object]] = []
+    for pad in pads:
+        source_digest = _flat_json_digest(
+            [
+                FLAT_PAD_SCHEMA_VERSION,
+                pad.source_workbook,
+                pad.source_sheet,
+                pad.source_row,
+                pad.direction,
+                pad.soc_top_port,
+                pad.subsys_instance,
+                pad.subsys_port,
+                pad.connection_id,
+            ]
+        )
+        machine_rows.append(
+            _flat_pad_machine_values(
+                pad, run_context, completeness, structure, accounting_before,
+                view_id, stage, corner, source_digest,
+            )
+        )
+
+    expected_keys = {pad_key(machine) for machine in machine_rows}
+    stale_rows: List[int] = []
+    for row_idx in range(2, sheet.max_row + 1):
+        values = row_values(sheet, row_idx, PAD_HEADERS)
+        if clean_cell(values.get("view_id")) != view_id:
+            continue
+        if clean_cell(values.get("pad_name")) and pad_key(values) not in expected_keys:
+            stale_rows.append(row_idx)
+    for row_idx in reversed(stale_rows):
+        sheet.delete_rows(row_idx, 1)
+    changed = bool(stale_rows)
+    if stale_rows:
+        report.warn(
+            f"removed {len(stale_rows)} obsolete pad_inventory row(s) from current view {view_id}"
+        )
+
+    rows_by_key: Dict[Tuple[str, str, str, str, str], int] = {}
+    for row_idx in range(2, sheet.max_row + 1):
+        values = row_values(sheet, row_idx, PAD_HEADERS)
+        if not clean_cell(values.get("pad_name")):
+            continue
+        key = pad_key(values)
+        if key in rows_by_key:
+            report.error(f"pad_inventory duplicates exact owner row {key}")
+        else:
+            rows_by_key[key] = row_idx
+
+    review_headers = {
+        "pad_disposition", "apply", "review_status", "owner", "basis",
+        "related_exception_intent", "reviewer", "review_date", "approved_machine_digest",
+        "effective_direction", "note",
+    }
+    machine_headers = [name for name in PAD_HEADERS if name not in review_headers]
+    for machine in machine_rows:
+        key = pad_key(machine)
+        row_idx = rows_by_key.get(key)
+        if row_idx is None:
+            report.error(f"pad_inventory machine row missing after synchronization: {key}")
+            continue
+        old_digest = clean_cell(sheet.cell(row_idx, mapping["machine_digest"]).value)
+        machine_changed = bool(old_digest and old_digest != clean_cell(machine.get("machine_digest")))
+        for name in machine_headers:
+            old_value = clean_cell(sheet.cell(row_idx, mapping[name]).value)
+            new_value = clean_cell(machine.get(name))
+            if old_value != new_value:
+                sheet.cell(row_idx, mapping[name], machine.get(name, ""))
+                changed = True
+        if machine_changed:
+            for name, value in (
+                ("apply", "no"),
+                ("review_status", "pending"),
+                ("approved_machine_digest", ""),
+            ):
+                if clean_cell(sheet.cell(row_idx, mapping[name]).value) != value:
+                    sheet.cell(row_idx, mapping[name], value)
+                    changed = True
+            report.warn(f"pad_inventory {machine['pad_id']}: machine identity changed; approval reset")
+
+    if changed:
+        atomic_save_workbook(workbook, path)
+        report.sync_changed = True
+        report.info("synchronized canonical pad machine fields; review is required")
+    else:
+        workbook.close()
+
+
+def _active_io_rows_by_pad(
+    rows: Sequence[FormRow], stage: str, corner: str, tool: str
+) -> Dict[str, List[FormRow]]:
+    result: Dict[str, List[FormRow]] = defaultdict(list)
+    for row in rows:
+        if not row_selected_for_assembled(row, "common", stage, corner):
+            continue
+        if not is_apply_approved(row):
+            continue
+        if not commands_for_row(row, tool, True):
+            continue
+        values = row.values
+        pad_name = clean_cell(values.get("pad_name"))
+        if pad_name:
+            # The emitted command targets the exact top port/bit, so one
+            # reviewed row covers every canonical direct edge in its fanout.
+            result[pad_name].append(row)
+    return result
+
+
+def _approved_na_rows_by_pad(
+    rows: Sequence[FormRow], stage: str, corner: str
+) -> Dict[Tuple[str, str, str], List[FormRow]]:
+    result: Dict[Tuple[str, str, str], List[FormRow]] = defaultdict(list)
+    for row in rows:
+        if not row_selected_for_assembled(row, "common", stage, corner):
+            continue
+        if not is_approved_na(row):
+            continue
+        values = row.values
+        result[
+            (
+                clean_cell(values.get("pad_name")),
+                clean_cell(values.get("subsys_instance")),
+                clean_cell(values.get("subsys_port")),
+            )
+        ].append(row)
+    return result
+
+
+def _resolved_flat_pad_rows(
+    form_path: Path,
+    io_rows: Sequence[FormRow],
+    stage: str,
+    corner: str,
+    tool: str,
+    accounting_after: str,
+    report: Report,
+) -> List[Dict[str, object]]:
+    workbook = load_workbook(form_path, data_only=False)
+    sheet = workbook["pad_inventory"]
+    active_by_pad = _active_io_rows_by_pad(io_rows, stage, corner, tool)
+    na_by_pad = _approved_na_rows_by_pad(io_rows, stage, corner)
+    resolved: List[Dict[str, object]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for row_idx in range(2, sheet.max_row + 1):
+        values = row_values(sheet, row_idx, PAD_HEADERS)
+        if not clean_cell(values.get("pad_name")):
+            continue
+        if clean_cell(values.get("stage")) != stage or clean_cell(values.get("corner")) != corner:
+            continue
+        pad_id = clean_cell(values.get("pad_id"))
+        view_id = clean_cell(values.get("view_id"))
+        identity = (pad_id, view_id)
+        if not pad_id or not re.fullmatch(r"[0-9a-f]{64}", pad_id):
+            report.error(f"pad_inventory row {row_idx}: pad_id must be a full SHA-256")
+        if identity in seen:
+            report.error(f"pad_inventory row {row_idx}: duplicate pad_id/view_id {identity}")
+        seen.add(identity)
+        key = (
+            clean_cell(values.get("pad_name")),
+            clean_cell(values.get("subsys_instance")),
+            clean_cell(values.get("subsys_port")),
+        )
+        active_rows = active_by_pad.get(key[0], [])
+        normal_timing_rows = [
+            row for row in active_rows
+            if normalize_key(row.values.get("constraint_type")) in DELAY_TYPES | {"false_path"}
+        ]
+        na_rows = na_by_pad.get(key, [])
+        timing_active = bool(active_rows)
+        disposition = normalize_key(values.get("pad_disposition"))
+        apply_value = normalize_key(values.get("apply"))
+        review_status = normalize_key(values.get("review_status"))
+        integration_direction = normalize_key(
+            values.get("direction_from_integration") or values.get("direction")
+        )
+        effective_direction = normalize_key(values.get("effective_direction"))
+        if integration_direction in {"input", "output"}:
+            values["effective_direction"] = integration_direction
+        elif integration_direction == "inout" and timing_active and disposition != "route_to_30":
+            active_directions = {
+                normalize_key(row.values.get("direction"))
+                for row in active_rows
+                if normalize_key(row.values.get("direction"))
+            }
+            if len(active_directions) != 1 or not active_directions <= {"input", "output"}:
+                report.error(
+                    f"pad_inventory row {row_idx}: active inout IO commands must resolve to "
+                    "one effective input/output direction"
+                )
+            else:
+                values["effective_direction"] = next(iter(active_directions))
+        if disposition and disposition not in {"constrained", "not_applicable", "route_to_30", "pending"}:
+            report.error(f"pad_inventory row {row_idx}: invalid pad_disposition {disposition}")
+
+        if disposition == "route_to_30":
+            if apply_value != "yes" or review_status != "approved":
+                report.error(f"pad_inventory row {row_idx}: route_to_30 requires apply=yes and review_status=approved")
+            if not clean_cell(values.get("owner")) or not clean_cell(values.get("basis")):
+                report.error(f"pad_inventory row {row_idx}: route_to_30 requires owner and basis")
+            if not clean_cell(values.get("reviewer")) or not clean_cell(values.get("review_date")):
+                report.error(f"pad_inventory row {row_idx}: route_to_30 requires reviewer and review_date")
+            if not clean_cell(values.get("related_exception_intent")):
+                report.error(f"pad_inventory row {row_idx}: route_to_30 requires related_exception_intent")
+            if clean_cell(values.get("approved_machine_digest")) != clean_cell(values.get("machine_digest")):
+                report.error(f"pad_inventory row {row_idx}: route_to_30 approval is stale")
+            if integration_direction == "inout":
+                if effective_direction not in {"input", "output"}:
+                    report.error(
+                        f"pad_inventory row {row_idx}: inout route_to_30 requires "
+                        "effective_direction=input or output"
+                    )
+                elif effective_direction == "output":
+                    report.error(
+                        f"pad_inventory row {row_idx}: inout route_to_30 effective_direction=output "
+                        "is not supported by the current 30 oriented edge contract"
+                    )
+                else:
+                    values["effective_direction"] = "input"
+                route_active_directions = {
+                    normalize_key(row.values.get("direction"))
+                    for row in active_rows
+                    if normalize_key(row.values.get("direction"))
+                }
+                if route_active_directions and route_active_directions != {effective_direction}:
+                    report.error(
+                        f"pad_inventory row {row_idx}: inout route_to_30 effective_direction "
+                        "conflicts with active 04 electrical direction"
+                    )
+            if normal_timing_rows:
+                report.error(
+                    f"pad_inventory row {row_idx}: route_to_30 conflicts with active 04 normal timing"
+                )
+            values["timing_active"] = "no"
+            values["coverage_status"] = "route_to_30"
+        elif timing_active:
+            first = active_rows[0]
+            values["pad_disposition"] = "constrained"
+            values["timing_active"] = "yes"
+            values["coverage_status"] = "constrained"
+            values["apply"] = "yes"
+            values["review_status"] = "approved"
+            values["owner"] = clean_cell(first.values.get("owner"))
+            values["basis"] = clean_cell(first.values.get("basis")) or clean_cell(first.values.get("note"))
+            values["reviewer"] = clean_cell(first.values.get("reviewer"))
+            values["review_date"] = clean_cell(first.values.get("review_date"))
+            values["related_exception_intent"] = ""
+        elif na_rows:
+            first = na_rows[0]
+            values["pad_disposition"] = "not_applicable"
+            values["timing_active"] = "no"
+            values["coverage_status"] = "not_applicable"
+            values["apply"] = "yes"
+            values["review_status"] = "approved"
+            values["owner"] = clean_cell(first.values.get("owner"))
+            values["basis"] = clean_cell(first.values.get("basis")) or clean_cell(first.values.get("note"))
+            values["reviewer"] = clean_cell(first.values.get("reviewer"))
+            values["review_date"] = clean_cell(first.values.get("review_date"))
+            values["related_exception_intent"] = ""
+        elif disposition == "not_applicable":
+            missing_review = [
+                name for name in ("owner", "basis", "reviewer", "review_date")
+                if not clean_cell(values.get(name))
+            ]
+            if apply_value != "yes" or review_status != "approved" or missing_review:
+                report.error(
+                    f"pad_inventory row {row_idx}: not_applicable requires approved review, "
+                    "owner, basis, reviewer, and review_date"
+                )
+            values["timing_active"] = "no"
+            values["coverage_status"] = "not_applicable"
+        else:
+            if disposition == "constrained":
+                report.error(
+                    f"pad_inventory row {row_idx}: constrained requires an active approved 04 IO command"
+                )
+            values["pad_disposition"] = disposition or "pending"
+            values["timing_active"] = "no"
+            values["coverage_status"] = "pending"
+        values["accounting_digest_after"] = accounting_after
+        resolved.append(values)
+    workbook.close()
+    return resolved
+
+
+def _merge_prior_pad_rows(
+    path: Path,
+    current_rows: Sequence[Dict[str, object]],
+    current_view_id: str,
+    allowed_view_ids: Set[str],
+    run_context: Dict[str, str],
+    structure: str,
+    report: Report,
+) -> Tuple[List[Dict[str, object]], Set[str]]:
+    merged: Dict[Tuple[str, str], Dict[str, object]] = {}
+    authenticated_prior_views: Set[str] = set()
+    if path.is_file():
+        meta_path = path.with_name("pad_inventory.meta")
+        try:
+            prior_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            report.warn(f"ignoring prior pad inventory without metadata: {meta_path}")
+            prior_meta = None
+        except (OSError, ValueError, TypeError) as exc:
+            report.warn(f"ignoring invalid prior pad inventory metadata {meta_path}: {exc}")
+            prior_meta = None
+
+        if prior_meta is not None:
+            stale_fields = []
+            if str(prior_meta.get("schema_version") or "").strip() != FLAT_PAD_SCHEMA_VERSION:
+                stale_fields.append("schema_version")
+            for name, expected in (
+                ("stage_name", "04_soc_io_pads"),
+                ("run_id", clean_cell(run_context.get("run_id"))),
+                ("mode_label", clean_cell(run_context.get("mode_label"))),
+                ("design_revision", clean_cell(run_context.get("design_revision"))),
+                ("structure_digest", structure),
+                ("completion_status", "complete"),
+                ("sync_changed", "no"),
+            ):
+                actual = (
+                    normalize_key(prior_meta.get(name))
+                    if name in {"completion_status", "sync_changed"}
+                    else clean_cell(prior_meta.get(name))
+                )
+                if actual != expected:
+                    stale_fields.append(name)
+            if clean_cell(prior_meta.get("error_count")) not in {"", "0"}:
+                stale_fields.append("error_count")
+            if stale_fields:
+                report.warn(
+                    f"ignoring stale prior pad inventory {path}: {', '.join(stale_fields)}"
+                )
+            else:
+                try:
+                    actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError as exc:
+                    report.error(f"failed to read prior pad inventory {path}: {exc}")
+                    actual_digest = ""
+                declared_digests = [
+                    clean_cell(prior_meta.get(name))
+                    for name in ("inventory_digest", "pad_inventory_digest")
+                    if clean_cell(prior_meta.get(name))
+                ]
+                if not declared_digests or any(
+                    declared != actual_digest for declared in declared_digests
+                ):
+                    report.error(
+                        f"prior pad inventory digest does not match {meta_path}"
+                    )
+                else:
+                    try:
+                        with path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                            reader = csv.DictReader(file_obj)
+                            missing_headers = sorted(set(PAD_HEADERS) - set(reader.fieldnames or []))
+                            prior_view_values = prior_meta.get("view_ids")
+                            if missing_headers or not isinstance(prior_view_values, list):
+                                details = (
+                                    "missing headers " + ", ".join(missing_headers)
+                                    if missing_headers
+                                    else "metadata has no canonical view_ids list"
+                                )
+                                report.warn(
+                                    f"ignoring non-canonical prior pad inventory {path}: {details}"
+                                )
+                                prior_view_ids: Set[str] = set()
+                            else:
+                                prior_view_ids = {
+                                    clean_cell(value) for value in prior_view_values
+                                    if clean_cell(value)
+                                }
+                                authenticated_prior_views = (
+                                    prior_view_ids & allowed_view_ids
+                                ) - {current_view_id}
+                            for row in reader:
+                                pad_id = clean_cell(row.get("pad_id"))
+                                view_id = clean_cell(row.get("view_id"))
+                                if not prior_view_ids:
+                                    continue
+                                if view_id not in prior_view_ids:
+                                    report.error(
+                                        f"prior pad inventory row has undeclared view_id {view_id or '<blank>'}"
+                                    )
+                                    continue
+                                if str(row.get("schema_version") or "").strip() != FLAT_PAD_SCHEMA_VERSION:
+                                    report.error(
+                                        f"prior pad inventory row {pad_id or '<blank>'}/{view_id}: schema_version is stale"
+                                    )
+                                    continue
+                                if clean_cell(row.get("structure_digest")) != structure:
+                                    report.error(
+                                        f"prior pad inventory row {pad_id or '<blank>'}/{view_id}: structure_digest is stale"
+                                    )
+                                    continue
+                                if not re.fullmatch(r"[0-9a-f]{64}", pad_id):
+                                    report.error(
+                                        f"prior pad inventory row {pad_id or '<blank>'}/{view_id}: invalid pad_id"
+                                    )
+                                    continue
+                                if view_id == current_view_id:
+                                    continue
+                                if view_id not in allowed_view_ids:
+                                    continue
+                                identity = (pad_id, view_id)
+                                if identity in merged:
+                                    report.error(
+                                        f"prior pad inventory duplicates pad_id/view_id {identity}"
+                                    )
+                                    continue
+                                merged[identity] = dict(row)
+                    except (OSError, csv.Error) as exc:
+                        report.error(f"failed to preserve prior pad inventory views: {exc}")
+    for row in current_rows:
+        merged[(clean_cell(row.get("pad_id")), clean_cell(row.get("view_id")))] = dict(row)
+    return [merged[key] for key in sorted(merged)], authenticated_prior_views
+
+
 def _load_accounting_runtime():
     """Load the shared 00 workbook/accounting implementation for flat runs."""
     script_root = Path(__file__).resolve().parents[1]
@@ -3137,37 +4185,53 @@ def _read_flat_manifest(path: Path, run_root: Path, instances: Dict[str, InstInf
 def _flat_owner_updates(
     runtime,
     records: Sequence[Any],
-    rows: Sequence[FormRow],
-    stage: str,
-    corner: str,
+    pad_rows: Sequence[Dict[str, object]],
     report: Report,
 ) -> List[Dict[str, Any]]:
-    updates: List[Dict[str, Any]] = []
+    updates: Dict[Tuple[str, str, int, str, int], Dict[str, Any]] = {}
     by_key: Dict[Tuple[str, str, str], List[Any]] = defaultdict(list)
     for record in records:
         by_key[(record.inst_name, record.direction, record.shape.base)].append(record)
-    for row in rows:
-        if not row_selected_for_assembled(row, "common", stage, corner):
+
+    for values in pad_rows:
+        disposition = normalize_key(values.get("pad_disposition"))
+        timing_active = normalize_key(values.get("timing_active"))
+        if disposition in {"route_to_30", "pending"}:
             continue
-        if not (is_apply_approved(row) or is_approved_na(row)):
+        if disposition == "constrained" and timing_active != "yes":
             continue
-        values = row.values
-        instance = clean_cell(values.get("subsys_instance"))
-        port = clean_cell(values.get("subsys_port"))
+        if disposition not in {"constrained", "not_applicable"}:
+            continue
+
+        instance = clean_cell(values.get("harden_instance") or values.get("subsys_instance"))
+        port = clean_cell(values.get("harden_port") or values.get("subsys_port"))
         direction = normalize_key(values.get("direction")) or normalize_key(values.get("direction_from_integration"))
         match = re.fullmatch(r"(?P<base>[^\[\]]+)(?:\[(?P<bit>-?\d+)\])?", port)
         if not match or not instance:
-            report.warn(f"io_constraints row {row.row_idx}: cannot derive accounting port from {instance}/{port}")
+            report.error(
+                f"pad_inventory {clean_cell(values.get('pad_id')) or '<unknown>'}: "
+                f"cannot derive accounting port from {instance}/{port}"
+            )
             continue
         base = match.group("base")
-        bit = int(match.group("bit")) if match.group("bit") is not None else 0
+        bit_text = clean_cell(values.get("harden_bit_index"))
+        bit = int(bit_text) if bit_text else (
+            int(match.group("bit")) if match.group("bit") is not None else 0
+        )
         candidates = by_key.get((instance, direction, base), [])
-        if not candidates:
-            report.error(f"io_constraints row {row.row_idx}: accounting port not found: {instance}/{direction}/{port}")
+        matches = [record for record in candidates if record.shape.contains(bit)]
+        if len(matches) != 1:
+            report.error(
+                f"pad_inventory {clean_cell(values.get('pad_id')) or '<unknown>'}: "
+                f"accounting port {instance}/{direction}/{port} matches {len(matches)} workbook row(s)"
+            )
             continue
-        record = candidates[0]
-        if not record.shape.contains(bit):
-            report.error(f"io_constraints row {row.row_idx}: bit {bit} is outside {record.location()}")
+        record = matches[0]
+        owner = clean_cell(values.get("pad_id"))
+        if not owner:
+            report.error(
+                f"pad_inventory {instance}/{direction}/{port}: canonical pad_id is missing for accounting owner"
+            )
             continue
         added = {bit} - set(record.used_bits)
         record.used_bits.add(bit)
@@ -3178,9 +4242,170 @@ def _flat_owner_updates(
             cell.number_format = "@"
             record.modified = True
             record.model.modified = True
-        owner = "PAD_" + hashlib.sha256((clean_cell(values.get("pad_name")) + "|" + instance + "|" + port + "|" + direction).encode("utf-8")).hexdigest()[:16]
-        updates.append({"record": record, "added_bits": added, "owner_object_id": owner, "row": row, "reason": "approved SoC IO/pad constraint" if is_apply_approved(row) else "approved NA disposition"})
-    return updates
+        update_key = (record.workbook, record.sheet, record.row, record.direction, bit)
+        if update_key not in updates:
+            updates[update_key] = {
+                "record": record,
+                "added_bits": added,
+                "owner_object_id": owner,
+                "reason": (
+                    "approved SoC IO/pad constraint"
+                    if disposition == "constrained"
+                    else "approved NA disposition"
+                ),
+            }
+        else:
+            updates[update_key]["added_bits"] |= added
+    return [updates[key] for key in sorted(updates)]
+
+
+def _validate_route_accounting_history(
+    runtime: Any,
+    pad_rows: Sequence[Dict[str, object]],
+    prior_delta_rows: Sequence[Dict[str, object]],
+    report: Report,
+) -> None:
+    normal_owner_ids = {
+        clean_cell(row.get("pad_id"))
+        for row in pad_rows
+        if normalize_key(row.get("pad_disposition")) in {"constrained", "not_applicable"}
+        and clean_cell(row.get("pad_id"))
+    }
+    normal_sources: Dict[Tuple[str, str, str, str], Set[int]] = defaultdict(set)
+    for row in pad_rows:
+        if normalize_key(row.get("pad_disposition")) not in {"constrained", "not_applicable"}:
+            continue
+        bit_text = clean_cell(row.get("harden_bit_index"))
+        normal_sources[
+            (
+                clean_cell(row.get("source_workbook")),
+                clean_cell(row.get("source_sheet")),
+                clean_cell(row.get("source_row")),
+                normalize_key(row.get("direction")),
+            )
+        ].add(int(bit_text) if bit_text else 0)
+
+    route_ids: Set[str] = set()
+    route_sources: Dict[Tuple[str, str, str, str], Set[int]] = defaultdict(set)
+    for row in pad_rows:
+        if normalize_key(row.get("pad_disposition")) != "route_to_30":
+            continue
+        pad_id = clean_cell(row.get("pad_id"))
+        bit_text = clean_cell(row.get("harden_bit_index"))
+        bit = int(bit_text) if bit_text else 0
+        source_key = (
+            clean_cell(row.get("source_workbook")),
+            clean_cell(row.get("source_sheet")),
+            clean_cell(row.get("source_row")),
+            normalize_key(row.get("direction")),
+        )
+        if pad_id in normal_owner_ids or bit in normal_sources.get(source_key, set()):
+            continue
+        if pad_id:
+            route_ids.add(pad_id)
+        route_sources[source_key].add(bit)
+
+    reported: Set[str] = set()
+    for delta in prior_delta_rows:
+        added_text = clean_cell(delta.get("added_bits"))
+        if not added_text:
+            continue
+        try:
+            added_bits = runtime.parse_bits_field(added_text)
+        except ValueError as exc:
+            report.error(f"invalid prior 04 accounting delta bits: {exc}")
+            continue
+        owner_id = clean_cell(delta.get("owner_object_id"))
+        source_key = (
+            clean_cell(delta.get("workbook")),
+            clean_cell(delta.get("sheet")),
+            clean_cell(delta.get("row")),
+            normalize_key(delta.get("direction")),
+        )
+        matched = owner_id in route_ids or bool(
+            added_bits & route_sources.get(source_key, set())
+        )
+        if not matched:
+            continue
+        label = owner_id or "/".join(source_key)
+        if label in reported:
+            continue
+        reported.add(label)
+        report.error(
+            f"route_to_30 pad {label} was already claimed by a prior 04 accounting transaction; "
+            "start from a fresh run root before transferring ownership to 30"
+        )
+
+
+def _validate_flat_upstream_completions(
+    runtime: Any,
+    run_root: Path,
+    run_context: Dict[str, str],
+    structure: str,
+    clock_path: Path,
+    report: Report,
+) -> Dict[str, str]:
+    specs = (
+        (
+            "00_stage_completion",
+            run_root / "00_middle" / "stage_completion.meta",
+            "00_harden_port_inventory",
+        ),
+        (
+            "01_stage_completion",
+            run_root / "01_middle" / "stage_completion.meta",
+            "01_soc_clocks",
+        ),
+    )
+    digests: Dict[str, str] = {}
+    payloads: Dict[str, Dict[str, object]] = {}
+    for label, path, expected_stage_name in specs:
+        if not path.is_file():
+            report.error(f"required upstream completion is missing: {path}")
+            digests[label] = ""
+            continue
+        digests[label] = runtime.sha256_file(path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            report.error(f"required upstream completion is invalid: {path}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            report.error(f"required upstream completion is invalid: {path}: expected JSON object")
+            continue
+        payloads[label] = payload
+        checks = {
+            "stage_name": clean_cell(payload.get("stage_name")) == expected_stage_name,
+            "run_id": clean_cell(payload.get("run_id")) == clean_cell(run_context.get("run_id")),
+            "mode_label": clean_cell(payload.get("mode_label")) == clean_cell(run_context.get("mode_label")),
+            "structure_digest": clean_cell(payload.get("structure_digest")) == structure,
+            "completion_status": normalize_key(payload.get("completion_status")) == "complete",
+            "sync_changed": normalize_key(payload.get("sync_changed")) == "no",
+            "error_count": clean_cell(payload.get("error_count")) in {"", "0"},
+        }
+        if label == "01_stage_completion":
+            checks["design_revision"] = (
+                clean_cell(payload.get("design_revision"))
+                == clean_cell(run_context.get("design_revision"))
+            )
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            report.error(
+                f"upstream completion is stale or incomplete: {path}: {', '.join(failed)}"
+            )
+
+    digests["01_clock_inventory"] = (
+        runtime.sha256_file(clock_path) if clock_path.is_file() else ""
+    )
+    completion_01 = payloads.get("01_stage_completion", {})
+    if not clock_path.is_file():
+        report.error(f"required 01 clock inventory is missing: {clock_path}")
+    elif clean_cell(completion_01.get("clock_inventory_digest")) != digests["01_clock_inventory"]:
+        report.error(
+            f"{run_root / '01_middle' / 'stage_completion.meta'}: "
+            "clock_inventory_digest does not match 01_middle/clock_inventory.csv"
+        )
+    return digests
 
 
 def run_target_flat(args: argparse.Namespace) -> int:
@@ -3197,12 +4422,32 @@ def run_target_flat(args: argparse.Namespace) -> int:
     runtime.recover_transactions(run_root, report)
     run_context = runtime.read_run_context(input_root / "run_context.csv", report)
     required_views = runtime.read_required_views(input_root / "required_views.csv", report)
-    if stage == "all" and corner == "all" and required_views:
-        stage, corner = required_views[0]["stage"], required_views[0]["corner"]
+    required_04_views = [
+        view for view in required_views if normalize_key(view.get("require_04")) == "yes"
+    ]
+    if stage == "all" and corner == "all" and required_04_views:
+        explicit_all_view = next(
+            (
+                view for view in required_04_views
+                if clean_cell(view.get("stage")) == "all"
+                and clean_cell(view.get("corner")) == "all"
+            ),
+            None,
+        )
+        if explicit_all_view is None:
+            stage, corner = required_04_views[0]["stage"], required_04_views[0]["corner"]
     current_view = next(
-        (view for view in required_views if view["stage"] == stage and view["corner"] == corner),
+        (
+            view for view in required_04_views
+            if view["stage"] == stage and view["corner"] == corner
+        ),
         None,
     )
+    if current_view is None:
+        report.error(
+            f"04 formal generation requires a require_04=yes view, got stage={stage} corner={corner}"
+        )
+    view_id = current_view["view_id"] if current_view else f"{stage}_{corner}"
     output_path = result / ("04_soc_io_pads.sdc" if stage == "all" and corner == "all" else f"04_soc_io_pads_{stage}_{safe_filename_token(corner)}.sdc")
     report_path = result / "reports" / f"io_pad_check_report_{stage}_{safe_filename_token(corner)}.txt"
 
@@ -3226,14 +4471,36 @@ def run_target_flat(args: argparse.Namespace) -> int:
     runtime.validate_connections(records, info_entries, report)
     structure = runtime.structure_digest(run_context, required_views, info_semantic, records)
     accounting_before = runtime.accounting_digest(records)
+    upstream_artifact_digests = _validate_flat_upstream_completions(
+        runtime, run_root, run_context, structure, clock_path, report
+    )
     port_sheets = read_port_workbooks(port_paths, report)
     attach_port_data(instances, port_sheets, report)
-    pads = build_pad_records(instances)
+    pads = _build_flat_exact_pads(runtime, records, instances, report)
     extracted: List[ExtractedConstraint] = []
     for inst in instances.values():
         extracted.extend(extract_constraints_from_instance(inst, "common", report))
+    extracted = _expand_flat_extracted_constraints(extracted, pads, report)
     if report.error_count == 0:
-        sync_workbook(form_path, pads, extracted, report)
+        sync_workbook(
+            form_path,
+            pads,
+            extracted,
+            report,
+            {"view_id": view_id, "stage": stage, "corner": corner},
+        )
+        _sync_flat_pad_machine_fields(
+            form_path,
+            pads,
+            run_context,
+            completeness,
+            structure,
+            accounting_before,
+            view_id,
+            stage,
+            corner,
+            report,
+        )
     common_inventory = read_clock_inventory(clock_path, report, "common", required=True)
     rows = read_form_rows(form_path) if form_path.is_file() else []
     if rows:
@@ -3250,56 +4517,60 @@ def run_target_flat(args: argparse.Namespace) -> int:
             "",
             "sta",
             report,
+            allow_false_path=False,
         )
     coverage = build_coverage_lines(rows, pads, "common", stage, corner)
     if report.sync_changed or report.error_count:
         write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
         return 1
 
-    generated = generate_sdc(rows, "common", stage, corner, "sta", completeness)
-    updates = _flat_owner_updates(runtime, records, rows, stage, corner, report)
+    generated = generate_sdc(
+        rows, "common", stage, corner, "sta", completeness, assembled=True
+    )
+    current_pad_rows = _resolved_flat_pad_rows(
+        form_path, rows, stage, corner, "sta", accounting_before, report
+    )
+    updates = _flat_owner_updates(
+        runtime, records, current_pad_rows, report
+    )
     accounting_after = runtime.accounting_digest(records)
     if report.error_count:
         write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
         return 1
 
     output_payload = ("\n".join(generated).rstrip() + "\n").encode("utf-8")
-    pad_rows = []
-    for pad in pads:
-        pad_rows.append({
-            "pad_name": pad.pad_name,
-            "soc_top_port": pad.soc_top_port,
-            "subsys_instance": pad.subsys_instance,
-            "subsys_port": pad.subsys_port,
-            "direction_from_integration": pad.direction,
-            "is_gpio_or_inout": pad.is_gpio_or_inout,
-            "related_scenarios": pad.related_scenarios,
-            "source_sdc_status": pad.source_sdc_status,
-            "connection_id": pad.connection_id,
-            "scenario_scope": pad.scenario_scope,
-            "connection_type": pad.connection_type,
-            "source_workbook": pad.source_workbook,
-            "source_sheet": pad.source_sheet,
-            "source_row": pad.source_row,
-            "note": pad.note,
-        })
-    flat_pad_headers = PAD_HEADERS + ["direction", "bit_index"]
-    for item in pad_rows:
-        item["direction"] = item["direction_from_integration"]
-        match = re.search(r"\[(-?\d+)\]$", clean_cell(item["subsys_port"]))
-        item["bit_index"] = match.group(1) if match else ""
-    pad_payload = runtime.csv_text(flat_pad_headers, pad_rows).encode("utf-8")
+    for item in current_pad_rows:
+        item["accounting_digest_after"] = accounting_after
+    pad_rows, authenticated_prior_views = _merge_prior_pad_rows(
+        middle / "pad_inventory.csv",
+        current_pad_rows,
+        view_id,
+        {clean_cell(view.get("view_id")) for view in required_04_views},
+        run_context,
+        structure,
+        report,
+    )
+    pad_payload = runtime.csv_text(PAD_HEADERS, pad_rows).encode("utf-8")
     pad_meta = {
         "schema_version": "1.0", "stage_name": "04_soc_io_pads",
         "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
         "design_revision": run_context.get("design_revision", ""), "completion_status": "complete",
+        "error_count": 0, "sync_changed": "no",
         "structure_digest": structure, "accounting_digest_before": accounting_before,
         "accounting_digest_after": accounting_after, "inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
         "pad_inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
+        "view_ids": sorted(
+            {view_id}
+            | authenticated_prior_views
+            | {clean_cell(row.get("view_id")) for row in pad_rows if clean_cell(row.get("view_id"))}
+        ),
     }
     delta_path = middle / "port_accounting_delta.csv"
     delta_meta_path = middle / "port_accounting_delta.meta"
     old_delta_rows = runtime.load_delta_rows(delta_path, report)
+    _validate_route_accounting_history(
+        runtime, pad_rows, old_delta_rows, report
+    )
     transaction_id = "04_" + hashlib.sha256((structure + accounting_after + runtime.utc_timestamp()).encode("utf-8")).hexdigest()[:16]
     new_delta_rows = []
     for item in updates:
@@ -3334,41 +4605,100 @@ def run_target_flat(args: argparse.Namespace) -> int:
         "delta_csv_digest": hashlib.sha256(delta_payload).hexdigest(),
         "transactions": list(old_meta.get("transactions", [])) + [transaction],
     }
-    write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
     completion = {
         "schema_version": "1.0", "author": author_name(), "stage_name": "04_soc_io_pads", "stage": stage, "corner": corner,
         "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""), "design_revision": run_context.get("design_revision", ""),
         "completion_status": "complete", "error_count": 0, "sync_changed": "no", "structure_digest": structure,
         "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after, "port_accounting": "enabled",
-        "upstream_artifact_digests": {"00_stage_completion": runtime.sha256_file(run_root / "00_middle" / "stage_completion.meta") if (run_root / "00_middle" / "stage_completion.meta").is_file() else "", "01_clock_inventory": runtime.sha256_file(clock_path) if clock_path.is_file() else ""},
+        "upstream_artifact_digests": upstream_artifact_digests,
         "output_sdc_digest": hashlib.sha256(output_payload).hexdigest(), "pad_inventory_digest": hashlib.sha256(pad_payload).hexdigest(),
         "accounting_delta_digest": hashlib.sha256(delta_payload).hexdigest(), "review_workbook_digest": runtime.sha256_file(form_path), "transaction_id": transaction_id,
     }
-    view_id = current_view["view_id"] if current_view else f"{stage}_{corner}"
     view_completion = dict(completion)
     view_completion.update({"view_id": view_id, "output_sdc_digest": hashlib.sha256(output_payload).hexdigest(), "completion_status": "complete"})
-    view_completion_payload = (json.dumps(view_completion, indent=2) + "\n").encode("utf-8")
-    prior_view_digests: Dict[str, str] = {}
+    pad_digest = hashlib.sha256(pad_payload).hexdigest()
+    view_completion["pad_inventory_digest"] = pad_digest
+    view_completion_payloads: Dict[Path, bytes] = {}
+    required_view_digests: Dict[str, str] = {}
     completion_path = middle / "stage_completion.meta"
-    if completion_path.is_file():
-        try:
-            prior_completion = json.loads(completion_path.read_text(encoding="utf-8"))
-            if prior_completion.get("structure_digest") == structure:
-                prior_view_digests = dict(prior_completion.get("required_view_completions", {}))
-        except (OSError, ValueError, TypeError):
-            prior_view_digests = {}
-    prior_view_digests[view_id] = hashlib.sha256(view_completion_payload).hexdigest()
-    completion["required_view_completions"] = prior_view_digests
-    required_04_ids = {view["view_id"] for view in required_views if view.get("require_04") == "yes"}
-    if required_04_ids and set(prior_view_digests) != required_04_ids:
+    for required_view in required_04_views:
+        required_id = clean_cell(required_view.get("view_id"))
+        required_stage = clean_cell(required_view.get("stage"))
+        required_corner = clean_cell(required_view.get("corner"))
+        required_path = (
+            middle / "completion"
+            / f"{safe_filename_token(required_stage)}_{safe_filename_token(required_corner)}.meta"
+        )
+        if required_id == view_id:
+            payload = dict(view_completion)
+        elif required_id not in authenticated_prior_views:
+            continue
+        elif required_path.is_file():
+            try:
+                payload = json.loads(required_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError) as exc:
+                report.warn(
+                    f"excluding unreadable prior 04 view completion {required_path}: {exc}"
+                )
+                continue
+            expected_output = result / (
+                "04_soc_io_pads.sdc"
+                if required_stage == "all" and required_corner == "all"
+                else f"04_soc_io_pads_{required_stage}_{safe_filename_token(required_corner)}.sdc"
+            )
+            checks = {
+                "stage_name": clean_cell(payload.get("stage_name")) == "04_soc_io_pads",
+                "view_id": clean_cell(payload.get("view_id")) == required_id,
+                "stage": clean_cell(payload.get("stage")) == required_stage,
+                "corner": clean_cell(payload.get("corner")) == required_corner,
+                "run_id": clean_cell(payload.get("run_id")) == clean_cell(run_context.get("run_id")),
+                "mode_label": clean_cell(payload.get("mode_label")) == clean_cell(run_context.get("mode_label")),
+                "design_revision": clean_cell(payload.get("design_revision")) == clean_cell(run_context.get("design_revision")),
+                "structure_digest": clean_cell(payload.get("structure_digest")) == structure,
+                "completion_status": normalize_key(payload.get("completion_status")) == "complete",
+                "sync_changed": normalize_key(payload.get("sync_changed")) == "no",
+                "error_count": clean_cell(payload.get("error_count")) in {"", "0"},
+                "output_sdc_digest": (
+                    expected_output.is_file()
+                    and clean_cell(payload.get("output_sdc_digest"))
+                    == runtime.sha256_file(expected_output)
+                ),
+                "upstream_artifact_digests": (
+                    isinstance(payload.get("upstream_artifact_digests"), dict)
+                    and all(
+                        clean_cell(payload["upstream_artifact_digests"].get(name))
+                        == digest
+                        for name, digest in upstream_artifact_digests.items()
+                    )
+                ),
+            }
+            failed = [name for name, passed in checks.items() if not passed]
+            if failed:
+                report.warn(
+                    f"excluding stale prior 04 view completion {required_path}: "
+                    f"{', '.join(failed)}"
+                )
+                continue
+            payload["pad_inventory_digest"] = pad_digest
+        else:
+            continue
+        payload_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+        view_completion_payloads[required_path] = payload_bytes
+        required_view_digests[required_id] = hashlib.sha256(payload_bytes).hexdigest()
+    completion["required_view_completions"] = required_view_digests
+    required_04_ids = {clean_cell(view.get("view_id")) for view in required_04_views}
+    if required_04_ids and set(required_view_digests) != required_04_ids:
         completion["completion_status"] = "review_required"
+    write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+    if report.error_count:
+        return 1
     artifact_payloads = [
         (output_path, output_payload), (report_path, report_path.read_bytes()),
         (middle / "pad_inventory.csv", pad_payload), (middle / "pad_inventory.meta", (json.dumps(pad_meta, indent=2) + "\n").encode("utf-8")),
         (delta_path, delta_payload), (delta_meta_path, (json.dumps(delta_meta, indent=2) + "\n").encode("utf-8")),
         (completion_path, (json.dumps(completion, indent=2) + "\n").encode("utf-8")),
-        (middle / "completion" / f"{safe_filename_token(stage)}_{safe_filename_token(corner)}.meta", view_completion_payload),
     ]
+    artifact_payloads.extend(sorted(view_completion_payloads.items(), key=lambda item: str(item[0])))
     candidate_root = run_root / ".04_candidates"
     if candidate_root.exists():
         shutil.rmtree(str(candidate_root))
