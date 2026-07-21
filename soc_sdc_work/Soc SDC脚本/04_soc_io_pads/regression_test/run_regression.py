@@ -741,6 +741,259 @@ def run_flat_target_case():
     require(flat_sdc_path.read_text(encoding="utf-8") == flat_sdc, "rejected flat false_path changed official SDC")
 
 
+def run_flat_tool_surface_case():
+    for tool in ("sta", "synth", "both"):
+        root = WORK / ("flat_tool_surface_" + tool)
+        clean_dir(root)
+        inputs = root / "inputs"
+        inputs.mkdir(parents=True)
+        write_info_all(inputs / "info_all.xlsx")
+
+        port_book = Workbook()
+        port_sheet = port_book.active
+        port_sheet.title = "u_io"
+        port_sheet.append([
+            "Input", "Input Width", "Input Used Width", "From Whom",
+            "Output", "Output Width", "Output Used Width", "To Top",
+            "Inout", "Inout Width", "Inout Connectivity", "Inout Name",
+        ])
+        port_sheet.append([
+            "synth_only_i", 1, "", "top.synth_only_pad",
+            "", "", "", "", "", "", "", "",
+        ])
+        port_book.save(str(inputs / "port_u_io.xlsx"))
+        (inputs / "u_io.sdc").write_text(
+            "set_dont_touch_network [get_ports synth_only_i]\n",
+            encoding="utf-8",
+        )
+
+        with (inputs / "run_context.csv").open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(["run_id", "mode_label", "design_revision", "note"])
+            writer.writerow([
+                "RUN_04_TOOL_%s" % tool.upper(), "func", "rev_tool_surface",
+                "04 %s tool surface regression" % tool,
+            ])
+        with (inputs / "required_views.csv").open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(["view_id", "stage", "corner", "require_02", "require_04", "require_20", "require_30", "note"])
+            writer.writerow(["prects_ss_125", "prects", "ss_125", "no", "yes", "no", "no", "04 tool surface view"])
+        with (inputs / "virtual_clocks.csv").open("w", encoding="utf-8", newline="") as file_obj:
+            writer = csv.writer(file_obj)
+            writer.writerow(["clock_name", "period", "waveform", "note"])
+            writer.writerow(["tool_ref_clk", "10", "0 5", "04 tool surface fixture"])
+
+        stage_00 = sh([EX00, "--run-root", root], BASE)
+        require(stage_00.returncode == 0, "%s tool surface 00 setup failed:\n%s\n%s" % (tool, stage_00.stdout, stage_00.stderr))
+        stage_01 = sh([EX01, "--run-root", root], BASE)
+        require(stage_01.returncode == 0, "%s tool surface 01 setup failed:\n%s\n%s" % (tool, stage_01.stdout, stage_01.stderr))
+
+        command = [
+            EX04, "--run-root", root, "--stage", "prects",
+            "--corner", "ss_125", "--tool", tool,
+        ]
+        report_path = root / "04_result" / "reports" / "io_pad_check_report_prects_ss_125.txt"
+        first = sh(command, BASE)
+        require(first.returncode == 1, "%s tool surface first run should synchronize review" % tool)
+        first_report = report_path.read_text(encoding="utf-8")
+        require("Tool    : %s" % tool in first_report, "%s sync report used the wrong tool surface" % tool)
+
+        form = root / "04_middle" / "04_soc_io_pads.xlsx"
+        book = load_workbook(str(form))
+        io_sheet = book["io_constraints"]
+        io_columns = header_map(io_sheet)
+        dont_touch_rows = [
+            row for row in range(2, io_sheet.max_row + 1)
+            if io_sheet.cell(row, io_columns["pad_name"]).value == "synth_only_pad"
+            and io_sheet.cell(row, io_columns["constraint_type"]).value == "dont_touch_network"
+        ]
+        require(len(dont_touch_rows) == 1, "%s tool surface dont_touch row missing" % tool)
+        row = dont_touch_rows[0]
+        for name, value in (
+            ("apply", "yes"), ("review_status", "approved"),
+            ("owner", "synthesis_owner"),
+            ("basis", "approved synthesis-only pad network preservation"),
+            ("note", "synthesis-only network protection"),
+        ):
+            io_sheet.cell(row, io_columns[name], value)
+        book.save(str(form))
+        book.close()
+
+        generated = sh(command, BASE)
+        require(generated.returncode == 0, "%s tool surface generation failed:\n%s\n%s" % (tool, generated.stdout, generated.stderr))
+        final_report = report_path.read_text(encoding="utf-8")
+        require("Tool    : %s" % tool in final_report, "%s final report used the wrong tool surface" % tool)
+
+        output_path = root / "04_result" / "04_soc_io_pads_prects_ss_125.sdc"
+        output = output_path.read_text(encoding="utf-8")
+        require("tool: %s" % tool in output, "%s SDC header used the wrong tool surface" % tool)
+        command_text = "set_dont_touch_network [get_ports {synth_only_pad}]"
+        if tool == "sta":
+            require(command_text not in output, "STA surface emitted synthesis-only dont_touch_network")
+            require("No IO/pad commands emitted" in output, "STA surface did not report an empty command set")
+        else:
+            require(output.count(command_text) == 1, "%s surface lost or duplicated dont_touch_network" % tool)
+            require("No IO/pad commands emitted" not in output, "%s surface reported an empty command set" % tool)
+
+        output_digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
+        view_completion_path = root / "04_middle" / "completion" / "prects_ss_125.meta"
+        stage_completion_path = root / "04_middle" / "stage_completion.meta"
+        for completion_path in (view_completion_path, stage_completion_path):
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            require(completion["tool"] == tool, "%s completion lost tool provenance" % tool)
+            require(completion["output_sdc_digest"] == output_digest, "%s completion has a stale output digest" % tool)
+
+        pad_meta = json.loads((root / "04_middle" / "pad_inventory.meta").read_text(encoding="utf-8"))
+        delta_meta = json.loads((root / "04_middle" / "port_accounting_delta.meta").read_text(encoding="utf-8"))
+        require(pad_meta["tool"] == tool, "%s pad inventory meta lost tool provenance" % tool)
+        require(delta_meta["tool"] == tool, "%s accounting meta lost tool provenance" % tool)
+        require(all(item["tool"] == tool for item in delta_meta["transactions"]), "%s accounting transaction lost tool provenance" % tool)
+
+        with (root / "04_middle" / "pad_inventory.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+            inventory_rows = [
+                item for item in csv.DictReader(file_obj)
+                if item.get("pad_name") == "synth_only_pad"
+            ]
+        require(len(inventory_rows) == 1, "%s surface did not publish one exact pad row" % tool)
+        inventory = inventory_rows[0]
+        with (root / "04_middle" / "port_accounting_delta.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+            delta_rows = [
+                item for item in csv.DictReader(file_obj)
+                if item.get("port") == "synth_only_i"
+            ]
+
+        used_book = load_workbook(str(inputs / "port_u_io.xlsx"), read_only=True, data_only=True)
+        used_sheet = used_book["u_io"]
+        used_columns = header_map(used_sheet)
+        used_value = str(used_sheet.cell(2, used_columns["Input Used Width"]).value or "")
+        used_book.close()
+        stage_completion = json.loads(stage_completion_path.read_text(encoding="utf-8"))
+        if tool == "sta":
+            require(inventory["pad_disposition"] == "pending", "STA-only dont_touch pad was not left pending")
+            require(inventory["timing_active"] == "no" and inventory["coverage_status"] == "pending", "STA-only dont_touch pad became active")
+            require(not delta_rows and used_value == "", "STA-only dont_touch pad was accounted")
+            require(stage_completion["accounting_digest_before"] == stage_completion["accounting_digest_after"], "STA-only dont_touch changed accounting")
+
+            official_sdc = output_path.read_bytes()
+            official_completion = stage_completion_path.read_bytes()
+            mismatch = sh(command[:-1] + ["synth"], BASE)
+            require(mismatch.returncode == 1, "same run root accepted a different 04 tool surface")
+            mismatch_report = report_path.read_text(encoding="utf-8")
+            require("04 tool surface mismatch" in mismatch_report and "fresh run root" in mismatch_report, "tool-surface mismatch diagnostic missing")
+            require(output_path.read_bytes() == official_sdc, "tool-surface mismatch changed official SDC")
+            require(stage_completion_path.read_bytes() == official_completion, "tool-surface mismatch changed official completion")
+
+            delta_meta_path = root / "04_middle" / "port_accounting_delta.meta"
+            official_delta_meta = delta_meta_path.read_bytes()
+            official_form = form.read_bytes()
+            official_ports = (inputs / "port_u_io.xlsx").read_bytes()
+            official_delta = json.loads(official_delta_meta.decode("utf-8"))
+            empty_id_transactions = [dict(item) for item in official_delta["transactions"]]
+            empty_id_transactions[0]["transaction_id"] = ""
+            duplicate_id_transactions = [dict(item) for item in official_delta["transactions"]]
+            duplicate_id_transactions.append(dict(duplicate_id_transactions[0]))
+            malformed_transaction_cases = (
+                ("missing", None, "missing transactions list"),
+                ("empty", [], "expected non-empty list"),
+                ("null", None, "expected list"),
+                ("non_object", [None], "expected JSON object"),
+                ("empty_id", empty_id_transactions, "empty transaction_id"),
+                ("duplicate_id", duplicate_id_transactions, "duplicate transaction_id"),
+            )
+            for label, transactions, diagnostic in malformed_transaction_cases:
+                malformed_delta = json.loads(official_delta_meta.decode("utf-8"))
+                if label == "missing":
+                    malformed_delta.pop("transactions")
+                else:
+                    malformed_delta["transactions"] = transactions
+                delta_meta_path.write_text(json.dumps(malformed_delta, indent=2) + "\n", encoding="utf-8")
+                malformed_delta_bytes = delta_meta_path.read_bytes()
+                malformed = sh(command, BASE)
+                require(malformed.returncode == 1, "%s 04 accounting transactions did not fail closed" % label)
+                malformed_report = report_path.read_text(encoding="utf-8")
+                require(diagnostic in malformed_report, "%s accounting metadata diagnostic missing" % label)
+                require(output_path.read_bytes() == official_sdc, "%s accounting metadata changed official SDC" % label)
+                require(stage_completion_path.read_bytes() == official_completion, "%s accounting metadata changed official completion" % label)
+                require(delta_meta_path.read_bytes() == malformed_delta_bytes, "%s accounting metadata was silently rewritten" % label)
+                require(form.read_bytes() == official_form, "%s accounting metadata changed the review workbook" % label)
+                require((inputs / "port_u_io.xlsx").read_bytes() == official_ports, "%s accounting metadata changed port accounting" % label)
+                delta_meta_path.write_bytes(official_delta_meta)
+
+            empty_tool = json.loads(official_completion.decode("utf-8"))
+            empty_tool["tool"] = ""
+            stage_completion_path.write_text(json.dumps(empty_tool, indent=2) + "\n", encoding="utf-8")
+            empty_tool_bytes = stage_completion_path.read_bytes()
+            invalid_tool = sh(command, BASE)
+            require(invalid_tool.returncode == 1, "explicitly empty 04 tool provenance was treated as legacy STA")
+            invalid_tool_report = report_path.read_text(encoding="utf-8")
+            require("invalid prior 04 tool surface" in invalid_tool_report, "empty tool provenance diagnostic missing")
+            require(output_path.read_bytes() == official_sdc, "empty tool provenance changed official SDC")
+            require(stage_completion_path.read_bytes() == empty_tool_bytes, "empty tool provenance was silently rewritten")
+            require(delta_meta_path.read_bytes() == official_delta_meta, "empty tool provenance changed accounting metadata")
+            require(form.read_bytes() == official_form, "empty tool provenance changed the review workbook")
+            require((inputs / "port_u_io.xlsx").read_bytes() == official_ports, "empty tool provenance changed port accounting")
+            stage_completion_path.write_bytes(official_completion)
+        else:
+            require(inventory["pad_disposition"] == "constrained", "%s dont_touch pad was not constrained" % tool)
+            require(inventory["timing_active"] == "yes" and inventory["coverage_status"] == "constrained", "%s dont_touch pad was not active" % tool)
+            require(len(delta_rows) == 1, "%s dont_touch pad accounting delta is missing" % tool)
+            require(delta_rows[0]["added_bits"] == "0" and delta_rows[0]["final_used_bits"] == "0", "%s dont_touch accounting bits are wrong" % tool)
+            require(used_value == "0", "%s dont_touch pad was not written to Used Width" % tool)
+            require(stage_completion["accounting_digest_before"] != stage_completion["accounting_digest_after"], "%s dont_touch pad did not change accounting" % tool)
+            if tool == "synth":
+                official_sdc = output_path.read_bytes()
+                official_completion = stage_completion_path.read_bytes()
+                delta_path = root / "04_middle" / "port_accounting_delta.csv"
+                delta_meta_path = root / "04_middle" / "port_accounting_delta.meta"
+                official_delta_csv = delta_path.read_bytes()
+                official_delta_meta = delta_meta_path.read_bytes()
+                official_form = form.read_bytes()
+                official_ports = (inputs / "port_u_io.xlsx").read_bytes()
+                orphaned_delta = json.loads(official_delta_meta.decode("utf-8"))
+                orphaned_delta["transactions"][0]["transaction_id"] = "04_missing_csv_history"
+                delta_meta_path.write_text(json.dumps(orphaned_delta, indent=2) + "\n", encoding="utf-8")
+                orphaned_delta_bytes = delta_meta_path.read_bytes()
+                orphaned = sh(command, BASE)
+                require(orphaned.returncode == 1, "delta CSV transaction absent from meta did not fail closed")
+                orphaned_report = report_path.read_text(encoding="utf-8")
+                require("transaction IDs" in orphaned_report and "absent from" in orphaned_report, "orphaned delta CSV transaction diagnostic missing")
+                require(output_path.read_bytes() == official_sdc, "orphaned delta history changed official SDC")
+                require(stage_completion_path.read_bytes() == official_completion, "orphaned delta history changed official completion")
+                require(delta_meta_path.read_bytes() == orphaned_delta_bytes, "orphaned delta history was silently rewritten")
+                require(form.read_bytes() == official_form, "orphaned delta history changed the review workbook")
+                require((inputs / "port_u_io.xlsx").read_bytes() == official_ports, "orphaned delta history changed port accounting")
+                delta_meta_path.write_bytes(official_delta_meta)
+
+                with delta_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                    reader = csv.DictReader(file_obj)
+                    delta_fieldnames = list(reader.fieldnames or [])
+                    official_delta_rows = [dict(row) for row in reader]
+                require(delta_fieldnames and len(official_delta_rows) == 1, "synth delta fixture is not singular")
+                tampered_delta_rows = [dict(row) for row in official_delta_rows]
+                tampered_delta_rows[0]["reason"] = "tampered accounting history"
+                for label, rows in (
+                    ("deleted_rows", []),
+                    ("tampered_rows", tampered_delta_rows),
+                ):
+                    with delta_path.open("w", encoding="utf-8", newline="") as file_obj:
+                        writer = csv.DictWriter(file_obj, fieldnames=delta_fieldnames, lineterminator="\n")
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    malformed_delta_csv = delta_path.read_bytes()
+                    malformed = sh(command, BASE)
+                    require(malformed.returncode == 1, "%s delta CSV history did not fail closed" % label)
+                    malformed_report = report_path.read_text(encoding="utf-8")
+                    require("delta_csv_digest" in malformed_report, "%s top-level delta digest diagnostic missing" % label)
+                    require("delta_rows_digest mismatch" in malformed_report, "%s transaction delta digest diagnostic missing" % label)
+                    require(output_path.read_bytes() == official_sdc, "%s changed official SDC" % label)
+                    require(stage_completion_path.read_bytes() == official_completion, "%s changed official completion" % label)
+                    require(delta_meta_path.read_bytes() == official_delta_meta, "%s changed accounting metadata" % label)
+                    require(delta_path.read_bytes() == malformed_delta_csv, "%s delta CSV was silently rewritten" % label)
+                    require(form.read_bytes() == official_form, "%s changed the review workbook" % label)
+                    require((inputs / "port_u_io.xlsx").read_bytes() == official_ports, "%s changed port accounting" % label)
+                    delta_path.write_bytes(official_delta_csv)
+
+
 def run_flat_empty_pad_multiview_case():
     root = WORK / "flat_empty_pad_multiview"
     clean_dir(root)
@@ -1599,6 +1852,7 @@ def main():
     run_target_delay_conflict_case()
     run_target_connection_contract_case()
     run_flat_target_case()
+    run_flat_tool_surface_case()
     run_flat_empty_pad_multiview_case()
     run_flat_fanout_case()
     run_flat_vector_expansion_case()
@@ -1606,7 +1860,7 @@ def main():
     run_flat_route_multiview_case()
     print("04 complex regression: PASS")
     print("  legacy cases: bit_pending, empty_command, noncanonical_port")
-    print("  target cases: flat direct, empty/multi-view, exact fanout/vector, inout direction, canonical route owner, multi-view inventory, partial+strict, scenario, approved NA, conflict, contract gates")
+    print("  target cases: flat direct, sta/synth/both tool surface, empty/multi-view, exact fanout/vector, inout direction, canonical route owner, multi-view inventory, partial+strict, scenario, approved NA, conflict, contract gates")
     return 0
 
 

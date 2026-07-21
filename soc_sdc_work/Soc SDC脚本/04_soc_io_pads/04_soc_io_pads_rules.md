@@ -279,6 +279,8 @@ pending
 ## 8. 生成规则
 
 - 只生成 `apply=yes + review_status=approved` 的 row。
+- target runtime 支持 `--tool sta|synth|both`，默认为 `sta`。`sta` 不生成 synthesis-only `set_dont_touch_network`；`synth` 和 `both` 必须生成该命令。
+- 选定的 tool surface 必须一致用于 row validation、SDC generation、resolved pad inventory、port accounting、report 和 completion provenance，不得在 flat 路径内回落为固定 STA。
 - `clock_name` 必须存在于 `01_middle/clock_inventory.csv`，virtual clock 也必须由 01 创建。
 - max/min 配对按 constraint_type 明确，不能把 blank 当 0。
 - numeric value 必须 finite。
@@ -300,6 +302,7 @@ inout  -> Inout Name
 允许 terminal：
 
 - 已生成所需 IO timing/electrical constraint。
+- 对 `synth/both` surface，已批准且已生成的 `set_dont_touch_network` 是 active 04 owner，可以将该 exact pad bit 解析为 `constrained`；同一 row 在 `sta` surface 不 active，不得因此销账。
 - 已批准 `untimed/not_applicable`，且 owner/basis/reviewer/review_date 完整。
 - missing SDC 情况下存在独立的 board/pad architecture basis。
 
@@ -331,6 +334,10 @@ inout  -> Inout Name
 delta 的 owner ID 必须引用 `pad_id`。completion 只允许在 required view、无 error/sync change、SDC/pad inventory/delta 全部发布后标 complete。
 
 所有 required 04 view complete 后，04 发布 run-wide `04_middle/stage_completion.meta`，证明 pad inventory resolved view 已稳定。每次累计 inventory 改变时，所有已完成 required view 的 completion 都必须刷新 `pad_inventory_digest`，run-wide `required_view_completions` 必须引用这些最终 completion 文件。复用 prior view completion 时必须重新核对其 output SDC 以及已声明的 `00_stage_completion`、`01_clock_inventory` digest；上游 artifact 变化时 prior view 必须被排除并重跑。即使本 run 没有 active IO timing view，04 仍须执行 pad classification/audit 并发布 header-only 或 reviewed pad inventory，供 10/20/30 排除 pad edge。
+
+一个 run root 的全部 required 04 view 必须使用同一 tool surface。`pad_inventory.meta`、`port_accounting_delta.meta`、per-view completion 和 run-wide completion 都必须记录 `tool`并在 resume 时核对；不同 surface 不得混用 prior inventory/completion/accounting。由于 accounting 是 append-only union，需要切换 surface 时必须使用 fresh run root。旧 flat 产物没有 `tool` 字段时只能按其历史实际行为解释为 `sta`。
+
+已有 `port_accounting_delta.meta` 必须保留显式、非空的 append-only `transactions` 列表；每个 transaction 必须是 object，并含非空且唯一的 `transaction_id`。meta 的 `delta_csv_digest` 必须认证当前 CSV；CSV 中每个非空 transaction ID 都必须能在 meta transaction history 中找到，且按 ID 分组后的 rows 必须匹配该 transaction 的 `delta_rows_digest`。真实的 empty-delta transaction 以空 rows digest 验证；任一历史 row 被删除、篡改或失去 provenance 时，脚本必须 fail closed 且不得改写正式 SDC、completion、accounting 或 review workbook。
 
 ## 10. 检查规则
 
@@ -372,7 +379,8 @@ delta 的 owner ID 必须引用 `pad_id`。completion 只允许在 required view
 python3 04_extract_soc_io_pads.py \
   --run-root <run_root> \
   --stage <stage> \
-  --corner <corner>
+  --corner <corner> \
+  --tool <sta|synth|both>
 ```
 
-`stage/corner` 可按项目需要默认 `all/all`。不接受 scenario 选择。
+`stage/corner` 可按项目需要默认 `all/all`，`tool` 默认 `sta`。不接受 scenario 选择。

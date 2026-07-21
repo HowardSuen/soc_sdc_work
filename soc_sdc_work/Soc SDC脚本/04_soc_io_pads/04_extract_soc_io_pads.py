@@ -3974,6 +3974,7 @@ def _merge_prior_pad_rows(
     allowed_view_ids: Set[str],
     run_context: Dict[str, str],
     structure: str,
+    expected_tool: str,
     report: Report,
 ) -> Tuple[List[Dict[str, object]], Set[str]]:
     merged: Dict[Tuple[str, str], Dict[str, object]] = {}
@@ -3993,6 +3994,8 @@ def _merge_prior_pad_rows(
             stale_fields = []
             if str(prior_meta.get("schema_version") or "").strip() != FLAT_PAD_SCHEMA_VERSION:
                 stale_fields.append("schema_version")
+            if _flat_metadata_tool(prior_meta) != expected_tool:
+                stale_fields.append("tool")
             for name, expected in (
                 ("stage_name", "04_soc_io_pads"),
                 ("run_id", clean_cell(run_context.get("run_id"))),
@@ -4408,6 +4411,163 @@ def _validate_flat_upstream_completions(
     return digests
 
 
+def _flat_metadata_tool(payload: Dict[str, object]) -> str:
+    # Flat artifacts published before tool provenance existed were always STA,
+    # because the old target path hard-coded the STA surface.
+    if "tool" not in payload:
+        return "sta"
+    return normalize_key(payload.get("tool"))
+
+
+def _validate_flat_tool_lock(
+    middle: Path,
+    expected_tool: str,
+    runtime: Any,
+    report: Report,
+) -> None:
+    paths = [
+        middle / "stage_completion.meta",
+        middle / "pad_inventory.meta",
+        middle / "port_accounting_delta.meta",
+    ]
+    completion_dir = middle / "completion"
+    if completion_dir.is_dir():
+        paths.extend(sorted(completion_dir.glob("*.meta")))
+
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            report.error(f"invalid prior 04 metadata {path}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            report.error(f"invalid prior 04 metadata {path}: expected JSON object")
+            continue
+        actual_tool = _flat_metadata_tool(payload)
+        if actual_tool not in TOOLS:
+            report.error(f"invalid prior 04 tool surface in {path}: {actual_tool or '<blank>'}")
+        elif actual_tool != expected_tool:
+            report.error(
+                f"04 tool surface mismatch in {path}: existing={actual_tool} "
+                f"requested={expected_tool}; use a fresh run root because 04 accounting is append-only"
+            )
+        if path.name == "port_accounting_delta.meta":
+            if "transactions" not in payload:
+                report.error(
+                    f"invalid prior 04 accounting transactions in {path}: "
+                    "missing transactions list"
+                )
+                continue
+            transactions = payload.get("transactions")
+            if not isinstance(transactions, list):
+                report.error(f"invalid prior 04 accounting transactions in {path}: expected list")
+                continue
+            if not transactions:
+                report.error(
+                    f"invalid prior 04 accounting transactions in {path}: "
+                    "expected non-empty list"
+                )
+                continue
+            transaction_ids: Set[str] = set()
+            valid_transactions: List[Tuple[int, str, Dict[str, object]]] = []
+            for index, transaction in enumerate(transactions, start=1):
+                if not isinstance(transaction, dict):
+                    report.error(
+                        f"invalid prior 04 accounting transaction {index} in {path}: expected JSON object"
+                    )
+                    continue
+                transaction_id = clean_cell(transaction.get("transaction_id"))
+                if not transaction_id:
+                    report.error(
+                        f"invalid prior 04 accounting transaction {index} in {path}: "
+                        "empty transaction_id"
+                    )
+                elif transaction_id in transaction_ids:
+                    report.error(
+                        f"invalid prior 04 accounting transaction {index} in {path}: "
+                        f"duplicate transaction_id {transaction_id}"
+                    )
+                else:
+                    transaction_ids.add(transaction_id)
+                    valid_transactions.append((index, transaction_id, transaction))
+                transaction_tool = _flat_metadata_tool(transaction)
+                if transaction_tool not in TOOLS:
+                    report.error(
+                        f"invalid prior 04 tool surface in {path} transaction {index}: "
+                        f"{transaction_tool or '<blank>'}"
+                    )
+                elif transaction_tool != expected_tool:
+                    report.error(
+                        f"04 tool surface mismatch in {path} transaction {index}: "
+                        f"existing={transaction_tool} requested={expected_tool}; use a fresh run root"
+                    )
+            delta_path = path.with_suffix(".csv")
+            if not delta_path.is_file():
+                report.error(
+                    f"invalid prior 04 accounting history: {path} exists but {delta_path} is missing"
+                )
+                continue
+            expected_delta_digest = clean_cell(payload.get("delta_csv_digest"))
+            actual_delta_digest = runtime.sha256_file(delta_path)
+            if not expected_delta_digest:
+                report.error(
+                    f"invalid prior 04 accounting history in {path}: missing delta_csv_digest"
+                )
+            elif expected_delta_digest != actual_delta_digest:
+                report.error(
+                    f"invalid prior 04 accounting history in {path}: "
+                    f"delta_csv_digest does not match {delta_path}"
+                )
+            try:
+                with delta_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                    reader = csv.DictReader(file_obj)
+                    if "transaction_id" not in (reader.fieldnames or []):
+                        report.error(
+                            f"invalid prior 04 accounting history in {delta_path}: "
+                            "missing transaction_id column"
+                        )
+                        continue
+                    csv_transaction_ids: Set[str] = set()
+                    delta_rows_by_transaction: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+                    for row_index, row in enumerate(reader, start=2):
+                        transaction_id = clean_cell(row.get("transaction_id"))
+                        if not transaction_id:
+                            report.error(
+                                f"invalid prior 04 accounting history in {delta_path} "
+                                f"row {row_index}: empty transaction_id"
+                            )
+                            continue
+                        csv_transaction_ids.add(transaction_id)
+                        delta_rows_by_transaction[transaction_id].append(dict(row))
+            except (OSError, csv.Error) as exc:
+                report.error(f"invalid prior 04 accounting history in {delta_path}: {exc}")
+                continue
+            missing_transaction_ids = sorted(csv_transaction_ids - transaction_ids)
+            if missing_transaction_ids:
+                report.error(
+                    f"invalid prior 04 accounting history in {delta_path}: transaction IDs "
+                    f"absent from {path}: {', '.join(missing_transaction_ids)}"
+                )
+            for index, transaction_id, transaction in valid_transactions:
+                expected_rows_digest = clean_cell(transaction.get("delta_rows_digest"))
+                if not expected_rows_digest:
+                    report.error(
+                        f"invalid prior 04 accounting transaction {index} in {path}: "
+                        "missing delta_rows_digest"
+                    )
+                    continue
+                actual_rows_digest = runtime.delta_rows_digest(
+                    delta_rows_by_transaction.get(transaction_id, [])
+                )
+                if expected_rows_digest != actual_rows_digest:
+                    report.error(
+                        f"invalid prior 04 accounting transaction {index} in {path}: "
+                        f"delta_rows_digest mismatch for transaction_id {transaction_id}"
+                    )
+
+
 def run_target_flat(args: argparse.Namespace) -> int:
     run_root = Path(args.run_root).expanduser().resolve()
     input_root = run_root / "inputs"
@@ -4417,9 +4577,11 @@ def run_target_flat(args: argparse.Namespace) -> int:
     clock_path = run_root / "01_middle" / "clock_inventory.csv"
     manifest_path = run_root / "00_middle" / "harden_sdc_manifest.csv"
     stage, corner = args.stage, args.corner
+    tool = normalize_key(args.tool)
     report = Report()
     runtime = _load_accounting_runtime()
     runtime.recover_transactions(run_root, report)
+    _validate_flat_tool_lock(middle, tool, runtime, report)
     run_context = runtime.read_run_context(input_root / "run_context.csv", report)
     required_views = runtime.read_required_views(input_root / "required_views.csv", report)
     required_04_views = [
@@ -4515,27 +4677,27 @@ def run_target_flat(args: argparse.Namespace) -> int:
             collect_current_sdc_digests(instances),
             "",
             "",
-            "sta",
+            tool,
             report,
             allow_false_path=False,
         )
     coverage = build_coverage_lines(rows, pads, "common", stage, corner)
     if report.sync_changed or report.error_count:
-        write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+        write_report(report_path, report, "common", stage, corner, tool, form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
         return 1
 
     generated = generate_sdc(
-        rows, "common", stage, corner, "sta", completeness, assembled=True
+        rows, "common", stage, corner, tool, completeness, assembled=True
     )
     current_pad_rows = _resolved_flat_pad_rows(
-        form_path, rows, stage, corner, "sta", accounting_before, report
+        form_path, rows, stage, corner, tool, accounting_before, report
     )
     updates = _flat_owner_updates(
         runtime, records, current_pad_rows, report
     )
     accounting_after = runtime.accounting_digest(records)
     if report.error_count:
-        write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+        write_report(report_path, report, "common", stage, corner, tool, form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
         return 1
 
     output_payload = ("\n".join(generated).rstrip() + "\n").encode("utf-8")
@@ -4548,11 +4710,13 @@ def run_target_flat(args: argparse.Namespace) -> int:
         {clean_cell(view.get("view_id")) for view in required_04_views},
         run_context,
         structure,
+        tool,
         report,
     )
     pad_payload = runtime.csv_text(PAD_HEADERS, pad_rows).encode("utf-8")
     pad_meta = {
         "schema_version": "1.0", "stage_name": "04_soc_io_pads",
+        "tool": tool,
         "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
         "design_revision": run_context.get("design_revision", ""), "completion_status": "complete",
         "error_count": 0, "sync_changed": "no",
@@ -4594,12 +4758,14 @@ def run_target_flat(args: argparse.Namespace) -> int:
             report.warn(f"ignoring malformed prior delta meta: {delta_meta_path}")
     transaction = {
         "transaction_id": transaction_id, "committed_at": runtime.utc_timestamp(),
+        "tool": tool,
         "structure_digest": structure, "accounting_digest_before": accounting_before,
         "accounting_digest_after": accounting_after, "delta_rows_digest": runtime.delta_rows_digest(new_delta_rows),
     }
     delta_meta = {
         "schema_version": "1.0", "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""),
         "design_revision": run_context.get("design_revision", ""), "stage_name": "04_soc_io_pads",
+        "tool": tool,
         "completion_status": "complete", "structure_digest": structure,
         "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after,
         "delta_csv_digest": hashlib.sha256(delta_payload).hexdigest(),
@@ -4607,6 +4773,7 @@ def run_target_flat(args: argparse.Namespace) -> int:
     }
     completion = {
         "schema_version": "1.0", "author": author_name(), "stage_name": "04_soc_io_pads", "stage": stage, "corner": corner,
+        "tool": tool,
         "run_id": run_context.get("run_id", ""), "mode_label": run_context.get("mode_label", ""), "design_revision": run_context.get("design_revision", ""),
         "completion_status": "complete", "error_count": 0, "sync_changed": "no", "structure_digest": structure,
         "accounting_digest_before": accounting_before, "accounting_digest_after": accounting_after, "port_accounting": "enabled",
@@ -4658,6 +4825,7 @@ def run_target_flat(args: argparse.Namespace) -> int:
                 "completion_status": normalize_key(payload.get("completion_status")) == "complete",
                 "sync_changed": normalize_key(payload.get("sync_changed")) == "no",
                 "error_count": clean_cell(payload.get("error_count")) in {"", "0"},
+                "tool": _flat_metadata_tool(payload) == tool,
                 "output_sdc_digest": (
                     expected_output.is_file()
                     and clean_cell(payload.get("output_sdc_digest"))
@@ -4680,6 +4848,7 @@ def run_target_flat(args: argparse.Namespace) -> int:
                 )
                 continue
             payload["pad_inventory_digest"] = pad_digest
+            payload["tool"] = tool
         else:
             continue
         payload_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
@@ -4689,7 +4858,7 @@ def run_target_flat(args: argparse.Namespace) -> int:
     required_04_ids = {clean_cell(view.get("view_id")) for view in required_04_views}
     if required_04_ids and set(required_view_digests) != required_04_ids:
         completion["completion_status"] = "review_required"
-    write_report(report_path, report, "common", stage, corner, "sta", form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
+    write_report(report_path, report, "common", stage, corner, tool, form_path, output_path, coverage, completeness, [clock_path], manifest_path, None, False)
     if report.error_count:
         return 1
     artifact_payloads = [
