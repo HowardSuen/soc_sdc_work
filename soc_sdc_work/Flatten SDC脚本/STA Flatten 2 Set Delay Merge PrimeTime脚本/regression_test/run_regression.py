@@ -62,13 +62,11 @@ proc get_pins {args} {
     if {[lsearch -exact $args "-of_objects"] >= 0} {
         return {}
     }
-    set name [lindex $args end]
-    return [list $name]
+    return [lindex $args end]
 }
 
 proc get_ports {args} {
-    set name [lindex $args end]
-    return [list $name]
+    return [lindex $args end]
 }
 
 proc get_attribute {obj attr} {
@@ -188,6 +186,18 @@ def assert_not_contains(path, needle):
 def assert_text_contains(text, needle):
     if needle not in text:
         raise AssertionError("Expected %r in text\n--- text ---\n%s" % (needle, text))
+
+
+def get_pins_list(prefix, indices):
+    return "[list %s]" % " ".join(
+        "[get_pins {%s[%d]}]" % (prefix, index) for index in indices
+    )
+
+
+def get_ports_list(prefix, indices):
+    return "[list %s]" % " ".join(
+        "[get_ports {%s[%d]}]" % (prefix, index) for index in indices
+    )
 
 
 def assert_generated_delays_have_explicit_endpoints(path):
@@ -371,6 +381,248 @@ proc all_fanout {args} {
     assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
 
 
+def test_open_to_complete_buses_compact_and_batch_once():
+    indices = list(range(8))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -through %s\n"
+        % (get_pins_list("src", indices), get_pins_list("mid", indices))
+    )
+    prelude = r'''
+foreach idx {0 1 2 3 4 5 6 7} {
+    set src_name [format {src[%d]} $idx]
+    set mid_name [format {mid[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($src_name) out
+    set ::PT_MOCK_DIRECTIONS($mid_name) out
+}
+
+set ::OPEN_TO_FANOUT_LOG [file join [pwd] open_to_fanout_calls.log]
+
+proc get_cells {args} {
+    return [lindex $args end]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        set owner [lindex $args end]
+        if {$owner eq "u_h0"} {
+            return [list u_h0/cfg_i]
+        }
+        return {}
+    }
+    set patterns [lindex $args end]
+    set out {}
+    foreach pattern $patterns {
+        if {$pattern eq {src[*]}} {
+            foreach idx {0 1 2 3 4 5 6 7} {
+                lappend out [format {src[%d]} $idx]
+            }
+        } elseif {$pattern eq {mid[*]}} {
+            foreach idx {0 1 2 3 4 5 6 7} {
+                lappend out [format {mid[%d]} $idx]
+            }
+        } else {
+            lappend out $pattern
+        }
+    }
+    return $out
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/u_reg/D"} {
+        return [list u_h0/cfg_i]
+    }
+    return {}
+}
+
+proc all_fanout {args} {
+    set fout [open $::OPEN_TO_FANOUT_LOG a]
+    puts $fout [join $args " "]
+    close $fout
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_complete_bus_batch",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(
+        result["out_sdc"],
+        "set_max_delay 7 -from [get_pins {src[*]}] -through [get_pins {mid[*]}] "
+        "-through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]",
+    )
+    assert_contains(result["report"], "compact_applied=2")
+    assert_contains(result["report"], "compact_members_saved=14")
+    assert_contains(result["report"], "batch_groups=1")
+    assert_contains(result["report"], "batch_endpoint_queries=1")
+    assert_contains(result["report"], "batch_fallbacks=0")
+    fanout_log = os.path.join(result["case_dir"], "open_to_fanout_calls.log")
+    calls = [line for line in read_file(fanout_log).splitlines() if line.strip()]
+    if len(calls) != 1:
+        raise AssertionError("Expected one batched all_fanout call, got %d: %r" % (len(calls), calls))
+
+
+def test_open_to_bus_with_missing_bit_is_not_compacted():
+    indices = [0, 2, 3, 4]
+    top_sdc = "set_max_delay 2.0 -from %s\n" % get_pins_list("src", indices)
+    prelude = r'''
+foreach idx {0 2 3 4} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+
+proc get_cells {args} {
+    return [lindex $args end]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    return [lindex $args end]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return [list u_h0/cfg_i]
+}
+
+proc all_fanout {args} {
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_bus_missing_bit",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != len(indices):
+        raise AssertionError("Expected one constraint per uncompressed bit:\n%s" % generated)
+    assert_not_contains(result["out_sdc"], "src[*]")
+    assert_contains(result["report"], "compact_rejected=1")
+    assert_contains(result["report"], "batch_endpoint_queries=1")
+
+
+def test_open_to_bus_wildcard_overmatch_is_not_compacted():
+    indices = [0, 1, 2, 3]
+    top_sdc = "set_max_delay 2.0 -from %s\n" % get_pins_list("src", indices)
+    prelude = r'''
+foreach idx {0 1 2 3 4} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+
+proc get_cells {args} {
+    return [lindex $args end]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] == 1 && [lindex $patterns 0] eq {src[*]}} {
+        set out {}
+        foreach idx {0 1 2 3 4} {
+            lappend out [format {src[%d]} $idx]
+        }
+        return $out
+    }
+    return $patterns
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return [list u_h0/cfg_i]
+}
+
+proc all_fanout {args} {
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_bus_wildcard_overmatch",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != len(indices):
+        raise AssertionError("Expected exact members after wildcard rejection:\n%s" % generated)
+    assert_not_contains(result["out_sdc"], "src[*]")
+    assert_contains(result["report"], "compact_rejected=1")
+    assert_text_contains(result["stdout"], "reason=pt_set_mismatch")
+
+
+def test_open_to_batch_getter_failure_falls_back_without_loss():
+    top_sdc = (
+        "set_max_delay 2.0 -from "
+        "[list [get_pins u_src_reg/Q] [get_pins u_aux_reg/Q]]\n"
+    )
+    prelude = r'''
+set ::PT_MOCK_DIRECTIONS(u_aux_reg/Q) out
+
+proc get_cells {args} {
+    return [lindex $args end]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1} {
+        error "mock PT rejects multi-pattern get_pins"
+    }
+    return $patterns
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return [list u_h0/cfg_i]
+}
+
+proc all_fanout {args} {
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_batch_getter_fallback",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != 2:
+        raise AssertionError("Fallback lost a source object:\n%s" % generated)
+    assert_contains(result["out_sdc"], "-from [get_pins {u_src_reg/Q}]")
+    assert_contains(result["out_sdc"], "-from [get_pins {u_aux_reg/Q}]")
+    assert_contains(result["report"], "batch_fallbacks=1")
+    assert_contains(result["report"], "batch_endpoint_queries=2")
+    assert_text_contains(result["stdout"], "open-to batch fallback")
+
+
 def test_harden_open_to_infers_endpoint_and_merges():
     prelude = r'''
 proc all_fanout {args} {
@@ -391,6 +643,63 @@ proc all_fanout {args} {
     assert_contains(result["out_sdc"], "set_min_delay 1 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
     assert_contains(result["final"], "STAGE2_CONSUMED CMD000002")
     assert_not_contains(result["review"], "NO_TO_OBJECT")
+
+
+def test_harden_open_to_batches_endpoint_and_full_fanout_queries():
+    indices = [0, 1, 2, 3]
+    top_sdc = (
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to %s\n"
+        % get_pins_list("u_h0/cfg", indices)
+    )
+    harden_sdc = (
+        "set_max_delay 5.0 -from %s\n"
+        % get_ports_list("cfg", indices)
+    )
+    prelude = r'''
+foreach idx {0 1 2 3} {
+    set port_name [format {cfg[%d]} $idx]
+    set pin_name [format {u_h0/cfg[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($port_name) in
+    set ::PT_MOCK_DIRECTIONS($pin_name) in
+}
+set ::OPEN_TO_FANOUT_LOG [file join [pwd] harden_open_to_fanout_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    return [lindex $args end]
+}
+
+proc get_ports {args} {
+    return [lindex $args end]
+}
+
+proc all_fanout {args} {
+    set fout [open $::OPEN_TO_FANOUT_LOG a]
+    puts $fout [join $args " "]
+    close $fout
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "harden_open_to_batch_fanout",
+        top_sdc,
+        harden_sdc,
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != len(indices):
+        raise AssertionError("Expected one merged constraint per harden input:\n%s" % generated)
+    assert_contains(result["report"], "batch_groups=1")
+    assert_contains(result["report"], "batch_endpoint_queries=1")
+    assert_contains(result["report"], "batch_full_fanout_queries=1")
+    assert_contains(result["report"], "batch_fallbacks=0")
+    fanout_log = os.path.join(result["case_dir"], "harden_open_to_fanout_calls.log")
+    calls = [line for line in read_file(fanout_log).splitlines() if line.strip()]
+    if len(calls) != 2:
+        raise AssertionError("Expected one endpoint and one full fanout call, got %d: %r" % (len(calls), calls))
 
 
 def test_open_to_inference_failure_keeps_original_for_review():
@@ -993,7 +1302,12 @@ def main():
         test_complete_complete_merge,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
+        test_open_to_complete_buses_compact_and_batch_once,
+        test_open_to_bus_with_missing_bit_is_not_compacted,
+        test_open_to_bus_wildcard_overmatch_is_not_compacted,
+        test_open_to_batch_getter_failure_falls_back_without_loss,
         test_harden_open_to_infers_endpoint_and_merges,
+        test_harden_open_to_batches_endpoint_and_full_fanout_queries,
         test_open_to_inference_failure_keeps_original_for_review,
         test_open_to_delay_option_mismatch_is_not_consumed,
         test_open_to_multiple_endpoints_same_boundary_are_fully_consumed_once,

@@ -85,6 +85,14 @@ set ::MAX_CHAIN_DEPTH 6
 set ::MAX_ENDPOINTS 1000
 set ::MAX_ENUM_OBJECTS 64
 
+# Performance controls for open-to delay commands.  Bus compression is only
+# applied after PT proves that the wildcard selector resolves to exactly the
+# original member set.  Batch fanout queries fall back to one seed at a time
+# if the linked PT version rejects the collection form.
+set ::STAGE2_COMPACT_BUS true
+set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
+set ::STAGE2_BATCH_OPEN_TO_QUERY true
+
 # Optional output file overrides. Leave empty to use OUT_DIR defaults.
 set ::OUT_E2E_SDC ""
 set ::OUT_REPORT ""
@@ -110,7 +118,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.0"
+    variable VERSION "v0.9.1"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -133,6 +141,9 @@ namespace eval stage2_delay {
     variable e2e_seq
     variable boundary_input_cache
     variable top_port_boundary_cache
+    variable open_to_stats
+    variable open_to_target_cache
+    variable bus_compact_cache
 
     array set options {
         -top_sdc ""
@@ -154,6 +165,9 @@ namespace eval stage2_delay {
         -max_chain_depth 6
         -max_endpoints 1000
         -max_enum_objects 64
+        -compact_bus "true"
+        -compact_bus_min_members 4
+        -batch_open_to_query "true"
         -check_units "true"
         -expect_units ""
         -strict "false"
@@ -220,6 +234,9 @@ proc stage2_delay::reset_state {} {
     variable e2e_seq
     variable boundary_input_cache
     variable top_port_boundary_cache
+    variable open_to_stats
+    variable open_to_target_cache
+    variable bus_compact_cache
 
     set hardens {}
     set top_segments {}
@@ -236,12 +253,32 @@ proc stage2_delay::reset_state {} {
     set consumed_segments {}
     set review_items {}
     set report_items {}
+    array unset open_to_stats
+    array set open_to_stats {
+        compact_candidates 0
+        compact_applied 0
+        compact_members 0
+        compact_members_saved 0
+        compact_rejected 0
+        batch_groups 0
+        batch_seed_records 0
+        batch_endpoint_queries 0
+        batch_full_fanout_queries 0
+        batch_fallbacks 0
+        inferred_endpoints 0
+        target_cache_hits 0
+        compact_cache_hits 0
+    }
     set command_seq 0
     set e2e_seq 0
     array unset boundary_input_cache
     array set boundary_input_cache {}
     array unset top_port_boundary_cache
     array set top_port_boundary_cache {}
+    array unset open_to_target_cache
+    array set open_to_target_cache {}
+    array unset bus_compact_cache
+    array set bus_compact_cache {}
 }
 
 proc stage2_delay::build {args} {
@@ -277,8 +314,8 @@ proc stage2_delay::build {args} {
     write_e2e_sdc $options(-out_e2e_sdc)
     write_removed_sdc $options(-out_removed_sdc)
     write_review_report $options(-out_review_rpt)
-    write_report $options(-out_report)
     write_final_sdc $options(-out_final_sdc)
+    write_report $options(-out_report)
     if {[truthy $options(-write_path_summary)]} {
         write_path_summary $options(-out_summary_dir)
     }
@@ -354,6 +391,9 @@ proc stage2_delay::validate_options {} {
     }
     if {$options(-recursive_chain_mode) ni {off auto}} {
         error "-recursive_chain_mode must be off or auto"
+    }
+    if {![string is integer -strict $options(-compact_bus_min_members)] || $options(-compact_bus_min_members) < 2} {
+        error "-compact_bus_min_members must be an integer >= 2"
     }
 }
 
@@ -795,6 +835,19 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         }
         set through_record_groups $mapped_groups
     }
+    if {$to_expr eq "" && $from_expr ne ""} {
+        set from_records [compact_open_to_records $from_records "$source:$cmd_id:-from" true]
+        set compact_groups {}
+        set through_records {}
+        set through_index 0
+        foreach group $through_record_groups {
+            incr through_index
+            set group [compact_open_to_records $group "$source:$cmd_id:-through#$through_index"]
+            lappend compact_groups $group
+            set through_records [concat $through_records $group]
+        }
+        set through_record_groups $compact_groups
+    }
     set open_to_inferred false
     set open_to_seed_records {}
     if {$to_expr eq ""} {
@@ -803,11 +856,8 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
             set reason "OPEN_FROM_AND_TO_UNSUPPORTED"
         } else {
             set open_to_seed_records $from_records
-            if {[llength $through_exprs] > 0} {
-                set open_to_seed_records [resolve_object_expr [lindex $through_exprs end]]
-                if {$source eq "harden" && $harden_inst ne ""} {
-                    set open_to_seed_records [map_harden_port_records_to_instance_pins $open_to_seed_records $harden_inst]
-                }
+            if {[llength $through_record_groups] > 0} {
+                set open_to_seed_records [lindex $through_record_groups end]
             }
             set to_records [pt_open_to_targets $open_to_seed_records $source $harden_inst]
             if {[llength $to_records] == 0} {
@@ -1080,6 +1130,225 @@ proc stage2_delay::object_record_from_get {cmd name} {
 
 proc stage2_delay::object_record {class name direction owner} {
     return [list object_class $class full_name $name direction $direction owner_harden_inst $owner]
+}
+
+proc stage2_delay::bus_member_info {rec} {
+    array set r $rec
+    set info {}
+    if {$r(object_class) in {pin port} && $r(direction) ne "" && ![info exists r(compact_bus)]} {
+        if {[regexp {^(.*)\[([0-9]+)\]$} $r(full_name) -> base index]} {
+            set info [list \
+                base $base \
+                index $index \
+                object_class $r(object_class) \
+                direction $r(direction) \
+                owner_harden_inst $r(owner_harden_inst) \
+            ]
+        }
+    }
+    array unset r
+    return $info
+}
+
+proc stage2_delay::record_member_records {rec} {
+    array set r $rec
+    if {[info exists r(compact_bus)] && [truthy $r(compact_bus)] && [info exists r(compact_members)]} {
+        set members $r(compact_members)
+        array unset r
+        return $members
+    }
+    array unset r
+    return [list $rec]
+}
+
+proc stage2_delay::compact_open_to_records {records label {preserve_boundary_members false}} {
+    variable options
+    if {![truthy $options(-compact_bus)] || [llength $records] < $options(-compact_bus_min_members)} {
+        return $records
+    }
+
+    array set groups {}
+    set order {}
+    set position 0
+    foreach rec $records {
+        set info [bus_member_info $rec]
+        if {[llength $info] == 0} {
+            set key [list scalar $position]
+        } else {
+            array set b $info
+            set key [list bus $b(object_class) $b(direction) $b(owner_harden_inst) $b(base)]
+            array unset b
+        }
+        if {![info exists groups($key)]} {
+            set groups($key) {}
+            lappend order $key
+        }
+        lappend groups($key) $rec
+        incr position
+    }
+
+    set out {}
+    foreach key $order {
+        set members $groups($key)
+        if {[lindex $key 0] ne "bus" || [llength $members] < $options(-compact_bus_min_members)} {
+            set out [concat $out $members]
+            continue
+        }
+        if {$preserve_boundary_members && [records_include_harden_boundary $members]} {
+            pt_trace "open-to bus compact skipped label={$label} reason=boundary_members_required_for_merge"
+            set out [concat $out $members]
+            continue
+        }
+        set compact [compact_bus_record_if_equivalent $members $label]
+        if {[llength $compact] == 0} {
+            set out [concat $out $members]
+        } else {
+            lappend out $compact
+        }
+    }
+    return $out
+}
+
+proc stage2_delay::records_include_harden_boundary {records} {
+    foreach rec $records {
+        if {[is_immediate_harden_pin_record $rec]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc stage2_delay::compact_bus_record_if_equivalent {members label} {
+    variable bus_compact_cache
+    set indices {}
+    set expected {}
+    array set seen_index {}
+    array set first [lindex $members 0]
+    foreach rec $members {
+        set info [bus_member_info $rec]
+        if {[llength $info] == 0} {
+            array unset first
+            open_to_stat_add compact_rejected
+            return {}
+        }
+        array set b $info
+        if {[info exists seen_index($b(index))]} {
+            pt_trace "open-to bus compact rejected label={$label} base={$b(base)} reason=duplicate_index index=$b(index)"
+            array unset b
+            array unset first
+            open_to_stat_add compact_rejected
+            return {}
+        }
+        set seen_index($b(index)) 1
+        lappend indices $b(index)
+        lappend expected [record_full_name $rec]
+        set bus_base $b(base)
+        array unset b
+    }
+
+    set expected [lsort -unique $expected]
+    set selector $bus_base
+    append selector {[*]}
+    set cache_key [list $first(object_class) $selector $expected]
+    if {[info exists bus_compact_cache($cache_key)]} {
+        open_to_stat_add compact_cache_hits
+        set equivalent $bus_compact_cache($cache_key)
+        array unset first
+        if {!$equivalent} {
+            return {}
+        }
+        return [make_compact_bus_record $members $selector $expected]
+    }
+
+    open_to_stat_add compact_candidates
+    set indices [lsort -integer $indices]
+    set first_index [lindex $indices 0]
+    set last_index [lindex $indices end]
+    if {[llength $indices] != ($last_index - $first_index + 1)} {
+        pt_trace "open-to bus compact rejected label={$label} base={$bus_base} reason=non_contiguous indices={$indices}"
+        set bus_compact_cache($cache_key) false
+        array unset first
+        open_to_stat_add compact_rejected
+        return {}
+    }
+
+    array set query [pt_selector_object_names $first(object_class) $selector $label]
+    if {!$query(ok)} {
+        pt_trace "open-to bus compact rejected label={$label} selector={$selector} reason=$query(reason)"
+        set bus_compact_cache($cache_key) false
+        array unset query
+        array unset first
+        open_to_stat_add compact_rejected
+        return {}
+    }
+    set actual [lsort -unique $query(names)]
+    array unset query
+    if {$actual ne $expected} {
+        pt_trace "open-to bus compact rejected label={$label} selector={$selector} reason=pt_set_mismatch expected_count=[llength $expected] actual_count=[llength $actual]"
+        set bus_compact_cache($cache_key) false
+        array unset first
+        open_to_stat_add compact_rejected
+        return {}
+    }
+
+    set bus_compact_cache($cache_key) true
+    array unset first
+
+    open_to_stat_add compact_applied
+    open_to_stat_add compact_members [llength $members]
+    open_to_stat_add compact_members_saved [expr {[llength $members] - 1}]
+    add_report_item "OPEN_TO_BUS_COMPACT label={$label} selector={$selector} member_count=[llength $members]"
+    pt_trace "open-to bus compact applied label={$label} selector={$selector} member_count=[llength $members]"
+    return [make_compact_bus_record $members $selector $expected]
+}
+
+proc stage2_delay::make_compact_bus_record {members selector expected} {
+    array set first [lindex $members 0]
+    set compact [object_record $first(object_class) $selector $first(direction) $first(owner_harden_inst)]
+    array unset first
+    array set c $compact
+    set c(compact_bus) true
+    set c(compact_members) $members
+    set c(compact_member_names) $expected
+    set c(compact_member_count) [llength $members]
+    set compact [array get c]
+    array unset c
+    return $compact
+}
+
+proc stage2_delay::pt_selector_object_names {object_class selector label} {
+    set getter [pt_getter_for_class $object_class]
+    if {$getter eq "" || [info commands $getter] eq "" || [info commands foreach_in_collection] eq ""} {
+        return [list ok false names {} reason missing_collection_command]
+    }
+
+    set names {}
+    pt_trace "$getter -quiet {$selector} for open-to bus equivalence label={$label}"
+    if {[catch {
+        set coll [$getter -quiet $selector]
+        foreach_in_collection obj $coll {
+            lappend names [collection_object_name $obj]
+        }
+    } err]} {
+        return [list ok false names {} reason "selector_query_failed:$err"]
+    }
+    return [list ok true names $names reason ""]
+}
+
+proc stage2_delay::pt_getter_for_class {object_class} {
+    if {$object_class eq "pin"} {
+        return get_pins
+    }
+    if {$object_class eq "port"} {
+        return get_ports
+    }
+    if {$object_class eq "cell"} {
+        return get_cells
+    }
+    if {$object_class eq "net"} {
+        return get_nets
+    }
+    return ""
 }
 
 proc stage2_delay::pt_get_attr_by_name {class name attr} {
@@ -2774,60 +3043,202 @@ proc stage2_delay::pt_top_fanout_targets_from_harden_output_boundary {boundary} 
 }
 
 proc stage2_delay::pt_open_to_targets {seed_records source harden_inst} {
+    variable options
+    variable open_to_target_cache
     if {[info commands all_fanout] eq "" || [info commands foreach_in_collection] eq "" || [info commands sizeof_collection] eq ""} {
         pt_trace "open-to endpoint inference skip source={$source} missing_command"
         return {}
     }
 
+    set cache_key [list $source $harden_inst [records_signature $seed_records]]
+    if {[info exists open_to_target_cache($cache_key)]} {
+        open_to_stat_add target_cache_hits
+        set cached $open_to_target_cache($cache_key)
+        pt_trace "open-to endpoint cache hit source={$source} harden={$harden_inst} logical_seeds=[logical_record_count $seed_records] target_count=[llength $cached]"
+        return $cached
+    }
+
     set value {}
-    foreach seed $seed_records {
-        set seed_name [record_full_name $seed]
-        set start [pt_collection_for_record $seed]
-        if {[sizeof_collection $start] == 0} {
-            pt_trace "open-to endpoint inference seed not found seed={$seed_name}"
+    set use_batch [truthy $options(-batch_open_to_query)]
+    foreach seed_group [pt_open_to_seed_groups $seed_records $use_batch] {
+        set seed_label [open_to_seed_group_label $seed_group]
+        if {$use_batch} {
+            open_to_stat_add batch_groups
+            open_to_stat_add batch_seed_records [logical_record_count $seed_group]
+            array set batch [pt_collection_for_records $seed_group]
+        } else {
+            set batch [list ok false collection {} reason batch_disabled]
+            array set batch $batch
+        }
+
+        if {$use_batch && $batch(ok)} {
+            set start $batch(collection)
+            array unset batch
+            if {[sizeof_collection $start] == 0} {
+                pt_trace "open-to endpoint inference batch not found seeds={$seed_label}"
+                continue
+            }
+            set value [concat $value [pt_open_to_targets_from_collection $start $seed_label $source $harden_inst]]
             continue
         }
 
-        foreach endpoint [pt_endpoint_fanout_records $start $seed_name "open-to"] {
-            if {$source eq "top" || [record_owner_name $endpoint] eq $harden_inst} {
-                lappend value $endpoint
-            }
+        set fallback_reason $batch(reason)
+        array unset batch
+        if {$use_batch} {
+            open_to_stat_add batch_fallbacks
+            pt_trace "open-to batch fallback seeds={$seed_label} reason={$fallback_reason}"
         }
-
-        if {$source eq "harden" && $harden_inst ne ""} {
-            if {[catch {
-                pt_trace "all_fanout -flat -from {$seed_name} for harden open-to outputs"
-                set fanout [all_fanout -flat -from $start]
-                pt_trace "all_fanout harden open-to result seed={$seed_name} count=[sizeof_collection $fanout]"
-                foreach_in_collection obj $fanout {
-                    set rec [pt_object_record_from_collection $obj]
-                    if {[record_owner_name $rec] eq $harden_inst && [is_harden_boundary_output_record $rec]} {
-                        lappend value $rec
-                    }
-                }
-            } err]} {
-                pt_trace "harden open-to output inference failed seed={$seed_name} error={$err}"
+        foreach seed $seed_group {
+            set seed_name [record_full_name $seed]
+            set start [pt_collection_for_record $seed]
+            if {[sizeof_collection $start] == 0} {
+                pt_trace "open-to endpoint inference seed not found seed={$seed_name}"
+                continue
             }
+            set value [concat $value [pt_open_to_targets_from_collection $start $seed_name $source $harden_inst]]
         }
     }
 
     set value [unique_records_by_name $value]
-    pt_trace "open-to endpoint inference summary source={$source} harden={$harden_inst} seed_count=[llength $seed_records] target_count=[llength $value]"
+    set open_to_target_cache($cache_key) $value
+    open_to_stat_add inferred_endpoints [llength $value]
+    pt_trace "open-to endpoint inference summary source={$source} harden={$harden_inst} seed_records=[llength $seed_records] logical_seeds=[logical_record_count $seed_records] target_count=[llength $value]"
     return $value
+}
+
+proc stage2_delay::pt_open_to_seed_groups {seed_records use_batch} {
+    if {!$use_batch} {
+        set groups {}
+        foreach seed $seed_records {
+            lappend groups [list $seed]
+        }
+        return $groups
+    }
+
+    array set by_class {}
+    set class_order {}
+    foreach seed $seed_records {
+        array set r $seed
+        set object_class $r(object_class)
+        array unset r
+        if {![info exists by_class($object_class)]} {
+            set by_class($object_class) {}
+            lappend class_order $object_class
+        }
+        lappend by_class($object_class) $seed
+    }
+    set groups {}
+    foreach object_class $class_order {
+        lappend groups $by_class($object_class)
+    }
+    return $groups
+}
+
+proc stage2_delay::open_to_seed_group_label {records} {
+    if {[llength $records] == 0} {
+        return "empty"
+    }
+    array set first [lindex $records 0]
+    set first_name $first(full_name)
+    set object_class $first(object_class)
+    array unset first
+    set last_name [record_full_name [lindex $records end]]
+    return "class=$object_class records=[llength $records] members=[logical_record_count $records] first={$first_name} last={$last_name}"
+}
+
+proc stage2_delay::logical_record_count {records} {
+    set count 0
+    foreach rec $records {
+        incr count [llength [record_member_records $rec]]
+    }
+    return $count
+}
+
+proc stage2_delay::pt_open_to_targets_from_collection {start seed_label source harden_inst} {
+    set value {}
+    open_to_stat_add batch_endpoint_queries
+    foreach endpoint [pt_endpoint_fanout_records $start $seed_label "open-to"] {
+        if {$source eq "top" || [record_owner_name $endpoint] eq $harden_inst} {
+            lappend value $endpoint
+        }
+    }
+
+    if {$source eq "harden" && $harden_inst ne ""} {
+        open_to_stat_add batch_full_fanout_queries
+        if {[catch {
+            pt_trace "all_fanout -flat -from <open-to seeds:{$seed_label}> for harden outputs"
+            set fanout [all_fanout -flat -from $start]
+            pt_trace "all_fanout harden open-to result seeds={$seed_label} count=[sizeof_collection $fanout]"
+            foreach_in_collection obj $fanout {
+                set rec [pt_object_record_from_collection $obj]
+                if {[record_owner_name $rec] eq $harden_inst && [is_harden_boundary_output_record $rec]} {
+                    lappend value $rec
+                }
+            }
+        } err]} {
+            pt_trace "harden open-to output inference failed seeds={$seed_label} error={$err}"
+        }
+    }
+    return [unique_records_by_name $value]
+}
+
+proc stage2_delay::pt_collection_names {coll} {
+    set names {}
+    foreach_in_collection obj $coll {
+        lappend names [collection_object_name $obj]
+    }
+    return [lsort -unique $names]
+}
+
+proc stage2_delay::expected_record_names {records} {
+    set names {}
+    foreach rec $records {
+        foreach member [record_member_records $rec] {
+            lappend names [record_full_name $member]
+        }
+    }
+    return [lsort -unique $names]
+}
+
+proc stage2_delay::pt_collection_for_records {records} {
+    if {[llength $records] == 0} {
+        return [list ok true collection {} reason ""]
+    }
+    array set first [lindex $records 0]
+    set object_class $first(object_class)
+    array unset first
+    set getter [pt_getter_for_class $object_class]
+    if {$getter eq "" || [info commands $getter] eq ""} {
+        return [list ok false collection {} reason "missing_getter:$getter"]
+    }
+
+    set patterns {}
+    foreach rec $records {
+        array set r $rec
+        if {$r(object_class) ne $object_class} {
+            array unset r
+            return [list ok false collection {} reason mixed_object_class]
+        }
+        lappend patterns $r(full_name)
+        array unset r
+    }
+
+    set value {}
+    pt_trace "$getter -quiet <open-to batch patterns=[llength $patterns] logical_members=[logical_record_count $records]>"
+    if {[catch {set value [$getter -quiet $patterns]} err]} {
+        return [list ok false collection {} reason "batch_getter_failed:$err"]
+    }
+    set expected [expected_record_names $records]
+    set actual [pt_collection_names $value]
+    if {$actual ne $expected} {
+        return [list ok false collection {} reason "batch_set_mismatch:expected=[llength $expected],actual=[llength $actual]"]
+    }
+    return [list ok true collection $value reason ""]
 }
 
 proc stage2_delay::pt_collection_for_record {rec} {
     array set r $rec
-    set getter ""
-    if {$r(object_class) eq "pin"} {
-        set getter get_pins
-    } elseif {$r(object_class) eq "port"} {
-        set getter get_ports
-    } elseif {$r(object_class) eq "cell"} {
-        set getter get_cells
-    } elseif {$r(object_class) eq "net"} {
-        set getter get_nets
-    }
+    set getter [pt_getter_for_class $r(object_class)]
     set name $r(full_name)
     array unset r
 
@@ -3720,6 +4131,33 @@ proc stage2_delay::pt_trace {message} {
     }
 }
 
+proc stage2_delay::open_to_stat_add {name {delta 1}} {
+    variable open_to_stats
+    if {![info exists open_to_stats($name)]} {
+        set open_to_stats($name) 0
+    }
+    incr open_to_stats($name) $delta
+}
+
+proc stage2_delay::open_to_stats_summary {} {
+    variable open_to_stats
+    set names {
+        compact_candidates compact_applied compact_members compact_members_saved
+        compact_rejected batch_groups batch_seed_records batch_endpoint_queries
+        batch_full_fanout_queries batch_fallbacks inferred_endpoints
+        target_cache_hits compact_cache_hits
+    }
+    set parts {}
+    foreach name $names {
+        set value 0
+        if {[info exists open_to_stats($name)]} {
+            set value $open_to_stats($name)
+        }
+        lappend parts "$name=$value"
+    }
+    return [join $parts ","]
+}
+
 proc stage2_delay::consume_segment {seg} {
     variable consumed_constraints
     variable consumed_segments
@@ -3877,6 +4315,10 @@ proc stage2_delay::write_report {path} {
     puts $fout "Max chain depth                 : $options(-max_chain_depth)"
     puts $fout "Verbose PT query                : $options(-verbose_pt_query)"
     puts $fout "Partial merge policy            : $options(-partial_merge_policy)"
+    puts $fout "Bus compression                 : $options(-compact_bus)"
+    puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
+    puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
+    puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
     puts $fout ""
     puts $fout "\[DETAIL\]"
@@ -4576,6 +5018,9 @@ proc stage2_delay::run_from_user_settings {} {
     set max_chain_depth [global_setting MAX_CHAIN_DEPTH 6]
     set max_endpoints [global_setting MAX_ENDPOINTS 1000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
+    set compact_bus [global_setting STAGE2_COMPACT_BUS true]
+    set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
+    set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
     set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY true]
     set write_path_summary [global_setting WRITE_PATH_SUMMARY true]
     set text_encoding [global_setting STAGE2_TEXT_ENCODING utf-8]
@@ -4604,6 +5049,9 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting TOP_PORT_BOUNDARY_MAP_MODE $top_port_boundary_map_mode
     set_global_setting RECURSIVE_CHAIN_MODE $recursive_chain_mode
     set_global_setting MAX_CHAIN_DEPTH $max_chain_depth
+    set_global_setting STAGE2_COMPACT_BUS $compact_bus
+    set_global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS $compact_bus_min_members
+    set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
     set_global_setting STAGE2_TEXT_ENCODING $text_encoding
@@ -4620,6 +5068,8 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Top open_from mode  : $top_open_from_mode"
     puts "INFO: Top port map mode   : $top_port_boundary_map_mode"
     puts "INFO: Recursive mode      : $recursive_chain_mode"
+    puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
+    puts "INFO: Batch open-to query : $batch_open_to_query"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
     puts "INFO: Text encoding       : $text_encoding"
 
@@ -4644,7 +5094,10 @@ proc stage2_delay::run_from_user_settings {} {
         -text_encoding $text_encoding \
         -allow_through $allow_through \
         -max_endpoints $max_endpoints \
-        -max_enum_objects $max_enum_objects
+        -max_enum_objects $max_enum_objects \
+        -compact_bus $compact_bus \
+        -compact_bus_min_members $compact_bus_min_members \
+        -batch_open_to_query $batch_open_to_query
 
     puts "INFO: Stage 2 complete."
     puts "INFO: Generated E2E SDC   : $out_e2e_sdc"
@@ -4652,6 +5105,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Removed constraints : $out_removed_sdc"
     puts "INFO: Review report       : $out_review_rpt"
     puts "INFO: Final flatten SDC   : $out_final_sdc"
+    puts "INFO: Open-to optimization: [stage2_delay::open_to_stats_summary]"
     if {[truthy $write_path_summary]} {
         puts "INFO: Path summary CSV    : $out_summary_dir"
     }
