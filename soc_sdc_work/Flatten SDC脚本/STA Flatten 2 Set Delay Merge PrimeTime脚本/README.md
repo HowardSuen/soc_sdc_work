@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.8.9。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.0。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -186,6 +186,11 @@ set MAX_ENUM_OBJECTS 64
   返回的是寄存器 `CP` 这类 input pin，脚本会把它作为 PT timing startpoint
   接受；这个放行只适用于 PT `all_fanin -startpoints_only` 推导结果，不会
   放宽原始 SDC 手写 `-from` 的合法性检查。
+- 当 top 或 harden delay 有 `-from`、但没有 `-to`（`open_to`）时，脚本会
+  从最后一级 `-through` 开始调用 PT `all_fanout -flat -endpoints_only`；没有
+  `-through` 时从 `-from` 开始。进入 `harden_list.csv` 所列 harden 的 endpoint
+  会先通过非 flat `all_fanin` 恢复唯一 input boundary，再进入既有递归 delay
+  累加。最终生成的 E2E 约束必须同时包含显式 `-from` 和 `-to`。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -433,9 +438,9 @@ Missing SDC Stage: <N>
 set_max_delay 7 -from [get_pins {u_src/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]
 ```
 
-## v0.8 支持范围
+## v0.9 支持范围
 
-v0.8 自动合并 input 方向单跳、harden input-to-output feedthrough，以及
+v0.9 自动合并 input 方向单跳、harden input-to-output feedthrough，以及
 harden output -> harden input 的递归 chain：
 
 ```text
@@ -450,6 +455,9 @@ A_internal_start -> A_output -> B_input -> B_internal_endpoint
 - Top complete + harden open_from
 - Top open_from + harden complete
 - Top open_from + harden open_from，前提是能推导 boundary input
+- Top open_to：有 `-from`、缺 `-to`，由 PT 推导全部合法 endpoint 后展开
+- Harden open_to：有 `-from`、缺 `-to`，由 PT 推导 harden 内部 endpoint
+  或 harden output boundary 后展开
 - harden complete feedthrough：`B_in -> B_out`，前提是 top 侧能匹配到
   `B_in`。
 - recursive chain：若 top delay 是 `harden_a.output -> harden_b.input`，
@@ -532,6 +540,23 @@ top_reg/Q -> harden_a/input_a -> harden_a/output_a -> top_output
   `all_fanout -flat` 中出现的组合逻辑 input pin 只作为中间 fanout 节点，
   不会被当成最终 endpoint。
 
+`open_to` 的覆盖规则：
+
+1. 有 `-through` 时，从最后一个 `-through` option 的 object collection 向后
+   推导；没有 `-through` 时从 `-from` 向后推导。
+2. PT 返回多个 endpoint 时逐 endpoint 展开；同一 harden boundary 下的多个
+   endpoint 都必须完成记账，相同的最终静态 SDC 只输出一次。
+3. top open_to 的 endpoint 若位于已暴露 harden 内，必须先恢复唯一 harden
+   input boundary，不能直接绕过 harden clean SDC。
+4. endpoint 推导为空、超过 `MAX_ENDPOINTS`、boundary 推导为空或不唯一时，
+   不 consume 原命令，并进入 review。
+5. 与 harden merge 无关的 top terminal endpoint 可以保持 passthrough；若同一
+   原命令只有部分 endpoint 被 consume，final SDC 会把其余 endpoint 改写成
+   显式 `-to` 的静态残留约束。
+6. 所有参与数值累加的真实 delay segment option 必须一致，例如
+   `-ignore_clock_latency`。一致时 option 写入最终命令；不一致时进入
+   `DELAY_OPTION_MISMATCH` review，原命令不 consume。
+
 若 harden clean SDC 中仍保留 `[get_ports <port>]`，Stage 2 在解析 harden
 文件时会把它映射到当前 instance 的 `[get_pins <inst>/<port>]`，再使用 PT
 `get_attribute direction` 判断 input/output。这个映射只对 harden SDC
@@ -550,6 +575,9 @@ set_max_delay 2.0 \
 `<TOP_SDC_basename>_flatten.sdc` 会把未 consume 的 pair 重写成单条静态
 `set_max_delay` / `set_min_delay`，避免已 merge 的 pair 又从原始 list 中
 重复生效。
+
+`-through [list ...]` 保持为同一个 through stage 的多对象 collection，不会
+错误拆成多个连续 `-through`。多个独立 `-through` option 才表示连续路径阶段。
 
 输出示例：
 
@@ -584,8 +612,12 @@ stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束
   并进入 report review 标识；若缺失 bridge/stage 无法由 PT 推导，末端缺失
   stage 无法由 PT 推到合法 endpoint，或方向未知、对象非法、超过
   `MAX_CHAIN_DEPTH`，则停止并进入 review。
-- delay 命令没有 `-to`。
+- delay 同时缺少 `-from` 和 `-to`。
+- open_to 无法从 PT 推导 endpoint、endpoint 数量超过 `MAX_ENDPOINTS`，或进入
+  harden 后无法恢复唯一 input boundary。
 - max/min 类型不一致。
+- 参与同一 E2E 数值累加的 delay option 不一致，例如只有部分 segment 带
+  `-ignore_clock_latency`。
 - `-from`、`-to`、`-through` 中出现 clock 或未知对象。
 - edge-specific option，例如 `-rise_from`、`-fall_to`、`-rise`、`-fall`。
 - 生成后的 `-from` 不是合法 startpoint。
@@ -624,6 +656,16 @@ merge candidate。
   `inst_path/u_cell/D` 这类内部 leaf pin 不会被当作 boundary。
 - input/output 方向只以 PrimeTime `get_attribute <pin_or_port> direction`
   返回值为准，不根据 `i_`、`_i`、`o_`、`_o` 等命名规则推断。
+
+对 `open_to` endpoint 推导：
+
+- 从最后一级 `-through` collection 开始；无 `-through` 时从 `-from` 开始。
+- 使用 `all_fanout -flat -endpoints_only`，只接受 PT 返回并通过 endpoint
+  合法性检查的对象。
+- top endpoint 位于 harden 内时，再用非 flat `all_fanin -to <endpoint>` 与
+  harden immediate input pin 求交，恢复 Stage 2 merge boundary。
+- harden open_to 只接受同一 harden 内 endpoint 或该 harden 的 immediate
+  output boundary，不把下游其它 scope 的 endpoint 错算成 harden 内部段。
 
 若需要观察脚本实际向 PT 查询了什么，可打开：
 
@@ -681,6 +723,11 @@ python3 regression_test/run_regression.py
 
 - complete + complete merge
 - top open_from 通过 PT `all_fanin` 推导 startpoint，并生成显式 `-from`
+- top/harden open_to 通过 PT `all_fanout -flat -endpoints_only` 推导并生成显式
+  `-to`
+- 多 object `-from`、多 endpoint 和 `-through [list ...]` 分组语义
+- 同一 harden boundary 下多个 open_to endpoint 的完整 consume 与最终命令去重
+- open_to PT 推导失败和 delay option 不一致时保留原命令并进入 review
 - harden open_from 显式 `-through`
 - 多跳 harden output start 缺少上游 harden SDC source 时 assumed-zero 继续扩展
 - edge-specific option 进入 review

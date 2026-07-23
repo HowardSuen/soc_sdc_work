@@ -190,13 +190,15 @@ def assert_text_contains(text, needle):
         raise AssertionError("Expected %r in text\n--- text ---\n%s" % (needle, text))
 
 
-def assert_generated_delays_have_from(path):
+def assert_generated_delays_have_explicit_endpoints(path):
     text = read_file(path)
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("set_max_delay ") or stripped.startswith("set_min_delay "):
             if " -from " not in stripped:
                 raise AssertionError("Generated delay missing -from in %s:\n%s" % (path, stripped))
+            if " -to " not in stripped:
+                raise AssertionError("Generated delay missing -to in %s:\n%s" % (path, stripped))
 
 
 def require_ok(result):
@@ -204,9 +206,9 @@ def require_ok(result):
         raise AssertionError(
             "case failed\nstdout=%s\nstderr=%s\ndriver=%s"
             % (result["stdout"], result["stderr"], read_file(result["driver"]))
-        )
+    )
     if os.path.exists(result["out_sdc"]):
-        assert_generated_delays_have_from(result["out_sdc"])
+        assert_generated_delays_have_explicit_endpoints(result["out_sdc"])
 
 
 def test_release_identity_is_reconstructed_without_plaintext_constant():
@@ -295,6 +297,191 @@ proc all_fanin {args} {
     )
     require_ok(result)
     assert_contains(result["out_sdc"], "set_min_delay 1 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+
+
+def test_top_open_to_multi_from_through_and_endpoint_expansion():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        set owner [lindex $args end]
+        if {$owner eq "u_h0"} {
+            return [list u_h0/cfg_i]
+        }
+        if {$owner eq "u_h1"} {
+            return [list u_h1/cfg_i]
+        }
+        return {}
+    }
+    return [list [lindex $args end]]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/u_reg/D"} {
+        return [list u_h0/cfg_i]
+    }
+    if {$target eq "u_h1/u_reg/D"} {
+        return [list u_h1/cfg_i]
+    }
+    return {}
+}
+
+proc all_fanout {args} {
+    set seed [lindex [lindex $args end] 0]
+    if {$seed in {u_mid/out_o u_up/data_o}} {
+        return [list u_h0/u_reg/D u_h1/u_reg/D]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "top_open_to_multi_matrix",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/Q] [get_pins u_up/u_reg/Q]] -through [list [get_pins u_mid/out_o] [get_pins u_up/data_o]] -ignore_clock_latency\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D] -ignore_clock_latency\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D] -ignore_clock_latency\n",
+            )
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    through_group = "-through [list [get_pins {u_mid/out_o}] [get_pins {u_up/data_o}]]"
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/Q}] %s -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}] -ignore_clock_latency" % through_group)
+    assert_contains(result["out_sdc"], "set_max_delay 8 -from [get_pins {u_up/u_reg/Q}] %s -through [get_pins {u_h1/cfg_i}] -to [get_pins {u_h1/u_reg/D}] -ignore_clock_latency" % through_group)
+    assert_contains(result["report"], "Merged constraints              : 4")
+    assert_contains(result["report"], "OPEN_TO_ENDPOINT_INFERRED")
+    assert_not_contains(result["review"], "NO_TO_OBJECT")
+    assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+
+
+def test_harden_open_to_infers_endpoint_and_merges():
+    prelude = r'''
+proc all_fanout {args} {
+    set seed [lindex [lindex $args end] 0]
+    if {$seed eq "u_h0/cfg_i"} {
+        return [list u_h0/u_reg/D]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "harden_open_to",
+        "set_min_delay 0.25 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_min_delay 0.75 -from [get_ports cfg_i]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_min_delay 1 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_contains(result["final"], "STAGE2_CONSUMED CMD000002")
+    assert_not_contains(result["review"], "NO_TO_OBJECT")
+
+
+def test_open_to_inference_failure_keeps_original_for_review():
+    result = run_case(
+        "open_to_inference_failure",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -through [get_pins u_mid/out_o]\n",
+        "",
+    )
+    require_ok(result)
+    assert_contains(result["review"], "OPEN_TO_ENDPOINT_NOT_INFERRED")
+    assert_contains(result["final"], "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -through [get_pins u_mid/out_o]")
+    assert_not_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+
+
+def test_open_to_delay_option_mismatch_is_not_consumed():
+    prelude = r'''
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    return [list [lindex $args end]]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return [list u_h0/cfg_i]
+}
+
+proc all_fanout {args} {
+    return [list u_h0/u_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_delay_option_mismatch",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -ignore_clock_latency\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["review"], "DELAY_OPTION_MISMATCH")
+    assert_contains(result["final"], "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -ignore_clock_latency")
+    assert_not_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+
+
+def test_open_to_multiple_endpoints_same_boundary_are_fully_consumed_once():
+    prelude = r'''
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    return [list [lindex $args end]]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return [list u_h0/cfg_i]
+}
+
+proc all_fanout {args} {
+    return [list u_h0/u_cfg_reg/D u_h0/u_mode_reg/D]
+}
+'''
+    result = run_case(
+        "open_to_same_boundary_multi_endpoint",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [list [get_pins u_h0/u_cfg_reg/D] [get_pins u_h0/u_mode_reg/D]]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != 2:
+        raise AssertionError("Expected exactly two unique generated endpoints:\n%s" % generated)
+    assert_contains(result["out_sdc"], "-to [get_pins {u_h0/u_cfg_reg/D}]")
+    assert_contains(result["out_sdc"], "-to [get_pins {u_h0/u_mode_reg/D}]")
+    assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+    assert_not_contains(result["final"], "set_max_delay 2 -from [get_pins {u_src_reg/Q}]")
+    assert_not_contains(result["review"], "NO_HARDEN_SEGMENT_MATCHED")
 
 
 def test_legacy_top_open_from_mode_still_emits_from_when_pt_knows_startpoint():
@@ -805,6 +992,11 @@ def main():
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_complete_complete_merge,
         test_top_open_from_infers_static_startpoint,
+        test_top_open_to_multi_from_through_and_endpoint_expansion,
+        test_harden_open_to_infers_endpoint_and_merges,
+        test_open_to_inference_failure_keeps_original_for_review,
+        test_open_to_delay_option_mismatch_is_not_consumed,
+        test_open_to_multiple_endpoints_same_boundary_are_fully_consumed_once,
         test_legacy_top_open_from_mode_still_emits_from_when_pt_knows_startpoint,
         test_harden_open_from_with_explicit_through,
         test_multi_hop_review,
