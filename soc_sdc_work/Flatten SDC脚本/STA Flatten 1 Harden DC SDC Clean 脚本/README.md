@@ -5,7 +5,7 @@
 ## 入口
 
 ```bash
-python3 proc_harden_sdc.py \
+python3 run_stage1_clean_sdc.py \
   --in  <input_dc_sdc> \
   --out <output_soc_sdc> \
   --removed-out <removed_sdc> \
@@ -33,9 +33,9 @@ python3 proc_harden_sdc.py \
 - 保留的 `create_clock` / `create_generated_clock` 不再因为最终主 SDC 中暂时没有其它 `get_clocks` 引用而删除；是否与 SoC 顶层 clock 重复由 report 和 STA post-check review。
 - `get_ports <name>`：映射为 `get_pins <inst>/<name>`。
 - 裸 `get_ports`、`get_ports *`、危险 `all_*`：不进入主 SDC。
-- `set_max_delay` / `set_min_delay` 单边涉及 harden boundary `get_ports`、另一边是内部对象：保留整条 path 约束，将 boundary `get_ports` 映射为 SoC scope 下的 `get_pins <inst>/<port>`，内部对象同步上升 hierarchy，并放入 `REVIEW_REQUIRED` 区块。
-- `set_max_delay` / `set_min_delay` 两侧都涉及 harden boundary `get_ports`：不进入 cleaned harden SDC，转交 10/20/30 或 SoC 级 review。
-- `set_false_path` / `set_multicycle_path` / `set_case_analysis` 只要直接涉及 harden boundary `get_ports`：不进入 cleaned harden SDC，转交 scenario pre、30 或 SoC 级 review。
+- `set_max_delay` / `set_min_delay` 涉及 harden boundary `get_ports`：保留整条 path 约束，将 boundary `get_ports` 映射为 SoC scope 下的 `get_pins <inst>/<port>`，内部对象同步上升 hierarchy，并放入 `REVIEW_REQUIRED` 区块；`-from get_ports -to get_ports` 两端都映射后保留。
+- `set_multicycle_path` 涉及 harden boundary `get_ports`：保留并映射为 `get_pins <inst>/<port>`，其它内部对象同步上升 hierarchy，同时放入 `REVIEW_REQUIRED` 区块确认 timing exception 语义。
+- `set_false_path` / `set_case_analysis` 只要直接涉及 harden boundary `get_ports`：不进入 cleaned harden SDC，转交 scenario pre、30 或 SoC 级 review。
 - `set_input_delay` / `set_output_delay`、clock group、clock budget、RC/SPEF/derate、global library/report constraint：REMOVE。
 - `set_units`：匹配 `--expect-units` 时 REMOVE；mismatch 为 fatal `INVALID_OUTPUT`。
 - `source`、`current_design`、`current_instance`、复杂 Tcl / collection 操作、未分类命令：UNSUPPORTED。
@@ -43,6 +43,7 @@ python3 proc_harden_sdc.py \
 - 整行注释会在 Tcl 解析前丢弃并保留行号，避免 DC 输出的大型注释约束拖慢转换。
 - 单条有效命令超过 `--oversize-command-chars` 阈值时，跳过深度递归检查，改用浅层对象映射：只处理明确的 bracket get command，例如 `[get_pins u_a/Q]`、`[get_ports A]`，以及 safe `[list [get_pins ...] ...]` wrapper；无法安全浅层映射的变量、通配、`get_clocks`、非 safe 嵌套 collection 或复杂 option 进入 `unsupported.sdc`。
 - unsupported count > 0：`REVIEW_REQUIRED`；`--strict` 下 `INVALID_OUTPUT`。
+- Stage1 幂等保护只识别本脚本 `run_stage1_clean_sdc.py`（兼容旧名 `proc_harden_sdc.py`）生成的明确文件头；允许 `run_stage2_merge_delay.tcl` 生成的 Stage2 flatten SDC 作为输入。通用的 `SDC_PROCESS_VERSION` 不再单独作为“已被 Stage1 处理”的判据。
 
 ## REVIEW_REQUIRED 主 SDC 区块
 
@@ -56,9 +57,9 @@ set_false_path -from [get_cells -hierarchical u_soc/u_blk/u_async/*] -to [get_pi
 # !!! REVIEW_REQUIRED COMMANDS END !!!
 ```
 
-这些命令不会在后续普通 body 中重复输出。直接涉及 harden boundary `get_ports` 的 path/mode 约束会进入 `removed.sdc`，不会进入该区块。
+这些命令不会在后续普通 body 中重复输出。直接涉及 harden boundary `get_ports` 的 `set_false_path` / `set_case_analysis` 会进入 `removed.sdc`，不会进入该区块。
 
-例外：`set_max_delay` / `set_min_delay` 如果只有一侧是 boundary `get_ports`、另一侧是 harden 内部对象，脚本会保留整条 path，并把 boundary `get_ports` 映射为 SoC scope 下的 harden instance pin。保留后的命令会进入 `REVIEW_REQUIRED` 区块。例如：
+`set_max_delay` / `set_min_delay` 如果 endpoint 涉及 boundary `get_ports`，脚本会保留整条 path，并把 boundary `get_ports` 映射为 SoC scope 下的 harden instance pin。保留后的命令会进入 `REVIEW_REQUIRED` 区块。例如：
 
 ```tcl
 # 原始
@@ -68,7 +69,27 @@ set_max_delay 0.8 -from [get_ports A] -to [get_pins u_sink/D]
 set_max_delay 0.8 -from [get_pins u_soc/u_blk/A] -to [get_pins u_soc/u_blk/u_sink/D]
 ```
 
-该保留表示 harden boundary pin 到 harden internal endpoint 的原 path 语义被尽量保留；仍需人工确认其是否属于 cleaned harden SDC，而不是 SoC interface timing。
+`-from get_ports -to get_ports` 两端都会映射：
+
+```tcl
+# 原始
+set_max_delay 0.7 -from [get_ports A] -to [get_ports B]
+
+# cleaned harden SDC
+set_max_delay 0.7 -from [get_pins u_soc/u_blk/A] -to [get_pins u_soc/u_blk/B]
+```
+
+该保留表示 harden boundary pin 相关原 path 语义被尽量保留；仍需人工确认其是否属于 cleaned harden SDC，而不是 SoC interface timing。
+
+`set_multicycle_path` 不做 Stage1 删除。涉及 boundary `get_ports` 时同样映射为 SoC scope 下的 harden instance pin，并进入 `REVIEW_REQUIRED` 区块。例如：
+
+```tcl
+# 原始
+set_multicycle_path 2 -setup -from [get_ports A] -to [get_pins u_dst/D]
+
+# cleaned harden SDC
+set_multicycle_path 2 -setup -from [get_pins u_soc/u_blk/A] -to [get_pins u_soc/u_blk/u_dst/D]
+```
 
 ## Clock mapping
 
@@ -109,8 +130,11 @@ python3 regression_test/run_regression.py
 - `set_units` mismatch fatal。
 - command boundary structural failure fatal。
 - 主 SDC 顶部 `REVIEW_REQUIRED` 醒目区块。
-- boundary `get_ports` path/mode 约束从 cleaned harden SDC 移除。
+- boundary `get_ports` 的 `set_max_delay` / `set_min_delay` 映射并进入 `REVIEW_REQUIRED`，包含 `-from get_ports -to get_ports`。
+- boundary `get_ports` 的 `set_multicycle_path` 映射并进入 `REVIEW_REQUIRED`。
+- boundary `get_ports` 的 `set_false_path` / `set_case_analysis` 从 cleaned harden SDC 移除。
 - 整行注释预处理与超长命令 shallow mapping。
+- Stage2 flatten SDC 文件头可正常输入，Stage1 自身输出重复输入仍会被拦截。
 
 ## 实现边界
 
