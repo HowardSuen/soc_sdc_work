@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.0。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.1。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -82,6 +82,9 @@ set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
 set ::TOP_OPEN_FROM_MODE enumerate_static_startpoints
 set ::RECURSIVE_CHAIN_MODE auto
 set ::MAX_CHAIN_DEPTH 6
+set ::STAGE2_COMPACT_BUS true
+set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
+set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
@@ -125,6 +128,9 @@ set ::OUT_DIR $::RUN_DIR
 set ::TOP_PORT_BOUNDARY_MAP_MODE connectivity
 set ::RECURSIVE_CHAIN_MODE auto
 set ::MAX_CHAIN_DEPTH 6
+set ::STAGE2_COMPACT_BUS true
+set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
+set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
@@ -160,6 +166,9 @@ set OUT_SUMMARY_DIR [file join $OUT_DIR delay_path_summary]
 set STAGE2_TEXT_ENCODING utf-8
 set MAX_ENDPOINTS 1000
 set MAX_ENUM_OBJECTS 64
+set STAGE2_COMPACT_BUS true
+set STAGE2_COMPACT_BUS_MIN_MEMBERS 4
+set STAGE2_BATCH_OPEN_TO_QUERY true
 ```
 
 这些默认值含义如下：
@@ -191,6 +200,21 @@ set MAX_ENUM_OBJECTS 64
   `-through` 时从 `-from` 开始。进入 `harden_list.csv` 所列 harden 的 endpoint
   会先通过非 flat `all_fanin` 恢复唯一 input boundary，再进入既有递归 delay
   累加。最终生成的 E2E 约束必须同时包含显式 `-from` 和 `-to`。
+- `STAGE2_COMPACT_BUS=true`：仅对 `open_to` 的 `-from` 和各级 `-through`
+  尝试 bus collection 压缩。对象必须属于同一 class、direction、owner 和
+  bus basename，index 连续且无重复；默认至少 4 个成员才尝试。脚本会在当前
+  linked PT database 中查询 `[get_pins {bus[*]}]` 或
+  `[get_ports {bus[*]}]`，只有实际返回对象名集合与原始成员集合完全一致时才
+  使用 `[*]`。缺 bit、额外匹配、对象被优化掉或查询失败时保留原 list。
+- harden immediate boundary 的 `-from` 不做 bus 合并，因为 Stage 2 仍需逐成员
+  匹配跨层 delay 和重写未消费约束；它们仍会参与下面的批量 PT 查询。
+- `STAGE2_BATCH_OPEN_TO_QUERY=true`：同一 open_to seed 按 pin/port/cell/net
+  class 组成 collection，每个 class 只执行一次 endpoint fanout；harden
+  open_to 的 full fanout 也只执行一次。若当前 PT 版本不接受 multi-pattern
+  getter、返回集合不完整或命令报错，脚本自动回退为逐 seed 查询，不丢原约束。
+- bus 等价查询和 open_to endpoint 查询在一次 build 内缓存，避免最终 SDC
+  残留重写时重复访问 PT。压缩数、节省成员数、batch 数、fallback 数和 endpoint
+  数会写入 `integration_delay_merge.rpt` 的 `[SUMMARY]`。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -703,6 +727,9 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -top_port_boundary_map_mode connectivity
 -recursive_chain_mode auto
 -max_chain_depth 6
+-compact_bus true
+-compact_bus_min_members 4
+-batch_open_to_query true
 -verbose_pt_query true
 -write_path_summary true
 -max_endpoints 1000
@@ -725,6 +752,12 @@ python3 regression_test/run_regression.py
 - top open_from 通过 PT `all_fanin` 推导 startpoint，并生成显式 `-from`
 - top/harden open_to 通过 PT `all_fanout -flat -endpoints_only` 推导并生成显式
   `-to`
+- 连续完整 bus 的 `-from` / `-through` 经 PT 集合等价验证后压缩为 `[*]`，并
+  验证 top open_to 只执行一次批量 endpoint fanout
+- bus 缺 bit、wildcard 额外匹配时拒绝压缩并保留精确成员
+- multi-pattern getter 报错时自动回退逐 seed 查询，确认所有约束仍完整生成
+- harden open_to 的多 boundary seed 只执行一次 endpoint fanout 和一次 full
+  fanout
 - 多 object `-from`、多 endpoint 和 `-through [list ...]` 分组语义
 - 同一 harden boundary 下多个 open_to endpoint 的完整 consume 与最终命令去重
 - open_to PT 推导失败和 delay option 不一致时保留原命令并进入 review
