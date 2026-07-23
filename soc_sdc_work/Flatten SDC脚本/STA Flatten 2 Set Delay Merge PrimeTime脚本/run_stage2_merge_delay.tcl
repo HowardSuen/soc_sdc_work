@@ -118,7 +118,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.1"
+    variable VERSION "v0.9.2"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -142,8 +142,23 @@ namespace eval stage2_delay {
     variable boundary_input_cache
     variable top_port_boundary_cache
     variable open_to_stats
+    variable performance_stats
     variable open_to_target_cache
     variable bus_compact_cache
+    variable object_attribute_cache
+    variable owner_harden_cache
+    variable startpoint_cache
+    variable missing_harden_target_cache
+    variable missing_top_target_cache
+    variable parsed_command_segments
+    variable consumed_command_segments
+    variable consumed_source_files
+    variable segment_index_top_to
+    variable segment_index_chain_from
+    variable segment_index_chain_owner
+    variable segment_index_harden_boundary
+    variable segment_index_harden_output
+    variable segment_index_any_top_to
 
     array set options {
         -top_sdc ""
@@ -235,8 +250,23 @@ proc stage2_delay::reset_state {} {
     variable boundary_input_cache
     variable top_port_boundary_cache
     variable open_to_stats
+    variable performance_stats
     variable open_to_target_cache
     variable bus_compact_cache
+    variable object_attribute_cache
+    variable owner_harden_cache
+    variable startpoint_cache
+    variable missing_harden_target_cache
+    variable missing_top_target_cache
+    variable parsed_command_segments
+    variable consumed_command_segments
+    variable consumed_source_files
+    variable segment_index_top_to
+    variable segment_index_chain_from
+    variable segment_index_chain_owner
+    variable segment_index_harden_boundary
+    variable segment_index_harden_output
+    variable segment_index_any_top_to
 
     set hardens {}
     set top_segments {}
@@ -269,6 +299,23 @@ proc stage2_delay::reset_state {} {
         target_cache_hits 0
         compact_cache_hits 0
     }
+    array unset performance_stats
+    array set performance_stats {
+        metadata_batch_queries 0
+        metadata_batch_records 0
+        metadata_batch_fallbacks 0
+        metadata_individual_queries 0
+        attribute_cache_hits 0
+        owner_cache_hits 0
+        boundary_cache_hits 0
+        startpoint_cache_hits 0
+        missing_harden_cache_hits 0
+        missing_top_cache_hits 0
+        segment_index_lookups 0
+        final_rewrite_index_hits 0
+        final_rewrite_skipped_files 0
+        parsed_segment_reuse_hits 0
+    }
     set command_seq 0
     set e2e_seq 0
     array unset boundary_input_cache
@@ -279,6 +326,34 @@ proc stage2_delay::reset_state {} {
     array set open_to_target_cache {}
     array unset bus_compact_cache
     array set bus_compact_cache {}
+    array unset object_attribute_cache
+    array set object_attribute_cache {}
+    array unset owner_harden_cache
+    array set owner_harden_cache {}
+    array unset startpoint_cache
+    array set startpoint_cache {}
+    array unset missing_harden_target_cache
+    array set missing_harden_target_cache {}
+    array unset missing_top_target_cache
+    array set missing_top_target_cache {}
+    array unset parsed_command_segments
+    array set parsed_command_segments {}
+    array unset consumed_command_segments
+    array set consumed_command_segments {}
+    array unset consumed_source_files
+    array set consumed_source_files {}
+    array unset segment_index_top_to
+    array set segment_index_top_to {}
+    array unset segment_index_chain_from
+    array set segment_index_chain_from {}
+    array unset segment_index_chain_owner
+    array set segment_index_chain_owner {}
+    array unset segment_index_harden_boundary
+    array set segment_index_harden_boundary {}
+    array unset segment_index_harden_output
+    array set segment_index_harden_output {}
+    array unset segment_index_any_top_to
+    array set segment_index_any_top_to {}
 }
 
 proc stage2_delay::build {args} {
@@ -306,6 +381,7 @@ proc stage2_delay::build {args} {
     map_top_open_to_endpoint_segments
     map_top_port_boundary_segments
     classify_segments
+    build_segment_indexes
     if {$options(-recursive_chain_mode) eq "auto"} {
         match_delay_graph_segments
     } else {
@@ -1004,8 +1080,13 @@ proc stage2_delay::add_segment {seg} {
     variable top_segments
     variable harden_segments
     variable all_delay_segments
+    variable parsed_command_segments
     lappend all_delay_segments $seg
     array set s $seg
+    if {$s(source_file) ne "" && $s(original_text) ne ""} {
+        set command_key [source_command_key $s(source_file) $s(line_no) $s(original_text)]
+        lappend parsed_command_segments($command_key) $seg
+    }
     if {$s(source) eq "top"} {
         lappend top_segments $seg
     } else {
@@ -1014,7 +1095,19 @@ proc stage2_delay::add_segment {seg} {
     array unset s
 }
 
+proc stage2_delay::source_file_key {path} {
+    return [file normalize $path]
+}
+
+proc stage2_delay::source_command_key {path line_no original_text} {
+    return [list [source_file_key $path] $line_no $original_text]
+}
+
 proc stage2_delay::resolve_object_expr {expr} {
+    return [hydrate_object_records [parse_object_expr_records $expr]]
+}
+
+proc stage2_delay::parse_object_expr_records {expr} {
     set expr [string trim $expr]
     if {$expr eq ""} {
         return {}
@@ -1036,7 +1129,7 @@ proc stage2_delay::resolve_object_expr {expr} {
         if {$cmd eq "list"} {
             set out {}
             foreach item [lrange $words 1 end] {
-                set out [concat $out [resolve_object_expr $item]]
+                set out [concat $out [parse_object_expr_records $item]]
             }
             return $out
         }
@@ -1082,14 +1175,13 @@ proc stage2_delay::map_harden_port_records_to_instance_pins {records harden_inst
         array set r $rec
         if {$r(object_class) eq "port"} {
             set pin_name "${harden_inst}/$r(full_name)"
-            set direction [pt_get_attr_by_name pin $pin_name direction]
-            lappend out [object_record pin $pin_name $direction [owner_harden_inst $pin_name]]
+            lappend out [object_record pin $pin_name "" [owner_harden_inst $pin_name]]
         } else {
             lappend out $rec
         }
         array unset r
     }
-    return $out
+    return [hydrate_object_records $out]
 }
 
 proc stage2_delay::split_object_list {text} {
@@ -1123,9 +1215,110 @@ proc stage2_delay::object_record_from_get {cmd name} {
     } elseif {$cmd eq "get_clocks"} {
         set class clock
     }
-    set direction [pt_get_attr_by_name $class $name direction]
     set owner [owner_harden_inst $name]
-    return [object_record $class $name $direction $owner]
+    return [object_record $class $name "" $owner]
+}
+
+proc stage2_delay::hydrate_object_records {records} {
+    variable object_attribute_cache
+
+    array set pending_by_class {}
+    array set pending_seen {}
+    set class_order {}
+    foreach rec $records {
+        array set r $rec
+        if {$r(direction) eq "" && $r(object_class) in {pin port cell net}} {
+            set cache_key [list $r(object_class) $r(full_name) direction]
+            if {![info exists object_attribute_cache($cache_key)] && [is_batch_exact_object_name $r(full_name)]} {
+                set pending_key [list $r(object_class) $r(full_name)]
+                if {![info exists pending_seen($pending_key)]} {
+                    set pending_seen($pending_key) 1
+                    if {![info exists pending_by_class($r(object_class))]} {
+                        set pending_by_class($r(object_class)) {}
+                        lappend class_order $r(object_class)
+                    }
+                    lappend pending_by_class($r(object_class)) $r(full_name)
+                }
+            }
+        }
+        array unset r
+    }
+
+    foreach object_class $class_order {
+        set names $pending_by_class($object_class)
+        if {[llength $names] > 1} {
+            performance_stat_add metadata_batch_queries
+            performance_stat_add metadata_batch_records [llength $names]
+            array set batch [pt_batch_object_directions $object_class $names]
+            if {$batch(ok)} {
+                array set directions $batch(values)
+                foreach name $names {
+                    set cache_key [list $object_class $name direction]
+                    set object_attribute_cache($cache_key) $directions($name)
+                }
+                array unset directions
+                array unset batch
+                continue
+            }
+            performance_stat_add metadata_batch_fallbacks
+            pt_trace "object metadata batch fallback class=$object_class records=[llength $names] reason={$batch(reason)}"
+            array unset batch
+        }
+        foreach name $names {
+            pt_get_attr_by_name $object_class $name direction
+        }
+    }
+
+    set out {}
+    foreach rec $records {
+        array set r $rec
+        if {$r(direction) eq "" && $r(object_class) in {pin port cell net}} {
+            set cache_key [list $r(object_class) $r(full_name) direction]
+            if {![info exists object_attribute_cache($cache_key)]} {
+                pt_get_attr_by_name $r(object_class) $r(full_name) direction
+            }
+            if {[info exists object_attribute_cache($cache_key)]} {
+                set r(direction) $object_attribute_cache($cache_key)
+            }
+        }
+        lappend out [array get r]
+        array unset r
+    }
+    return $out
+}
+
+proc stage2_delay::is_batch_exact_object_name {name} {
+    return [expr {[string first "*" $name] < 0 && [string first "?" $name] < 0}]
+}
+
+proc stage2_delay::pt_batch_object_directions {object_class names} {
+    set getter [pt_getter_for_class $object_class]
+    if {$getter eq "" || [info commands $getter] eq "" || [info commands foreach_in_collection] eq "" || [info commands get_attribute] eq ""} {
+        return [list ok false values {} reason missing_collection_command]
+    }
+
+    array set directions {}
+    set actual_names {}
+    pt_trace "$getter -quiet <metadata batch patterns=[llength $names]>"
+    if {[catch {
+        set coll [$getter -quiet $names]
+        foreach_in_collection obj $coll {
+            set name [collection_object_name $obj]
+            set direction ""
+            catch {set direction [get_attribute $obj direction]}
+            set directions($name) $direction
+            lappend actual_names $name
+        }
+    } err]} {
+        return [list ok false values {} reason "batch_query_failed:$err"]
+    }
+
+    set expected [lsort -unique $names]
+    set actual [lsort -unique $actual_names]
+    if {$actual ne $expected} {
+        return [list ok false values {} reason "batch_set_mismatch:expected=[llength $expected],actual=[llength $actual]"]
+    }
+    return [list ok true values [array get directions] reason ""]
 }
 
 proc stage2_delay::object_record {class name direction owner} {
@@ -1352,22 +1545,23 @@ proc stage2_delay::pt_getter_for_class {object_class} {
 }
 
 proc stage2_delay::pt_get_attr_by_name {class name attr} {
+    variable object_attribute_cache
+    set cache_key [list $class $name $attr]
+    if {[info exists object_attribute_cache($cache_key)]} {
+        performance_stat_add attribute_cache_hits
+        return $object_attribute_cache($cache_key)
+    }
     if {[info commands get_attribute] eq "" || $class eq "unknown" || $class eq "clock"} {
         pt_trace "skip get_attribute class=$class name=$name attr=$attr command_unavailable_or_unsupported"
+        set object_attribute_cache($cache_key) ""
         return ""
     }
-    set getter ""
-    if {$class eq "pin"} {
-        set getter get_pins
-    } elseif {$class eq "port"} {
-        set getter get_ports
-    } elseif {$class eq "cell"} {
-        set getter get_cells
-    } elseif {$class eq "net"} {
-        set getter get_nets
-    } else {
+    set getter [pt_getter_for_class $class]
+    if {$getter eq "" || [info commands $getter] eq ""} {
+        set object_attribute_cache($cache_key) ""
         return ""
     }
+    performance_stat_add metadata_individual_queries
     set value ""
     pt_trace "$getter -quiet {$name}"
     if {[catch {
@@ -1381,13 +1575,20 @@ proc stage2_delay::pt_get_attr_by_name {class name attr} {
         }
     } err]} {
         pt_trace "$getter/get_attribute failed name={$name} attr=$attr error={$err}"
+        set object_attribute_cache($cache_key) ""
         return ""
     }
+    set object_attribute_cache($cache_key) $value
     return $value
 }
 
 proc stage2_delay::owner_harden_inst {name} {
     variable hardens
+    variable owner_harden_cache
+    if {[info exists owner_harden_cache($name)]} {
+        performance_stat_add owner_cache_hits
+        return $owner_harden_cache($name)
+    }
     if {![info exists hardens]} {
         set hardens {}
     }
@@ -1402,6 +1603,7 @@ proc stage2_delay::owner_harden_inst {name} {
         }
         array unset h
     }
+    set owner_harden_cache($name) $best
     return $best
 }
 
@@ -1442,11 +1644,7 @@ proc stage2_delay::map_top_open_to_endpoint_segment {seg} {
         return $result
     }
 
-    set boundaries [pt_boundary_inputs_by_fanin $owner [record_full_name $endpoint]]
-    if {[llength $boundaries] == 0} {
-        set boundaries [pt_boundary_inputs_by_fanout $owner [record_full_name $endpoint]]
-    }
-    set boundaries [unique_records_by_name $boundaries]
+    set boundaries [cached_boundary_inputs_to_endpoint $owner [record_full_name $endpoint]]
     if {[llength $boundaries] == 0} {
         set s(status) review
         set s(failure_reason) OPEN_TO_BOUNDARY_NOT_INFERRED
@@ -1957,17 +2155,31 @@ proc stage2_delay::find_boundary_inputs_to_endpoint {hseg} {
         return [unique_records_by_name $inferred]
     }
 
-    set inferred [pt_boundary_inputs_by_fanin $harden_inst $endpoint]
-    if {[llength $inferred] == 0} {
-        set inferred [pt_boundary_inputs_by_fanout $harden_inst $endpoint]
-    }
+    set inferred [cached_boundary_inputs_to_endpoint $harden_inst $endpoint]
     if {[llength $inferred] > $options(-max_endpoints)} {
         add_review "" [array get s] "TOO_MANY_BOUNDARY_INPUTS" "open_from endpoint exceeded -max_endpoints"
         set inferred {}
     }
     array unset to
     array unset s
-    return [unique_records_by_name $inferred]
+    return $inferred
+}
+
+proc stage2_delay::cached_boundary_inputs_to_endpoint {harden_inst endpoint} {
+    variable boundary_input_cache
+    set cache_key [list $harden_inst $endpoint]
+    if {[info exists boundary_input_cache($cache_key)]} {
+        performance_stat_add boundary_cache_hits
+        return $boundary_input_cache($cache_key)
+    }
+
+    set inferred [pt_boundary_inputs_by_fanin $harden_inst $endpoint]
+    if {[llength $inferred] == 0} {
+        set inferred [pt_boundary_inputs_by_fanout $harden_inst $endpoint]
+    }
+    set inferred [unique_records_by_name $inferred]
+    set boundary_input_cache($cache_key) $inferred
+    return $inferred
 }
 
 proc stage2_delay::pt_boundary_inputs_by_fanin {harden_inst endpoint} {
@@ -1987,6 +2199,7 @@ proc stage2_delay::pt_boundary_inputs_by_fanin {harden_inst endpoint} {
             pt_trace "all_fanin -to {$endpoint}"
             set cone [all_fanin -to $ep]
             pt_trace "all_fanin result endpoint={$endpoint} count=[sizeof_collection $cone]"
+            array set cone_names [collection_name_set $cone]
             pt_trace "get_pins -quiet -of_objects <cell:{$harden_inst}>"
             set hpins [get_pins -quiet -of_objects $hcell]
             pt_trace "get_pins harden pins result harden={$harden_inst} count=[sizeof_collection $hpins]"
@@ -1996,11 +2209,12 @@ proc stage2_delay::pt_boundary_inputs_by_fanin {harden_inst endpoint} {
             set out {}
             foreach_in_collection pin $hin {
                 set name [get_attribute $pin full_name]
-                if {[collection_contains_name $cone $name]} {
+                if {[info exists cone_names($name)]} {
                     pt_trace "fanin boundary matched harden={$harden_inst} endpoint={$endpoint} boundary={$name}"
                     lappend out [object_record pin $name [get_attribute $pin direction] $harden_inst]
                 }
             }
+            array unset cone_names
             set value $out
         }
     } err]} {
@@ -2065,6 +2279,17 @@ proc stage2_delay::collection_contains_name {coll name} {
         }
     }
     return $found
+}
+
+proc stage2_delay::collection_name_set {coll} {
+    set result {}
+    if {[info commands foreach_in_collection] eq ""} {
+        return $result
+    }
+    foreach_in_collection obj $coll {
+        lappend result [collection_object_name $obj] 1
+    }
+    return $result
 }
 
 proc stage2_delay::unique_records_by_name {records} {
@@ -2364,6 +2589,78 @@ proc stage2_delay::summary_through_groups_from_steps {path_steps final_to_record
         array unset st
     }
     return $groups
+}
+
+proc stage2_delay::build_segment_indexes {} {
+    variable top_segments
+    variable chain_top_segments
+    variable harden_segments
+    variable harden_output_segments
+    variable segment_index_top_to
+    variable segment_index_chain_from
+    variable segment_index_chain_owner
+    variable segment_index_harden_boundary
+    variable segment_index_harden_output
+    variable segment_index_any_top_to
+
+    array unset segment_index_top_to
+    array set segment_index_top_to {}
+    array unset segment_index_chain_from
+    array set segment_index_chain_from {}
+    array unset segment_index_chain_owner
+    array set segment_index_chain_owner {}
+    array unset segment_index_harden_boundary
+    array set segment_index_harden_boundary {}
+    array unset segment_index_harden_output
+    array set segment_index_harden_output {}
+    array unset segment_index_any_top_to
+    array set segment_index_any_top_to {}
+
+    foreach tseg $top_segments {
+        array set t $tseg
+        if {[llength $t(to_records)] == 1} {
+            set key [list $t(type) [record_full_name [lindex $t(to_records) 0]]]
+            lappend segment_index_top_to($key) [array get t]
+            set segment_index_any_top_to($key) 1
+        }
+        array unset t
+    }
+
+    foreach tseg $chain_top_segments {
+        array set t $tseg
+        if {[llength $t(from_records)] == 1} {
+            set from_rec [lindex $t(from_records) 0]
+            set key [list $t(type) [record_full_name $from_rec]]
+            lappend segment_index_chain_from($key) [array get t]
+            if {[is_harden_boundary_output_record $from_rec]} {
+                set owner_key [list $t(type) [record_owner_name $from_rec]]
+                lappend segment_index_chain_owner($owner_key) [array get t]
+            }
+        }
+        if {[llength $t(to_records)] == 1} {
+            set key [list $t(type) [record_full_name [lindex $t(to_records) 0]]]
+            set segment_index_any_top_to($key) 1
+        }
+        array unset t
+    }
+
+    foreach hseg $harden_segments {
+        array set h $hseg
+        foreach boundary [harden_boundary_records [array get h]] {
+            set key [list $h(type) [record_full_name $boundary]]
+            lappend segment_index_harden_boundary($key) [array get h]
+        }
+        array unset h
+    }
+
+    foreach hseg $harden_output_segments {
+        array set h $hseg
+        if {[harden_output_source_has_legal_start [array get h]] && [llength $h(to_records)] == 1} {
+            set key [list $h(type) [record_full_name [lindex $h(to_records) 0]]]
+            lappend segment_index_harden_output($key) [array get h]
+        }
+        array unset h
+    }
 }
 
 proc stage2_delay::match_delay_graph_segments {} {
@@ -2704,21 +3001,10 @@ proc stage2_delay::paths_from_missing_top_to_harden_feedthrough {hseg} {
 }
 
 proc stage2_delay::top_or_chain_segment_exists_to_boundary {boundary type} {
-    variable top_segments
-    variable chain_top_segments
-    set bname [record_full_name $boundary]
-    foreach tseg [concat $top_segments $chain_top_segments] {
-        array set t $tseg
-        set matched 0
-        if {$t(type) eq $type && [llength $t(to_records)] == 1 && [record_full_name [lindex $t(to_records) 0]] eq $bname} {
-            set matched 1
-        }
-        array unset t
-        if {$matched} {
-            return 1
-        }
-    }
-    return 0
+    variable segment_index_any_top_to
+    performance_stat_add segment_index_lookups
+    set key [list $type [record_full_name $boundary]]
+    return [info exists segment_index_any_top_to($key)]
 }
 
 proc stage2_delay::paths_from_missing_harden_output_boundary {boundary type} {
@@ -2843,78 +3129,46 @@ proc stage2_delay::harden_output_source_has_legal_start {hseg} {
 }
 
 proc stage2_delay::harden_output_source_exists_for_boundary {boundary type} {
-    variable harden_output_segments
-    set bname [record_full_name $boundary]
-    foreach hseg $harden_output_segments {
-        array set h $hseg
-        if {$h(type) eq $type && [llength $h(to_records)] == 1 && [record_full_name [lindex $h(to_records) 0]] eq $bname && [harden_output_source_has_legal_start [array get h]]} {
-            array unset h
-            return 1
-        }
-        array unset h
-    }
-    return 0
+    variable segment_index_harden_output
+    performance_stat_add segment_index_lookups
+    set key [list $type [record_full_name $boundary]]
+    return [info exists segment_index_harden_output($key)]
 }
 
 proc stage2_delay::matching_chain_top_segments {from_boundary type} {
-    variable chain_top_segments
-    set out {}
-    set bname [record_full_name $from_boundary]
-    foreach tseg $chain_top_segments {
-        array set t $tseg
-        if {$t(type) eq $type && [llength $t(from_records)] == 1 && [record_full_name [lindex $t(from_records) 0]] eq $bname} {
-            lappend out [array get t]
-        }
-        array unset t
+    variable segment_index_chain_from
+    performance_stat_add segment_index_lookups
+    set key [list $type [record_full_name $from_boundary]]
+    if {[info exists segment_index_chain_from($key)]} {
+        return $segment_index_chain_from($key)
     }
-    return $out
+    return {}
 }
 
 proc stage2_delay::matching_harden_segments_for_boundary {boundary type} {
-    variable harden_segments
-    set out {}
-    set bname [record_full_name $boundary]
-    foreach hseg $harden_segments {
-        array set h $hseg
-        if {$h(type) ne $type} {
-            array unset h
-            continue
-        }
-        foreach candidate [harden_boundary_records [array get h]] {
-            if {[record_full_name $candidate] eq $bname} {
-                lappend out [array get h]
-                break
-            }
-        }
-        array unset h
+    variable segment_index_harden_boundary
+    performance_stat_add segment_index_lookups
+    set key [list $type [record_full_name $boundary]]
+    if {[info exists segment_index_harden_boundary($key)]} {
+        return $segment_index_harden_boundary($key)
     }
-    return $out
+    return {}
 }
 
 proc stage2_delay::missing_harden_bridge_top_segments {boundary type} {
-    variable chain_top_segments
-    set out {}
+    variable segment_index_chain_owner
+    performance_stat_add segment_index_lookups
     array set b $boundary
     set owner $b(owner_harden_inst)
     array unset b
     if {$owner eq ""} {
         return {}
     }
-    foreach tseg $chain_top_segments {
-        array set t $tseg
-        if {$t(type) ne $type || [llength $t(from_records)] != 1} {
-            array unset t
-            continue
-        }
-        set from_rec [lindex $t(from_records) 0]
-        array set f $from_rec
-        if {$f(owner_harden_inst) eq $owner && [is_harden_boundary_output_record $from_rec]} {
-            lappend out [array get t]
-        }
-        array unset f
-        array unset t
+    set key [list $type $owner]
+    if {[info exists segment_index_chain_owner($key)]} {
+        return $segment_index_chain_owner($key)
     }
-    return $out
+    return {}
 }
 
 proc stage2_delay::missing_harden_targets_from_boundary {boundary type} {
@@ -2938,16 +3192,26 @@ proc stage2_delay::missing_top_targets_from_harden_output_boundary {boundary typ
 }
 
 proc stage2_delay::pt_harden_fanout_targets_from_boundary {boundary} {
+    variable missing_harden_target_cache
     array set b $boundary
     set boundary_name $b(full_name)
     set harden_inst $b(owner_harden_inst)
     array unset b
 
+    set cache_key [list $harden_inst $boundary_name]
+    if {[info exists missing_harden_target_cache($cache_key)]} {
+        performance_stat_add missing_harden_cache_hits
+        pt_trace "missing-sdc fanout cache hit boundary={$boundary_name} target_count=[llength $missing_harden_target_cache($cache_key)]"
+        return $missing_harden_target_cache($cache_key)
+    }
+
     if {$harden_inst eq ""} {
+        set missing_harden_target_cache($cache_key) {}
         return {}
     }
     if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands foreach_in_collection] eq ""} {
         pt_trace "missing-sdc fanout target skip boundary={$boundary_name} missing_command"
+        set missing_harden_target_cache($cache_key) {}
         return {}
     }
 
@@ -2982,24 +3246,36 @@ proc stage2_delay::pt_harden_fanout_targets_from_boundary {boundary} {
         }
     } err]} {
         pt_trace "missing-sdc fanout target failed boundary={$boundary_name} error={$err}"
+        set missing_harden_target_cache($cache_key) {}
         return {}
     }
     set value [unique_records_by_name $value]
+    set missing_harden_target_cache($cache_key) $value
     pt_trace "missing-sdc fanout target summary boundary={$boundary_name} target_count=[llength $value]"
     return $value
 }
 
 proc stage2_delay::pt_top_fanout_targets_from_harden_output_boundary {boundary} {
+    variable missing_top_target_cache
     array set b $boundary
     set boundary_name $b(full_name)
     set owner_harden $b(owner_harden_inst)
     array unset b
 
+    set cache_key [list $owner_harden $boundary_name]
+    if {[info exists missing_top_target_cache($cache_key)]} {
+        performance_stat_add missing_top_cache_hits
+        pt_trace "missing-top fanout cache hit boundary={$boundary_name} target_count=[llength $missing_top_target_cache($cache_key)]"
+        return $missing_top_target_cache($cache_key)
+    }
+
     if {$owner_harden eq ""} {
+        set missing_top_target_cache($cache_key) {}
         return {}
     }
     if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands foreach_in_collection] eq ""} {
         pt_trace "missing-top fanout target skip boundary={$boundary_name} missing_command"
+        set missing_top_target_cache($cache_key) {}
         return {}
     }
 
@@ -3035,9 +3311,11 @@ proc stage2_delay::pt_top_fanout_targets_from_harden_output_boundary {boundary} 
         }
     } err]} {
         pt_trace "missing-top fanout target failed boundary={$boundary_name} error={$err}"
+        set missing_top_target_cache($cache_key) {}
         return {}
     }
     set value [unique_records_by_name $value]
+    set missing_top_target_cache($cache_key) $value
     pt_trace "missing-top fanout target summary boundary={$boundary_name} target_count=[llength $value]"
     return $value
 }
@@ -3279,13 +3557,22 @@ proc stage2_delay::pt_endpoint_fanout_records {start boundary_name label} {
 }
 
 proc stage2_delay::pt_startpoints_to_boundary {boundary} {
+    variable startpoint_cache
     array set b $boundary
     set boundary_name $b(full_name)
     set boundary_class $b(object_class)
     array unset b
 
+    set cache_key [list $boundary_class $boundary_name]
+    if {[info exists startpoint_cache($cache_key)]} {
+        performance_stat_add startpoint_cache_hits
+        pt_trace "top startpoint cache hit boundary={$boundary_name} startpoint_count=[llength $startpoint_cache($cache_key)]"
+        return $startpoint_cache($cache_key)
+    }
+
     if {[info commands all_fanin] eq "" || [info commands foreach_in_collection] eq "" || [info commands sizeof_collection] eq ""} {
         pt_trace "top startpoint inference skip boundary={$boundary_name} missing_command"
+        set startpoint_cache($cache_key) {}
         return {}
     }
 
@@ -3295,6 +3582,7 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     }
     if {[info commands $getter] eq ""} {
         pt_trace "top startpoint inference skip boundary={$boundary_name} missing_getter=$getter"
+        set startpoint_cache($cache_key) {}
         return {}
     }
 
@@ -3324,9 +3612,11 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
         }
     } err]} {
         pt_trace "top startpoint inference failed boundary={$boundary_name} error={$err}"
+        set startpoint_cache($cache_key) {}
         return {}
     }
     set value [unique_records_by_name $value]
+    set startpoint_cache($cache_key) $value
     pt_trace "top startpoint inference summary boundary={$boundary_name} startpoint_count=[llength $value]"
     return $value
 }
@@ -3780,21 +4070,13 @@ proc stage2_delay::harden_boundary_records {hseg} {
 }
 
 proc stage2_delay::matching_top_segments {boundary type} {
-    variable top_segments
-    set out {}
-    set bname [record_full_name $boundary]
-    foreach tseg $top_segments {
-        array set t $tseg
-        if {$t(type) ne $type} {
-            array unset t
-            continue
-        }
-        if {[llength $t(to_records)] == 1 && [record_full_name [lindex $t(to_records) 0]] eq $bname} {
-            lappend out [array get t]
-        }
-        array unset t
+    variable segment_index_top_to
+    performance_stat_add segment_index_lookups
+    set key [list $type [record_full_name $boundary]]
+    if {[info exists segment_index_top_to($key)]} {
+        return $segment_index_top_to($key)
     }
-    return $out
+    return {}
 }
 
 proc stage2_delay::missing_boundaries {boundaries matched_names} {
@@ -4158,9 +4440,39 @@ proc stage2_delay::open_to_stats_summary {} {
     return [join $parts ","]
 }
 
+proc stage2_delay::performance_stat_add {name {delta 1}} {
+    variable performance_stats
+    if {![info exists performance_stats($name)]} {
+        set performance_stats($name) 0
+    }
+    incr performance_stats($name) $delta
+}
+
+proc stage2_delay::performance_stats_summary {} {
+    variable performance_stats
+    set names {
+        metadata_batch_queries metadata_batch_records metadata_batch_fallbacks
+        metadata_individual_queries attribute_cache_hits owner_cache_hits
+        boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
+        missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
+        final_rewrite_skipped_files parsed_segment_reuse_hits
+    }
+    set parts {}
+    foreach name $names {
+        set value 0
+        if {[info exists performance_stats($name)]} {
+            set value $performance_stats($name)
+        }
+        lappend parts "$name=$value"
+    }
+    return [join $parts ","]
+}
+
 proc stage2_delay::consume_segment {seg} {
     variable consumed_constraints
     variable consumed_segments
+    variable consumed_command_segments
+    variable consumed_source_files
     array set s $seg
     if {[info exists s(missing_sdc)] && [truthy $s(missing_sdc)]} {
         array unset s
@@ -4170,6 +4482,10 @@ proc stage2_delay::consume_segment {seg} {
     if {![info exists consumed_constraints($key)]} {
         set consumed_constraints($key) $s(original_text)
         lappend consumed_segments [array get s]
+        set source_key [source_file_key $s(source_file)]
+        set command_key [source_command_key $s(source_file) $s(line_no) $s(original_text)]
+        lappend consumed_command_segments($command_key) [array get s]
+        set consumed_source_files($source_key) 1
     }
     array unset s
 }
@@ -4319,6 +4635,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
     puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
+    puts $fout "Stage2 performance statistics   : [performance_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
     puts $fout ""
     puts $fout "\[DETAIL\]"
@@ -4697,21 +5014,27 @@ proc stage2_delay::csv_quote {value} {
 }
 
 proc stage2_delay::remaining_sdc_text {path} {
-    variable consumed_segments
+    variable consumed_source_files
 
     set fin [open_text $path r]
     set text [read $fin]
     close $fin
 
+    set source_key [source_file_key $path]
+    if {![info exists consumed_source_files($source_key)]} {
+        performance_stat_add final_rewrite_skipped_files
+        return [string trimright $text]
+    }
+
     set commands [scan_tcl_commands $text]
     set remaining $text
     foreach item [lsort -decreasing -integer -command stage2_delay::command_start_compare [commands_with_offsets $text $commands]] {
         array set cmd $item
-        set consumed_for_cmd [consumed_segments_for_command $path $cmd(text)]
+        set consumed_for_cmd [consumed_segments_for_command $path $cmd(line) $cmd(text)]
         if {[llength $consumed_for_cmd] > 0} {
             set before [string range $remaining 0 [expr {$cmd(start) - 1}]]
             set after [string range $remaining $cmd(end) end]
-            set replacement [remaining_replacement_for_command $path $cmd(text) $consumed_for_cmd]
+            set replacement [remaining_replacement_for_command $path $cmd(line) $cmd(text) $consumed_for_cmd]
             set remaining "${before}${replacement}${after}"
         }
         array unset cmd
@@ -4719,25 +5042,28 @@ proc stage2_delay::remaining_sdc_text {path} {
     return [string trimright $remaining]
 }
 
-proc stage2_delay::consumed_segments_for_command {path original_text} {
-    variable consumed_segments
-    set out {}
-    set norm_path [file normalize $path]
-    foreach seg $consumed_segments {
-        array set s $seg
-        if {[file normalize $s(source_file)] eq $norm_path && $s(original_text) eq $original_text} {
-            lappend out [array get s]
-        }
-        array unset s
+proc stage2_delay::consumed_segments_for_command {path line_no original_text} {
+    variable consumed_command_segments
+    set command_key [source_command_key $path $line_no $original_text]
+    if {[info exists consumed_command_segments($command_key)]} {
+        performance_stat_add final_rewrite_index_hits
+        return $consumed_command_segments($command_key)
     }
-    return $out
+    return {}
 }
 
-proc stage2_delay::remaining_replacement_for_command {path original_text consumed_for_cmd} {
+proc stage2_delay::remaining_replacement_for_command {path line_no original_text consumed_for_cmd} {
+    variable parsed_command_segments
     array set first [lindex $consumed_for_cmd 0]
-    set words [tokenize_words $original_text]
-    set base [segment_from_words $words $first(source) $path $first(line_no) $first(original_id) $original_text $first(harden_inst)]
-    set expanded [expand_segment $base]
+    set command_key [source_command_key $path $line_no $original_text]
+    if {[info exists parsed_command_segments($command_key)]} {
+        performance_stat_add parsed_segment_reuse_hits
+        set expanded $parsed_command_segments($command_key)
+    } else {
+        set words [tokenize_words $original_text]
+        set base [segment_from_words $words $first(source) $path $first(line_no) $first(original_id) $original_text $first(harden_inst)]
+        set expanded [expand_segment $base]
+    }
 
     set consumed_sigs {}
     foreach seg $consumed_for_cmd {
@@ -4860,7 +5186,7 @@ proc stage2_delay::commands_with_offsets {text commands} {
                     incr end
                 }
             }
-            lappend out [list id $cmd(id) text $target start $start end $end]
+            lappend out [list id $cmd(id) line $cmd(line) end_line $cmd(end_line) text $target start $start end $end]
             set search_start $end
         }
         array unset cmd
@@ -5106,6 +5432,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Review report       : $out_review_rpt"
     puts "INFO: Final flatten SDC   : $out_final_sdc"
     puts "INFO: Open-to optimization: [stage2_delay::open_to_stats_summary]"
+    puts "INFO: Performance stats   : [stage2_delay::performance_stats_summary]"
     if {[truthy $write_path_summary]} {
         puts "INFO: Path summary CSV    : $out_summary_dir"
     }

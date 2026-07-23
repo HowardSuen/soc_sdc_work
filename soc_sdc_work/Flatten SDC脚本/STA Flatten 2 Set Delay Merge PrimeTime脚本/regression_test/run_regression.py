@@ -12,6 +12,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,7 +96,7 @@ def read_file(path):
         return fin.read()
 
 
-def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_hardens=None, prelude=""):
+def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_hardens=None, prelude="", post_build_tcl=""):
     case_dir = os.path.join(WORK, case_name)
     if os.path.isdir(case_dir):
         shutil.rmtree(case_dir)
@@ -136,14 +137,14 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
     if extra_build_args:
         args.extend(extra_build_args)
     complete_prelude = DEFAULT_PT_PRELUDE + "\n" + prelude
-    write_file(
-        driver,
-        '%s\nset ::STAGE2_AUTO_RUN false\nsource "%s"\nstage2_delay::build %s\n' % (
-            complete_prelude,
-            TOOL.replace("\\", "/"),
-            " ".join('"%s"' % arg for arg in args),
-        ),
+    driver_text = '%s\nset ::STAGE2_AUTO_RUN false\nsource "%s"\nstage2_delay::build %s\n' % (
+        complete_prelude,
+        TOOL.replace("\\", "/"),
+        " ".join('"%s"' % arg for arg in args),
     )
+    if post_build_tcl:
+        driver_text += post_build_tcl + "\n"
+    write_file(driver, driver_text)
     proc = subprocess.Popen(
         ["tclsh", driver],
         stdout=subprocess.PIPE,
@@ -186,6 +187,13 @@ def assert_not_contains(path, needle):
 def assert_text_contains(text, needle):
     if needle not in text:
         raise AssertionError("Expected %r in text\n--- text ---\n%s" % (needle, text))
+
+
+def stat_value(text, name):
+    match = re.search(r"(?:^|[,: ])%s=([0-9]+)" % re.escape(name), text)
+    if not match:
+        raise AssertionError("Statistic %s not found in text:\n%s" % (name, text))
+    return int(match.group(1))
 
 
 def get_pins_list(prefix, indices):
@@ -434,6 +442,229 @@ proc all_fanout {args} {
     assert_contains(result["report"], "OPEN_TO_ENDPOINT_INFERRED")
     assert_not_contains(result["review"], "NO_TO_OBJECT")
     assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+
+
+def test_object_metadata_batches_explicit_pin_list():
+    indices = list(range(8))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+foreach idx {0 1 2 3 4 5 6 7} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+set ::METADATA_GETTER_LOG [file join [pwd] metadata_getter_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    set fout [open $::METADATA_GETTER_LOG a]
+    puts $fout "[llength $patterns]|[join $patterns ,]"
+    close $fout
+    return $patterns
+}
+'''
+    result = run_case(
+        "metadata_batch_explicit_pin_list",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != len(indices):
+        raise AssertionError("Metadata batch changed list expansion semantics:\n%s" % generated)
+    calls = read_file(os.path.join(result["case_dir"], "metadata_getter_calls.log")).splitlines()
+    batch_calls = [line for line in calls if line.startswith("8|")]
+    if len(batch_calls) != 1:
+        raise AssertionError("Expected one eight-object metadata getter call: %r" % calls)
+    report = read_file(result["report"])
+    if stat_value(report, "metadata_batch_queries") != 1:
+        raise AssertionError("Expected one metadata batch query:\n%s" % report)
+    if stat_value(report, "metadata_batch_records") != len(indices):
+        raise AssertionError("Unexpected metadata batch record count:\n%s" % report)
+    if stat_value(report, "metadata_batch_fallbacks") != 0:
+        raise AssertionError("Unexpected metadata batch fallback:\n%s" % report)
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_object_metadata_batch_failure_falls_back_without_loss():
+    indices = [0, 1, 2, 3]
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+foreach idx {0 1 2 3} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1} {
+        error "mock PT rejects metadata multi-pattern getter"
+    }
+    return $patterns
+}
+'''
+    result = run_case(
+        "metadata_batch_fallback",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    if generated.count("set_max_delay 7 ") != len(indices):
+        raise AssertionError("Metadata fallback lost an object:\n%s" % generated)
+    report = read_file(result["report"])
+    if stat_value(report, "metadata_batch_fallbacks") != 1:
+        raise AssertionError("Expected metadata batch fallback:\n%s" % report)
+    if stat_value(report, "metadata_individual_queries") < len(indices):
+        raise AssertionError("Expected per-object metadata fallback queries:\n%s" % report)
+    assert_text_contains(result["stdout"], "object metadata batch fallback")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_startpoint_and_boundary_queries_are_cached():
+    prelude = r'''
+set ::FANIN_QUERY_LOG [file join [pwd] fanin_query_calls.log]
+
+proc get_cells {args} {
+    return [lindex $args end]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    return [lindex $args end]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    set fout [open $::FANIN_QUERY_LOG a]
+    puts $fout $target
+    close $fout
+    if {$target eq "u_h0/u_reg/D"} {
+        return [list u_h0/cfg_i]
+    }
+    if {$target eq "u_h0/cfg_i"} {
+        return [list u_src_reg/Q]
+    }
+    return {}
+}
+'''
+    post_build_tcl = r'''
+set boundary [stage2_delay::object_record pin u_h0/cfg_i in u_h0]
+stage2_delay::pt_startpoints_to_boundary $boundary
+stage2_delay::pt_startpoints_to_boundary $boundary
+stage2_delay::cached_boundary_inputs_to_endpoint u_h0 u_h0/u_reg/D
+stage2_delay::cached_boundary_inputs_to_endpoint u_h0 u_h0/u_reg/D
+puts "PERF_AFTER_CACHE=[stage2_delay::performance_stats_summary]"
+'''
+    result = run_case(
+        "startpoint_boundary_query_cache",
+        "set_max_delay 2.0 -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+        post_build_tcl=post_build_tcl,
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/Q}]")
+    calls = read_file(os.path.join(result["case_dir"], "fanin_query_calls.log")).splitlines()
+    if calls.count("u_h0/u_reg/D") != 1 or calls.count("u_h0/cfg_i") != 1:
+        raise AssertionError("Expected one PT fanin query per logical key: %r" % calls)
+    if stat_value(result["stdout"], "startpoint_cache_hits") < 2:
+        raise AssertionError("Expected startpoint cache hits:\n%s" % result["stdout"])
+    if stat_value(result["stdout"], "boundary_cache_hits") < 2:
+        raise AssertionError("Expected boundary cache hits:\n%s" % result["stdout"])
+
+
+def test_missing_path_fanout_queries_are_cached():
+    prelude = r'''
+set ::FANOUT_QUERY_LOG [file join [pwd] fanout_query_calls.log]
+
+proc all_fanout {args} {
+    set seed [lindex [lindex $args end] 0]
+    set fout [open $::FANOUT_QUERY_LOG a]
+    puts $fout "$seed|[expr {[lsearch -exact $args -endpoints_only] >= 0}]"
+    close $fout
+    if {$seed eq "u_h0/cfg_i"} {
+        if {[lsearch -exact $args -endpoints_only] >= 0} {
+            return [list u_h0/u_reg/D]
+        }
+        return [list u_h0/o_niu_rst_n]
+    }
+    if {$seed eq "u_h0/o_niu_rst_n"} {
+        return [list top_rst_n]
+    }
+    return {}
+}
+'''
+    post_build_tcl = r'''
+set input_boundary [stage2_delay::object_record pin u_h0/cfg_i in u_h0]
+set output_boundary [stage2_delay::object_record pin u_h0/o_niu_rst_n out u_h0]
+stage2_delay::pt_harden_fanout_targets_from_boundary $input_boundary
+stage2_delay::pt_harden_fanout_targets_from_boundary $input_boundary
+stage2_delay::pt_top_fanout_targets_from_harden_output_boundary $output_boundary
+stage2_delay::pt_top_fanout_targets_from_harden_output_boundary $output_boundary
+puts "PERF_AFTER_FANOUT_CACHE=[stage2_delay::performance_stats_summary]"
+'''
+    result = run_case(
+        "missing_path_fanout_cache",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+        post_build_tcl=post_build_tcl,
+    )
+    require_ok(result)
+    calls = read_file(os.path.join(result["case_dir"], "fanout_query_calls.log")).splitlines()
+    if len(calls) != 4:
+        raise AssertionError("Expected cached fanout helpers to issue four total PT queries: %r" % calls)
+    if stat_value(result["stdout"], "missing_harden_cache_hits") != 1:
+        raise AssertionError("Expected missing-harden target cache hit:\n%s" % result["stdout"])
+    if stat_value(result["stdout"], "missing_top_cache_hits") != 1:
+        raise AssertionError("Expected missing-top target cache hit:\n%s" % result["stdout"])
+
+
+def test_final_rewrite_reuses_parsed_segments_and_skips_untouched_sdc():
+    result = run_case(
+        "final_rewrite_index_reuse",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "# untouched harden constraint\nset_false_path -from [get_ports aux_i]\n",
+            )
+        ],
+    )
+    require_ok(result)
+    assert_contains(result["final"], "set_false_path -from [get_ports aux_i]")
+    report = read_file(result["report"])
+    if stat_value(report, "final_rewrite_index_hits") != 2:
+        raise AssertionError("Expected indexed rewrite lookup for top and h0:\n%s" % report)
+    if stat_value(report, "parsed_segment_reuse_hits") != 2:
+        raise AssertionError("Expected parsed segment reuse for top and h0:\n%s" % report)
+    if stat_value(report, "final_rewrite_skipped_files") != 1:
+        raise AssertionError("Expected untouched h1 SDC rewrite skip:\n%s" % report)
 
 
 def test_open_to_complete_buses_compact_and_batch_once():
@@ -1367,6 +1598,11 @@ def main():
         test_complete_complete_merge,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
+        test_object_metadata_batches_explicit_pin_list,
+        test_object_metadata_batch_failure_falls_back_without_loss,
+        test_startpoint_and_boundary_queries_are_cached,
+        test_missing_path_fanout_queries_are_cached,
+        test_final_rewrite_reuses_parsed_segments_and_skips_untouched_sdc,
         test_open_to_complete_buses_compact_and_batch_once,
         test_open_to_bus_with_missing_bit_is_not_compacted,
         test_open_to_bus_wildcard_overmatch_is_not_compacted,
