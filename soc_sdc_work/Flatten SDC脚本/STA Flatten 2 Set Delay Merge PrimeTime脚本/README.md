@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.1。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.2。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -215,6 +215,20 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - bus 等价查询和 open_to endpoint 查询在一次 build 内缓存，避免最终 SDC
   残留重写时重复访问 PT。压缩数、节省成员数、batch 数、fallback 数和 endpoint
   数会写入 `integration_delay_merge.rpt` 的 `[SUMMARY]`。
+- v0.9.2 会把显式对象 list 按 pin/port/cell/net 分组，一次查询同类对象的
+  `direction`。只有 PT 返回的 `full_name` 集合与原始对象集合完全相等时才采用
+  批量结果；getter 不支持 multi-pattern、查询报错、少返回或多返回对象时，
+  自动回退逐对象查询。该优化只减少 PT metadata query 次数，不改变对象集合。
+- v0.9.2 会缓存对象属性、owner harden、harden endpoint 到 input boundary、
+  boundary 到 startpoint，以及 missing-SDC fanin/fanout 推导结果。缓存 key
+  包含实际对象名和必要的 harden scope，空结果也会缓存，避免同一失败查询反复
+  扫描 PT database。
+- v0.9.2 在 segment 分类完成后建立 boundary 索引，并在生成最终 flatten SDC
+  时复用第一次解析得到的 segment。完全没有 consumed delay 的 SDC 文件直接
+  原样写出，不再逐条重新扫描；若索引条目意外缺失，仍保留原解析 fallback。
+- `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
+  会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
+  final rewrite 命中与跳过文件数，便于定位大型设计中的实际热点。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -756,6 +770,11 @@ python3 regression_test/run_regression.py
   验证 top open_to 只执行一次批量 endpoint fanout
 - bus 缺 bit、wildcard 额外匹配时拒绝压缩并保留精确成员
 - multi-pattern getter 报错时自动回退逐 seed 查询，确认所有约束仍完整生成
+- 显式 pin list 的 direction metadata 批量查询，以及批量返回集合不完整时的
+  逐对象安全回退
+- harden boundary/startpoint 和 missing-SDC fanin/fanout 查询缓存，确认同一
+  logical key 不重复调用 PT
+- segment boundary 索引、首次解析结果复用，以及未消费 SDC 文件直接写出
 - harden open_to 的多 boundary seed 只执行一次 endpoint fanout 和一次 full
   fanout
 - 多 object `-from`、多 endpoint 和 `-through [list ...]` 分组语义
@@ -774,6 +793,10 @@ python3 regression_test/run_regression.py
   segment delay 和 generated command
 - 缺失 top bridge / harden SDC stage assumed-zero，并在 Excel 报告中显示
   `NOT FOUND`
+
+当前共 33 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
+linked design 下的 collection、timing path 和 exception 验证。
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
