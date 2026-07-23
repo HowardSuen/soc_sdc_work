@@ -200,6 +200,57 @@ def get_ports_list(prefix, indices):
     )
 
 
+def validate_static_sdc(path):
+    """Source generated SDC with Tcl collection stubs and validate its shape."""
+    text = read_file(path)
+    for forbidden in ("all_fanin", "all_fanout", "foreach_in_collection"):
+        if forbidden in text:
+            raise AssertionError("Runtime PT query leaked into generated SDC %s: %s" % (path, forbidden))
+    validator = os.path.join(os.path.dirname(path), "validate_static_sdc.tcl")
+    write_file(
+        validator,
+        r'''
+set ::SDC_DELAY_COUNT 0
+proc get_pins {args} { return [lindex $args end] }
+proc get_ports {args} { return [lindex $args end] }
+proc get_cells {args} { return [lindex $args end] }
+proc get_nets {args} { return [lindex $args end] }
+proc set_max_delay {args} {
+    if {[lsearch -exact $args -from] < 0 || [lsearch -exact $args -to] < 0} {
+        error "generated set_max_delay must have explicit -from and -to"
+    }
+    incr ::SDC_DELAY_COUNT
+}
+proc set_min_delay {args} {
+    if {[lsearch -exact $args -from] < 0 || [lsearch -exact $args -to] < 0} {
+        error "generated set_min_delay must have explicit -from and -to"
+    }
+    incr ::SDC_DELAY_COUNT
+}
+source [lindex $argv 0]
+if {$::SDC_DELAY_COUNT == 0} {
+    error "generated SDC contains no delay command"
+}
+puts "STATIC_SDC_VALID commands=$::SDC_DELAY_COUNT"
+''',
+    )
+    proc = subprocess.Popen(
+        ["tclsh", validator, path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=os.path.dirname(path),
+    )
+    stdout, stderr = proc.communicate()
+    output = stdout.decode("utf-8", "replace")
+    errors = stderr.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        raise AssertionError(
+            "Generated SDC failed Tcl source validation: %s\nstdout=%s\nstderr=%s"
+            % (path, output, errors)
+        )
+    assert_text_contains(output, "STATIC_SDC_VALID commands=")
+
+
 def assert_generated_delays_have_explicit_endpoints(path):
     text = read_file(path)
     for line in text.splitlines():
@@ -286,6 +337,8 @@ def test_complete_complete_merge():
     assert_contains(result["removed"], "set_max_delay 2.0")
     assert_contains(result["removed"], "set_max_delay 5.0")
     assert_contains(result["report"], "Merged constraints              : 1")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_top_open_from_infers_static_startpoint():
@@ -307,6 +360,8 @@ proc all_fanin {args} {
     )
     require_ok(result)
     assert_contains(result["out_sdc"], "set_min_delay 1 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_top_open_to_multi_from_through_and_endpoint_expansion():
@@ -467,6 +522,8 @@ proc all_fanout {args} {
     calls = [line for line in read_file(fanout_log).splitlines() if line.strip()]
     if len(calls) != 1:
         raise AssertionError("Expected one batched all_fanout call, got %d: %r" % (len(calls), calls))
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_open_to_bus_with_missing_bit_is_not_compacted():
@@ -514,6 +571,8 @@ proc all_fanout {args} {
     assert_not_contains(result["out_sdc"], "src[*]")
     assert_contains(result["report"], "compact_rejected=1")
     assert_contains(result["report"], "batch_endpoint_queries=1")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_open_to_bus_wildcard_overmatch_is_not_compacted():
@@ -569,6 +628,8 @@ proc all_fanout {args} {
     assert_not_contains(result["out_sdc"], "src[*]")
     assert_contains(result["report"], "compact_rejected=1")
     assert_text_contains(result["stdout"], "reason=pt_set_mismatch")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_open_to_batch_getter_failure_falls_back_without_loss():
@@ -621,6 +682,8 @@ proc all_fanout {args} {
     assert_contains(result["report"], "batch_fallbacks=1")
     assert_contains(result["report"], "batch_endpoint_queries=2")
     assert_text_contains(result["stdout"], "open-to batch fallback")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_harden_open_to_infers_endpoint_and_merges():
@@ -700,6 +763,8 @@ proc all_fanout {args} {
     calls = [line for line in read_file(fanout_log).splitlines() if line.strip()]
     if len(calls) != 2:
         raise AssertionError("Expected one endpoint and one full fanout call, got %d: %r" % (len(calls), calls))
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_open_to_inference_failure_keeps_original_for_review():
