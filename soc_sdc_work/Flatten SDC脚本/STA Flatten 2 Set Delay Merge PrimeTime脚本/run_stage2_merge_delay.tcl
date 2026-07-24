@@ -118,7 +118,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.2"
+    variable VERSION "v0.9.3"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -315,6 +315,7 @@ proc stage2_delay::reset_state {} {
         final_rewrite_index_hits 0
         final_rewrite_skipped_files 0
         parsed_segment_reuse_hits 0
+        final_rewrite_signature_lookups 0
     }
     set command_seq 0
     set e2e_seq 0
@@ -899,7 +900,9 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
     foreach expr $through_exprs {
         set group [resolve_object_expr $expr]
         lappend through_record_groups $group
-        set through_records [concat $through_records $group]
+        foreach rec $group {
+            lappend through_records $rec
+        }
     }
     if {$source eq "harden" && $harden_inst ne ""} {
         set from_records [map_harden_port_records_to_instance_pins $from_records $harden_inst]
@@ -920,7 +923,9 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
             incr through_index
             set group [compact_open_to_records $group "$source:$cmd_id:-through#$through_index"]
             lappend compact_groups $group
-            set through_records [concat $through_records $group]
+            foreach rec $group {
+                lappend through_records $rec
+            }
         }
         set through_record_groups $compact_groups
     }
@@ -1129,7 +1134,9 @@ proc stage2_delay::parse_object_expr_records {expr} {
         if {$cmd eq "list"} {
             set out {}
             foreach item [lrange $words 1 end] {
-                set out [concat $out [parse_object_expr_records $item]]
+                foreach rec [parse_object_expr_records $item] {
+                    lappend out $rec
+                }
             }
             return $out
         }
@@ -1384,17 +1391,23 @@ proc stage2_delay::compact_open_to_records {records label {preserve_boundary_mem
     foreach key $order {
         set members $groups($key)
         if {[lindex $key 0] ne "bus" || [llength $members] < $options(-compact_bus_min_members)} {
-            set out [concat $out $members]
+            foreach rec $members {
+                lappend out $rec
+            }
             continue
         }
         if {$preserve_boundary_members && [records_include_harden_boundary $members]} {
             pt_trace "open-to bus compact skipped label={$label} reason=boundary_members_required_for_merge"
-            set out [concat $out $members]
+            foreach rec $members {
+                lappend out $rec
+            }
             continue
         }
         set compact [compact_bus_record_if_equivalent $members $label]
         if {[llength $compact] == 0} {
-            set out [concat $out $members]
+            foreach rec $members {
+                lappend out $rec
+            }
         } else {
             lappend out $compact
         }
@@ -1675,7 +1688,9 @@ proc stage2_delay::map_top_port_boundary_segments {} {
 
     set mapped {}
     foreach seg $top_segments {
-        set mapped [concat $mapped [map_top_port_boundary_segment $seg]]
+        foreach mapped_seg [map_top_port_boundary_segment $seg] {
+            lappend mapped $mapped_seg
+        }
     }
     set top_segments $mapped
 }
@@ -2729,7 +2744,7 @@ proc stage2_delay::match_delay_graph_segments {} {
 
         set end_rec $p(end_record)
         if {[validate_endpoint_record $end_rec]} {
-            set emitted_sig "TERMINAL:[path_signature [array get p]]"
+            set emitted_sig "TERMINAL:$psig"
             if {![info exists emitted($emitted_sig)]} {
                 set emitted($emitted_sig) 1
                 set generated [emit_graph_terminal_cmd [array get p]]
@@ -3356,7 +3371,9 @@ proc stage2_delay::pt_open_to_targets {seed_records source harden_inst} {
                 pt_trace "open-to endpoint inference batch not found seeds={$seed_label}"
                 continue
             }
-            set value [concat $value [pt_open_to_targets_from_collection $start $seed_label $source $harden_inst]]
+            foreach target [pt_open_to_targets_from_collection $start $seed_label $source $harden_inst] {
+                lappend value $target
+            }
             continue
         }
 
@@ -3373,7 +3390,9 @@ proc stage2_delay::pt_open_to_targets {seed_records source harden_inst} {
                 pt_trace "open-to endpoint inference seed not found seed={$seed_name}"
                 continue
             }
-            set value [concat $value [pt_open_to_targets_from_collection $start $seed_name $source $harden_inst]]
+            foreach target [pt_open_to_targets_from_collection $start $seed_name $source $harden_inst] {
+                lappend value $target
+            }
         }
     }
 
@@ -4080,9 +4099,13 @@ proc stage2_delay::matching_top_segments {boundary type} {
 }
 
 proc stage2_delay::missing_boundaries {boundaries matched_names} {
+    array set matched {}
+    foreach name $matched_names {
+        set matched($name) 1
+    }
     set out {}
     foreach boundary $boundaries {
-        if {[lsearch -exact $matched_names [record_full_name $boundary]] < 0} {
+        if {![info exists matched([record_full_name $boundary])]} {
             lappend out $boundary
         }
     }
@@ -4456,6 +4479,7 @@ proc stage2_delay::performance_stats_summary {} {
         boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
         final_rewrite_skipped_files parsed_segment_reuse_hits
+        final_rewrite_signature_lookups
     }
     set parts {}
     foreach name $names {
@@ -4770,26 +4794,63 @@ proc stage2_delay::write_path_summary {dir} {
     }
 
     set sheet_order {top}
+    array set sheet_seen {top 1}
     foreach harden $hardens {
         array set h $harden
-        if {[info exists h(inst_path)] && $h(inst_path) ne "" && [lsearch -exact $sheet_order $h(inst_path)] < 0} {
+        if {[info exists h(inst_path)] && $h(inst_path) ne "" && ![info exists sheet_seen($h(inst_path))]} {
+            set sheet_seen($h(inst_path)) 1
             lappend sheet_order $h(inst_path)
         }
         array unset h
     }
 
     array set rows_by_sheet {}
+    array set status_count {}
+    array set missing_sdc_seen {}
+    array set missing_sdc_count {}
+    array set sheet_max_through {}
+    array set sheet_max_steps {}
     foreach sheet $sheet_order {
         set rows_by_sheet($sheet) {}
+        set sheet_max_through($sheet) 0
+        set sheet_max_steps($sheet) 0
     }
     foreach item $path_summary_items {
-        set sheet [summary_item_get $item sheet top]
+        array set r $item
+        set sheet top
+        if {[info exists r(sheet)]} {
+            set sheet $r(sheet)
+        }
         if {![info exists rows_by_sheet($sheet)]} {
             set rows_by_sheet($sheet) {}
+            set sheet_seen($sheet) 1
+            set sheet_max_through($sheet) 0
+            set sheet_max_steps($sheet) 0
             lappend sheet_order $sheet
         }
         lappend rows_by_sheet($sheet) $item
+        if {[info exists r(merge_status)]} {
+            incr status_count([list $sheet $r(merge_status)])
+        }
+        if {[info exists r(cmd_id)] && [string match "MISSING_*" $r(cmd_id)]} {
+            set missing_key [list $sheet $r(cmd_id)]
+            if {![info exists missing_sdc_seen($missing_key)]} {
+                set missing_sdc_seen($missing_key) 1
+                incr missing_sdc_count($sheet)
+            }
+        }
+        if {[info exists r(through_records)] && [llength $r(through_records)] > $sheet_max_through($sheet)} {
+            set sheet_max_through($sheet) [llength $r(through_records)]
+        }
+        if {[info exists r(path_steps)] && [llength $r(path_steps)] > $sheet_max_steps($sheet)} {
+            set sheet_max_steps($sheet) [llength $r(path_steps)]
+        }
+        array unset r
     }
+
+    array set max_delay_total {}
+    array set max_delay_used {}
+    build_max_delay_usage_stats max_delay_total max_delay_used
 
     array set sheet_file {}
     array set used_file {}
@@ -4818,11 +4879,28 @@ proc stage2_delay::write_path_summary {dir} {
     csv_write_row $fout {tool version author sheet file row_count merged_rows residual_rows review_rows max_delay_used max_delay_total max_delay_usage missing_sdc_stages}
     foreach sheet $sheet_order {
         set rows $rows_by_sheet($sheet)
-        set max_stats [max_delay_usage_stats_for_sheet $sheet]
-        set max_used [lindex $max_stats 0]
-        set max_total [lindex $max_stats 1]
+        set max_used 0
+        set max_total 0
+        if {[info exists max_delay_used($sheet)]} {
+            set max_used $max_delay_used($sheet)
+        }
+        if {[info exists max_delay_total($sheet)]} {
+            set max_total $max_delay_total($sheet)
+        }
         set max_usage [format "%d/%d" $max_used $max_total]
-        set missing_stages [missing_sdc_stage_count $rows]
+        set merged_rows 0
+        set residual_rows 0
+        set review_rows 0
+        set missing_stages 0
+        foreach status {MERGED RESIDUAL REVIEW} counter {merged_rows residual_rows review_rows} {
+            set key [list $sheet $status]
+            if {[info exists status_count($key)]} {
+                set $counter $status_count($key)
+            }
+        }
+        if {[info exists missing_sdc_count($sheet)]} {
+            set missing_stages $missing_sdc_count($sheet)
+        }
         csv_write_row $fout [list \
             $TOOL_NAME \
             $VERSION \
@@ -4830,9 +4908,9 @@ proc stage2_delay::write_path_summary {dir} {
             $sheet \
             $sheet_file($sheet) \
             [llength $rows] \
-            [summary_count_status $rows MERGED] \
-            [summary_count_status $rows RESIDUAL] \
-            [summary_count_status $rows REVIEW] \
+            $merged_rows \
+            $residual_rows \
+            $review_rows \
             $max_used \
             $max_total \
             $max_usage \
@@ -4842,7 +4920,11 @@ proc stage2_delay::write_path_summary {dir} {
     close $fout
 
     foreach sheet $sheet_order {
-        write_path_summary_sheet [file join $dir $sheet_file($sheet)] $rows_by_sheet($sheet)
+        write_path_summary_sheet \
+            [file join $dir $sheet_file($sheet)] \
+            $rows_by_sheet($sheet) \
+            $sheet_max_through($sheet) \
+            $sheet_max_steps($sheet)
     }
     puts "INFO: Path summary CSV    : $dir"
 }
@@ -4868,30 +4950,53 @@ proc stage2_delay::segment_sheet {seg} {
     return $sheet
 }
 
-proc stage2_delay::max_delay_usage_stats_for_sheet {sheet} {
+proc stage2_delay::build_max_delay_usage_stats {total_name used_name} {
     variable all_delay_segments
     variable consumed_segments
+    upvar 1 $total_name total_by_sheet
+    upvar 1 $used_name used_by_sheet
 
     array set total_seen {}
     array set used_seen {}
     foreach seg $all_delay_segments {
         array set s $seg
-        if {$s(type) eq "max" && [segment_sheet [array get s]] eq $sheet} {
-            set total_seen([list $s(source_file) $s(original_id)]) 1
+        if {$s(type) eq "max"} {
+            set sheet [expr {$s(source) eq "harden" ? $s(harden_inst) : "top"}]
+            set key [list $sheet $s(source_file) $s(original_id)]
+            if {![info exists total_seen($key)]} {
+                set total_seen($key) 1
+                incr total_by_sheet($sheet)
+            }
         }
         array unset s
     }
     foreach seg $consumed_segments {
         array set s $seg
-        if {$s(type) eq "max" && [segment_sheet [array get s]] eq $sheet} {
-            set key [list $s(source_file) $s(original_id)]
-            if {[info exists total_seen($key)]} {
+        if {$s(type) eq "max"} {
+            set sheet [expr {$s(source) eq "harden" ? $s(harden_inst) : "top"}]
+            set key [list $sheet $s(source_file) $s(original_id)]
+            if {[info exists total_seen($key)] && ![info exists used_seen($key)]} {
                 set used_seen($key) 1
+                incr used_by_sheet($sheet)
             }
         }
         array unset s
     }
-    return [list [array size used_seen] [array size total_seen]]
+}
+
+proc stage2_delay::max_delay_usage_stats_for_sheet {sheet} {
+    array set total_by_sheet {}
+    array set used_by_sheet {}
+    build_max_delay_usage_stats total_by_sheet used_by_sheet
+    set total 0
+    set used 0
+    if {[info exists total_by_sheet($sheet)]} {
+        set total $total_by_sheet($sheet)
+    }
+    if {[info exists used_by_sheet($sheet)]} {
+        set used $used_by_sheet($sheet)
+    }
+    return [list $used $total]
 }
 
 proc stage2_delay::summary_count_status {rows status} {
@@ -4915,18 +5020,20 @@ proc stage2_delay::summary_item_get {item key {default "-"}} {
     return $value
 }
 
-proc stage2_delay::write_path_summary_sheet {path rows} {
-    set max_through 0
-    set max_steps 0
-    foreach item $rows {
-        array set r $item
-        if {[info exists r(through_records)] && [llength $r(through_records)] > $max_through} {
-            set max_through [llength $r(through_records)]
+proc stage2_delay::write_path_summary_sheet {path rows {max_through -1} {max_steps -1}} {
+    if {$max_through < 0 || $max_steps < 0} {
+        set max_through 0
+        set max_steps 0
+        foreach item $rows {
+            array set r $item
+            if {[info exists r(through_records)] && [llength $r(through_records)] > $max_through} {
+                set max_through [llength $r(through_records)]
+            }
+            if {[info exists r(path_steps)] && [llength $r(path_steps)] > $max_steps} {
+                set max_steps [llength $r(path_steps)]
+            }
+            array unset r
         }
-        if {[info exists r(path_steps)] && [llength $r(path_steps)] > $max_steps} {
-            set max_steps [llength $r(path_steps)]
-        }
-        array unset r
     }
 
     set max_path_cols [expr {$max_steps > $max_through ? $max_steps : $max_through}]
@@ -4950,12 +5057,18 @@ proc stage2_delay::write_path_summary_sheet {path rows} {
         array set r $item
         set row {}
         foreach key {e2e_id sheet merge_status path_id source source_inst source_file line_no cmd_id original_id delay_type native_delay native_from native_through native_to final_delay final_from start_sdc_delay start_from start_to} {
-            lappend row [summary_item_get $item $key]
+            set value "-"
+            if {[info exists r($key)]} {
+                set value $r($key)
+            }
+            lappend row $value
         }
-        set stage_delays [summary_item_get $item stage_delays {}]
-        set stage_from_texts [summary_item_get $item stage_from_texts {}]
-        set stage_to_texts [summary_item_get $item stage_to_texts {}]
-        set through_records [summary_item_get $item through_records {}]
+        foreach key {stage_delays stage_from_texts stage_to_texts through_records path_steps} {
+            set $key {}
+            if {[info exists r($key)]} {
+                set $key $r($key)
+            }
+        }
         for {set idx 0} {$idx < $max_path_cols} {incr idx} {
             if {$idx < [llength $stage_delays]} {
                 lappend row [lindex $stage_delays $idx]
@@ -4981,9 +5094,12 @@ proc stage2_delay::write_path_summary_sheet {path rows} {
             }
         }
         foreach key {final_to end_sdc_delay end_from end_to generated_cmd review_reason} {
-            lappend row [summary_item_get $item $key]
+            set value "-"
+            if {[info exists r($key)]} {
+                set value $r($key)
+            }
+            lappend row $value
         }
-        set path_steps [summary_item_get $item path_steps {}]
         for {set idx 0} {$idx < $max_steps} {incr idx} {
             if {$idx < [llength $path_steps]} {
                 array set st [lindex $path_steps $idx]
@@ -5065,17 +5181,17 @@ proc stage2_delay::remaining_replacement_for_command {path line_no original_text
         set expanded [expand_segment $base]
     }
 
-    set consumed_sigs {}
+    array set consumed_sig_count {}
     foreach seg $consumed_for_cmd {
-        lappend consumed_sigs [segment_signature $seg]
+        incr consumed_sig_count([segment_signature $seg])
     }
 
     set leftovers {}
     foreach seg $expanded {
         set sig [segment_signature $seg]
-        set idx [lsearch -exact $consumed_sigs $sig]
-        if {$idx >= 0} {
-            set consumed_sigs [lreplace $consumed_sigs $idx $idx]
+        performance_stat_add final_rewrite_signature_lookups
+        if {[info exists consumed_sig_count($sig)] && $consumed_sig_count($sig) > 0} {
+            incr consumed_sig_count($sig) -1
         } else {
             lappend leftovers $seg
         }

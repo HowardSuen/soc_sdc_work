@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.2。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.3。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -226,9 +226,19 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - v0.9.2 在 segment 分类完成后建立 boundary 索引，并在生成最终 flatten SDC
   时复用第一次解析得到的 segment。完全没有 consumed delay 的 SDC 文件直接
   原样写出，不再逐条重新扫描；若索引条目意外缺失，仍保留原解析 fallback。
+- v0.9.3 将解析 object list、展开 through group、bus compact fallback、top port
+  boundary mapping 和 open_to target 汇总中的重复 `concat` 改为增量 `lappend`，
+  避免长 list 在循环中反复整表复制。该改动只影响 Tcl 内部构造成本，不改变
+  object 顺序、分组或最终 SDC collection。
+- v0.9.3 将 final SDC partial rewrite 的 consumed segment 匹配改为
+  signature-count hash，并复用递归路径已经计算的 signature；同一 signature
+  出现多次时仍按计数逐条消费，不会把重复约束错误合并。
+- v0.9.3 的 path summary 在一次遍历中建立 sheet、status、missing-SDC、最大列数
+  和 max-delay 使用统计；每行 key/value 数据只解析一次。CSV 列顺序、行顺序和
+  `00_index.csv` 统计口径保持不变。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
-  final rewrite 命中与跳过文件数，便于定位大型设计中的实际热点。
+  final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -770,7 +780,7 @@ python3 regression_test/run_regression.py
   验证 top open_to 只执行一次批量 endpoint fanout
 - bus 缺 bit、wildcard 额外匹配时拒绝压缩并保留精确成员
 - multi-pattern getter 报错时自动回退逐 seed 查询，确认所有约束仍完整生成
-- 显式 pin list 的 direction metadata 批量查询，以及批量返回集合不完整时的
+- 64 个显式 pin 的 direction metadata 批量查询，以及批量返回集合不完整时的
   逐对象安全回退
 - harden boundary/startpoint 和 missing-SDC fanin/fanout 查询缓存，确认同一
   logical key 不重复调用 PT
@@ -797,6 +807,11 @@ python3 regression_test/run_regression.py
 当前共 33 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
+
+v0.9.3 另使用 2048 个显式对象的固定 mock case 做参考基准：生成 2048 条
+E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0.9.2
+改动前的 `6.808s` 降至 `6.309s`，约减少 7.3%。该结果只反映 Tcl 解析、匹配、
+重写和 CSV 汇总成本，不代表真实 PrimeTime database 查询的加速比例。
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
