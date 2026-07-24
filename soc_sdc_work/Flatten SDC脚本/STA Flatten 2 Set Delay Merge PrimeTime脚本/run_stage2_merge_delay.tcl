@@ -100,6 +100,10 @@ set ::OUT_REMOVED_SDC ""
 set ::OUT_REVIEW_RPT ""
 set ::OUT_SUMMARY_DIR ""
 
+# Live diagnostic trace. The file is opened before SDC parsing and flushed
+# after every line, so long PT runs can be inspected before build completes.
+set ::STAGE2_TRACE_FILE ""
+
 # Optional post-check after build. Keep disabled until generated SDC is reviewed.
 set ::STAGE2_POST_CHECK false
 
@@ -118,7 +122,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.3"
+    variable VERSION "v0.9.4"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -159,6 +163,7 @@ namespace eval stage2_delay {
     variable segment_index_harden_boundary
     variable segment_index_harden_output
     variable segment_index_any_top_to
+    variable live_trace_handle
 
     array set options {
         -top_sdc ""
@@ -169,6 +174,7 @@ namespace eval stage2_delay {
         -out_removed_sdc "merged_delay_removed.sdc"
         -out_review_rpt "unmerged_delay_review.rpt"
         -out_summary_dir ""
+        -out_trace_file ""
         -merge_mode "replace"
         -top_open_from_mode "enumerate_static_startpoints"
         -allow_through "false"
@@ -191,6 +197,7 @@ namespace eval stage2_delay {
         -write_path_summary "true"
         -text_encoding "utf-8"
     }
+    set live_trace_handle ""
 }
 
 proc stage2_delay::release_identity {} {
@@ -267,6 +274,12 @@ proc stage2_delay::reset_state {} {
     variable segment_index_harden_boundary
     variable segment_index_harden_output
     variable segment_index_any_top_to
+    variable live_trace_handle
+
+    if {$live_trace_handle ne ""} {
+        catch {close $live_trace_handle}
+        set live_trace_handle ""
+    }
 
     set hardens {}
     set top_segments {}
@@ -359,15 +372,23 @@ proc stage2_delay::reset_state {} {
 
 proc stage2_delay::build {args} {
     variable options
+    variable generated_cmds
+    variable review_items
 
     reset_state
     parse_options {*}$args
     validate_options
     apply_derived_options
+    open_live_trace
     print_author_banner
 
+    trace_event BUILD_START "top_sdc=$options(-top_sdc) harden_list=$options(-harden_list)"
+
+    trace_event PHASE "read_harden_list"
     read_harden_list $options(-harden_list)
+    trace_event PHASE "extract_top_sdc"
     extract_delay_segments_from_sdc $options(-top_sdc) top ""
+    trace_event PHASE "extract_harden_sdc"
     foreach harden $::stage2_delay::hardens {
         array set h $harden
         if {[info exists h(clean_sdc)] && $h(clean_sdc) ne ""} {
@@ -379,15 +400,19 @@ proc stage2_delay::build {args} {
         array unset h
     }
 
+    trace_event PHASE "map_open_to_and_top_ports"
     map_top_open_to_endpoint_segments
     map_top_port_boundary_segments
+    trace_event PHASE "classify_and_index_segments"
     classify_segments
     build_segment_indexes
+    trace_event PHASE "match_delay_graph mode=$options(-recursive_chain_mode)"
     if {$options(-recursive_chain_mode) eq "auto"} {
         match_delay_graph_segments
     } else {
         match_top_to_harden_segments
     }
+    trace_event PHASE "write_outputs"
     write_e2e_sdc $options(-out_e2e_sdc)
     write_removed_sdc $options(-out_removed_sdc)
     write_review_report $options(-out_review_rpt)
@@ -396,6 +421,8 @@ proc stage2_delay::build {args} {
     if {[truthy $options(-write_path_summary)]} {
         write_path_summary $options(-out_summary_dir)
     }
+    trace_event BUILD_COMPLETE "generated=[llength $generated_cmds] review=[llength $review_items]"
+    close_live_trace
 }
 
 proc stage2_delay::author_banner_lines {} {
@@ -484,6 +511,10 @@ proc stage2_delay::apply_derived_options {} {
     if {$options(-out_summary_dir) eq ""} {
         set out_dir [file dirname [file normalize $options(-out_report)]]
         set options(-out_summary_dir) [file join $out_dir delay_path_summary]
+    }
+    if {$options(-out_trace_file) eq ""} {
+        set out_dir [file dirname [file normalize $options(-out_report)]]
+        set options(-out_trace_file) [file join $out_dir stage2_live.log]
     }
 }
 
@@ -3795,6 +3826,7 @@ proc stage2_delay::emit_graph_delay_cmd {path hseg boundary} {
     set emitted_cmds {}
     foreach from_rec $start_records {
         if {![validate_startpoint_record $from_rec]} {
+            trace_invalid_startpoint $from_rec $to_rec "RECURSIVE:[path_id_string [array get p]]" [join $p(top_ids) +] [join [concat $p(harden_ids) [list $h(id)]] +]
             add_review "" [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
             continue
         }
@@ -3864,6 +3896,7 @@ proc stage2_delay::emit_graph_terminal_cmd {path} {
     set emitted_cmds {}
     foreach from_rec $start_records {
         if {![validate_startpoint_record $from_rec]} {
+            trace_invalid_startpoint $from_rec $to_rec "TERMINAL:[path_id_string [array get p]]" [join $p(top_ids) +] [join $p(harden_ids) +]
             add_review "" "" "INVALID_STARTPOINT" "terminal generated -from object is not a legal startpoint"
             continue
         }
@@ -4210,6 +4243,7 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
     if {$t(kind) eq "complete"} {
         set from_rec [lindex $t(from_records) 0]
         if {![validate_startpoint_record $from_rec]} {
+            trace_invalid_startpoint $from_rec $to_rec "DIRECT" $t(id) $h(id)
             add_review [array get t] [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
             array unset t
             array unset h
@@ -4248,6 +4282,7 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
             set emitted_cmds {}
             foreach from_rec $start_records {
                 if {![validate_startpoint_record $from_rec]} {
+                    trace_invalid_startpoint $from_rec $to_rec "OPEN_FROM" $t(id) $h(id)
                     add_review [array get t] [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
                     continue
                 }
@@ -4311,6 +4346,7 @@ proc stage2_delay::emit_residual_through_cmd {hseg boundary reason} {
     lappend residual_through_groups [list $boundary]
     foreach from_rec $start_records {
         if {![validate_startpoint_record $from_rec]} {
+            trace_invalid_startpoint $from_rec $to_rec "RESIDUAL" "-" $h(id)
             add_review "" [array get h] "INVALID_STARTPOINT" "residual -from object is not a legal startpoint"
             continue
         }
@@ -4434,6 +4470,65 @@ proc stage2_delay::pt_trace {message} {
     if {[info exists options(-verbose_pt_query)] && [truthy $options(-verbose_pt_query)]} {
         puts "PT_QUERY: $message"
     }
+    live_trace_event PT_QUERY $message
+}
+
+proc stage2_delay::trace_event {kind message} {
+    variable live_trace_handle
+    set line "[clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] $kind $message"
+    puts "STAGE2_TRACE: $line"
+    live_trace_event $kind $message
+}
+
+proc stage2_delay::live_trace_event {kind message} {
+    variable live_trace_handle
+    set line "[clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] $kind $message"
+    if {$live_trace_handle ne ""} {
+        puts $live_trace_handle $line
+        flush $live_trace_handle
+    }
+}
+
+proc stage2_delay::trace_invalid_startpoint {from_rec to_rec {path_text "-"} {top_id "-"} {harden_id "-"}} {
+    set from_text "-"
+    set to_text "-"
+    if {$from_rec ne ""} {
+        set from_text [record_debug $from_rec]
+    }
+    if {$to_rec ne ""} {
+        set to_text [record_debug $to_rec]
+    }
+    trace_event INVALID_STARTPOINT "top_id=$top_id harden_id=$harden_id from={$from_text} to={$to_text} path={$path_text}"
+}
+
+proc stage2_delay::open_live_trace {} {
+    variable options
+    variable live_trace_handle
+    if {$options(-out_trace_file) eq ""} {
+        return
+    }
+    set trace_dir [file dirname [file normalize $options(-out_trace_file)]]
+    if {![file isdirectory $trace_dir]} {
+        file mkdir $trace_dir
+    }
+    set live_trace_handle [open_text $options(-out_trace_file) w]
+    fconfigure $live_trace_handle -buffering line
+    puts $live_trace_handle "============================================================"
+    puts $live_trace_handle "Stage 2 live trace"
+    puts $live_trace_handle "Tool    : $::stage2_delay::TOOL_NAME"
+    puts $live_trace_handle "Version : $::stage2_delay::VERSION"
+    puts $live_trace_handle "Author  : [guarded_release_identity]"
+    puts $live_trace_handle "============================================================"
+    flush $live_trace_handle
+}
+
+proc stage2_delay::close_live_trace {} {
+    variable live_trace_handle
+    if {$live_trace_handle ne ""} {
+        flush $live_trace_handle
+        catch {close $live_trace_handle}
+        set live_trace_handle ""
+    }
 }
 
 proc stage2_delay::open_to_stat_add {name {delta 1}} {
@@ -4529,6 +4624,7 @@ proc stage2_delay::add_review {top_seg harden_seg reason action} {
         array unset h
     }
     lappend review_items $item
+    live_trace_event REVIEW [join_kv $item]
 }
 
 proc stage2_delay::add_report_item {text} {
@@ -4639,6 +4735,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Generated E2E SDC               : $options(-out_e2e_sdc)"
     puts $fout "Final flatten SDC               : $options(-out_final_sdc)"
     puts $fout "Path summary dir                : $options(-out_summary_dir)"
+    puts $fout "Live trace file                 : $options(-out_trace_file)"
     puts $fout "Write path summary              : $options(-write_path_summary)"
     puts $fout "Total top merge candidates      : [llength $top_segments]"
     puts $fout "Total top chain candidates      : [llength $chain_top_segments]"
@@ -5449,6 +5546,7 @@ proc stage2_delay::run_from_user_settings {} {
     set out_review_rpt [file normalize [global_setting OUT_REVIEW_RPT [file join $out_dir unmerged_delay_review.rpt]]]
     set out_final_sdc [file normalize [global_setting OUT_FINAL_SDC [file join $out_dir ${top_module}_flatten.sdc]]]
     set out_summary_dir [file normalize [global_setting OUT_SUMMARY_DIR [file join $out_dir delay_path_summary]]]
+    set out_trace_file [file normalize [global_setting STAGE2_TRACE_FILE [file join $out_dir stage2_live.log]]]
 
     set merge_mode [global_setting MERGE_MODE replace]
     set partial_merge_policy [global_setting PARTIAL_MERGE_POLICY residual_through]
@@ -5486,6 +5584,7 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting OUT_REVIEW_RPT $out_review_rpt
     set_global_setting OUT_FINAL_SDC $out_final_sdc
     set_global_setting OUT_SUMMARY_DIR $out_summary_dir
+    set_global_setting STAGE2_TRACE_FILE $out_trace_file
     set_global_setting TOP_MODULE_NAME $top_module
     set_global_setting TOP_OPEN_FROM_MODE $top_open_from_mode
     set_global_setting TOP_PORT_BOUNDARY_MAP_MODE $top_port_boundary_map_mode
@@ -5505,6 +5604,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Output E2E SDC      : $out_e2e_sdc"
     puts "INFO: Final flatten SDC   : $out_final_sdc"
     puts "INFO: Path summary dir    : $out_summary_dir"
+    puts "INFO: Live trace file     : $out_trace_file"
     puts "INFO: Write path summary  : $write_path_summary"
     puts "INFO: Merge mode          : $merge_mode"
     puts "INFO: Top open_from mode  : $top_open_from_mode"
@@ -5524,6 +5624,7 @@ proc stage2_delay::run_from_user_settings {} {
         -out_review_rpt $out_review_rpt \
         -out_final_sdc $out_final_sdc \
         -out_summary_dir $out_summary_dir \
+        -out_trace_file $out_trace_file \
         -merge_mode $merge_mode \
         -partial_merge_policy $partial_merge_policy \
         -unmatched_harden_policy $unmatched_harden_policy \

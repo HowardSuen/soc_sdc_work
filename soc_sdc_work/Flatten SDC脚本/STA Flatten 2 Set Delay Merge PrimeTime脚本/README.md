@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.3。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.4。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -86,6 +86,7 @@ set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_VERBOSE_PT_QUERY true
+set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
 set ::STAGE2_TEXT_ENCODING utf-8
@@ -104,6 +105,7 @@ stage2_delay::build \
   -out_report ./integration_delay_merge.rpt \
   -out_removed_sdc ./merged_delay_removed.sdc \
   -out_review_rpt ./unmerged_delay_review.rpt \
+  -out_trace_file ./stage2_live.log \
   -out_summary_dir ./delay_path_summary \
   -write_path_summary true \
   -merge_mode replace
@@ -132,6 +134,7 @@ set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_VERBOSE_PT_QUERY true
+set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
 set ::STAGE2_TEXT_ENCODING utf-8
@@ -161,6 +164,7 @@ set TOP_OPEN_FROM_MODE enumerate_static_startpoints
 set RECURSIVE_CHAIN_MODE auto
 set MAX_CHAIN_DEPTH 6
 set STAGE2_VERBOSE_PT_QUERY true
+set STAGE2_TRACE_FILE [file join $OUT_DIR stage2_live.log]
 set WRITE_PATH_SUMMARY true
 set OUT_SUMMARY_DIR [file join $OUT_DIR delay_path_summary]
 set STAGE2_TEXT_ENCODING utf-8
@@ -236,6 +240,11 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - v0.9.3 的 path summary 在一次遍历中建立 sheet、status、missing-SDC、最大列数
   和 max-delay 使用统计；每行 key/value 数据只解析一次。CSV 列顺序、行顺序和
   `00_index.csv` 统计口径保持不变。
+- v0.9.4 新增实时 `stage2_live.log`。文件在 SDC 解析前创建，每写一行立即
+  `flush`，长时间运行时可以直接观察当前阶段、PT query、review 和最终计数。
+- v0.9.4 对每个 `INVALID_STARTPOINT` 立即记录实际候选 `from/to` 的 class、
+  full name、direction、owner，以及 path、top ID 和 harden ID。该版本只增强
+  诊断，不自动放宽 startpoint 合法性规则。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
   final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
@@ -245,6 +254,8 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - `STAGE2_VERBOSE_PT_QUERY=true`：默认打印每个关键 PT query，terminal 会显示
   `PT_QUERY:` 前缀的查询动作，方便确认对象、方向、fanin/fanout 和 connectivity
   是否被 PT database 正确返回。若日志太长，可临时设为 `false`。
+- `STAGE2_TRACE_FILE`：实时 trace 文件，默认是 `$OUT_DIR/stage2_live.log`；
+  文件会持续写入并立即 flush。显式设置绝对路径可以覆盖默认位置。
 - `WRITE_PATH_SUMMARY=true`：默认生成 review-friendly CSV bundle。
 - `OUT_SUMMARY_DIR`：CSV bundle 输出目录，默认是
   `$OUT_DIR/delay_path_summary`。
@@ -338,6 +349,7 @@ BUDGET_SEMANTICS_UNRESOLVED
 - `merged_delay_removed.sdc`：`replace` 模式下被 consume 的原始 top/harden
   delay 命令。
 - `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。
+- `stage2_live.log`：运行过程中实时更新的阶段、PT query、review 和关键对象诊断。
 - `delay_path_summary/`：delay 推导汇总 CSV bundle，包含 `00_index.csv`、
   `top.csv` 和每个 harden instance 一张 CSV。
 - `<TOP_SDC_basename>_flatten.sdc`：最终单文件 SDC，包含 top 剩余约束、Stage 2
@@ -347,6 +359,7 @@ BUDGET_SEMANTICS_UNRESOLVED
 建议检查顺序：
 
 ```text
+stage2_live.log
 integration_delay_merge.rpt
 unmerged_delay_review.rpt
 delay_path_summary/00_index.csv
@@ -354,6 +367,24 @@ generated_e2e_delay.sdc
 merged_delay_removed.sdc
 <TOP_SDC_basename>_flatten.sdc
 ```
+
+长时间运行时可以在另一个 Linux terminal 中实时查看：
+
+```bash
+tail -f stage2_live.log
+```
+
+遇到 `INVALID_STARTPOINT` 时，实时文件会立即出现类似记录：
+
+```text
+INVALID_STARTPOINT top_id=CMD000001 harden_id=CMD000002 \
+from={class=pin,name=u_h0/async_i,direction=in,owner=u_h0} \
+to={class=pin,name=u_h0/u_reg/D,direction=in,owner=u_h0} \
+path={RECURSIVE:CMD000001}
+```
+
+这里打印的是脚本实际准备写入最终 `-from` 的 object，而不是事后从 endpoint
+重新执行 `all_fanin` 得到的其它 startpoint，因此可直接定位递归链保留了哪个对象。
 
 ### Delay 推导汇总 CSV
 
@@ -803,8 +834,10 @@ python3 regression_test/run_regression.py
   segment delay 和 generated command
 - 缺失 top bridge / harden SDC stage assumed-zero，并在 Excel 报告中显示
   `NOT FOUND`
+- 实时 trace 文件创建、阶段进度，以及非法 startpoint 的 from/to/path/command ID
+  诊断内容
 
-当前共 33 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 34 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
