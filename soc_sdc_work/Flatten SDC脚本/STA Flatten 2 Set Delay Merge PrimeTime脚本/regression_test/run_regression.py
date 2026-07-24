@@ -445,13 +445,13 @@ proc all_fanout {args} {
 
 
 def test_object_metadata_batches_explicit_pin_list():
-    indices = list(range(8))
+    indices = list(range(64))
     top_sdc = (
         "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
         % get_pins_list("src", indices)
     )
     prelude = r'''
-foreach idx {0 1 2 3 4 5 6 7} {
+for {set idx 0} {$idx < 64} {incr idx} {
     set name [format {src[%d]} $idx]
     set ::PT_MOCK_DIRECTIONS($name) out
 }
@@ -479,9 +479,9 @@ proc get_pins {args} {
     if generated.count("set_max_delay 7 ") != len(indices):
         raise AssertionError("Metadata batch changed list expansion semantics:\n%s" % generated)
     calls = read_file(os.path.join(result["case_dir"], "metadata_getter_calls.log")).splitlines()
-    batch_calls = [line for line in calls if line.startswith("8|")]
+    batch_calls = [line for line in calls if line.startswith("64|")]
     if len(batch_calls) != 1:
-        raise AssertionError("Expected one eight-object metadata getter call: %r" % calls)
+        raise AssertionError("Expected one 64-object metadata getter call: %r" % calls)
     report = read_file(result["report"])
     if stat_value(report, "metadata_batch_queries") != 1:
         raise AssertionError("Expected one metadata batch query:\n%s" % report)
@@ -489,6 +489,13 @@ proc get_pins {args} {
         raise AssertionError("Unexpected metadata batch record count:\n%s" % report)
     if stat_value(report, "metadata_batch_fallbacks") != 0:
         raise AssertionError("Unexpected metadata batch fallback:\n%s" % report)
+    top_rows = len(read_file(os.path.join(result["summary"], "top.csv")).splitlines()) - 1
+    harden_rows = len(read_file(os.path.join(result["summary"], "u_h0.csv")).splitlines()) - 1
+    if top_rows != len(indices) or harden_rows != len(indices):
+        raise AssertionError(
+            "Path summary lost rows: top=%d harden=%d expected=%d"
+            % (top_rows, harden_rows, len(indices))
+        )
     validate_static_sdc(result["out_sdc"])
     validate_static_sdc(result["final"])
 
@@ -1400,6 +1407,8 @@ def test_multi_object_lists_expand_and_rewrite_remaining():
     assert_contains(result["final"], "set_max_delay 2 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/unused_i}]")
     assert_contains(result["final"], "STAGE2_REWRITTEN CMD000002")
     assert_contains(result["final"], "set_max_delay 5 -from [get_pins {u_h0/other_i}] -to [get_pins {u_h0/u_reg/D}]")
+    if stat_value(read_file(result["report"]), "final_rewrite_signature_lookups") < 1:
+        raise AssertionError("Expected indexed final rewrite signature lookups")
 
 
 def test_one_top_boundary_reused_for_multiple_harden_endpoints():
