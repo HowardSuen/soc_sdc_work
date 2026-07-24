@@ -110,6 +110,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
     out_review = os.path.join(case_dir, "unmerged_delay_review.rpt")
     out_final = os.path.join(case_dir, "top_flatten.sdc")
     out_summary = os.path.join(case_dir, "delay_path_summary")
+    out_trace = os.path.join(case_dir, "stage2_live.log")
     driver = os.path.join(case_dir, "run.tcl")
     write_file(top_path, top_sdc)
     write_file(harden_path, harden_sdc)
@@ -133,6 +134,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
         "-out_report", out_report.replace("\\", "/"),
         "-out_removed_sdc", out_removed.replace("\\", "/"),
         "-out_review_rpt", out_review.replace("\\", "/"),
+        "-out_trace_file", out_trace.replace("\\", "/"),
     ]
     if extra_build_args:
         args.extend(extra_build_args)
@@ -163,6 +165,7 @@ def run_case(case_name, top_sdc, harden_sdc, extra_build_args=None, extra_harden
         "review": out_review,
         "final": out_final,
         "summary": out_summary,
+        "trace": out_trace,
         "driver": driver,
     }
 
@@ -347,6 +350,23 @@ def test_complete_complete_merge():
     assert_contains(result["report"], "Merged constraints              : 1")
     validate_static_sdc(result["out_sdc"])
     validate_static_sdc(result["final"])
+
+
+def test_live_trace_records_invalid_startpoint_object():
+    result = run_case(
+        "live_trace_invalid_startpoint",
+        "set_max_delay 2.0 -from [get_pins u_h0/async_i] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "BUILD_START")
+    assert_text_contains(trace, "PHASE match_delay_graph mode=auto")
+    assert_text_contains(trace, "INVALID_STARTPOINT")
+    assert_text_contains(trace, "top_id=CMD000001 harden_id=CMD000002")
+    assert_text_contains(trace, "name=u_h0/async_i,direction=in,owner=u_h0")
+    assert_text_contains(trace, "name=u_h0/u_reg/D,direction=in,owner=u_h0")
+    assert_text_contains(trace, "BUILD_COMPLETE generated=0")
 
 
 def test_top_open_from_infers_static_startpoint():
@@ -1605,6 +1625,7 @@ def main():
     tests = [
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_complete_complete_merge,
+        test_live_trace_records_invalid_startpoint_object,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
         test_object_metadata_batches_explicit_pin_list,
