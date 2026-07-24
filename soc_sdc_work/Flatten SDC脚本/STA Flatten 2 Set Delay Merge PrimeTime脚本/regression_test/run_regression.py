@@ -353,10 +353,21 @@ def test_complete_complete_merge():
 
 
 def test_live_trace_records_invalid_startpoint_object():
+    prelude = r'''
+proc all_fanin {args} {
+    set target [lindex $args end]
+    set name [lindex $target 0]
+    if {$name eq "u_h0/u_reg/D"} {
+        return [list u_src_reg/CP]
+    }
+    return {}
+}
+'''
     result = run_case(
         "live_trace_invalid_startpoint",
         "set_max_delay 2.0 -from [get_pins u_h0/async_i] -to [get_pins u_h0/cfg_i]\n",
         "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
     )
     require_ok(result)
     trace = read_file(result["trace"])
@@ -367,6 +378,75 @@ def test_live_trace_records_invalid_startpoint_object():
     assert_text_contains(trace, "name=u_h0/async_i,direction=in,owner=u_h0")
     assert_text_contains(trace, "name=u_h0/u_reg/D,direction=in,owner=u_h0")
     assert_text_contains(trace, "BUILD_COMPLETE generated=0")
+
+
+def test_pt_proven_input_clock_pin_is_accepted_as_startpoint():
+    prelude = r'''
+proc all_fanin {args} {
+    set target [lindex $args end]
+    set name [lindex $target 0]
+    if {$name eq "u_h0/u_reg/D"} {
+        return [list u_src_reg/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "pt_proven_input_clock_startpoint",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/CP] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/CP}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_contains(result["trace"], "STARTPOINT_PT_CONFIRMED")
+    assert_contains(result["trace"], "name=u_src_reg/CP,direction=in,owner=,pt_startpoint=true")
+    assert_not_contains(result["trace"], "INVALID_STARTPOINT")
+    assert_not_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
+    validate_static_sdc(result["out_sdc"])
+
+
+def test_recursive_pt_proven_input_clock_pin_is_accepted():
+    prelude = r'''
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return [list u_h0/cfg_i]
+    }
+    return [list [lindex $args end]]
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/u_reg/D"} {
+        if {[lsearch -exact $args "-startpoints_only"] >= 0} {
+            return [list u_src_reg/CP]
+        }
+        return [list u_h0/cfg_i u_src_reg/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "recursive_pt_proven_input_clock_startpoint",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/CP] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7 -from [get_pins {u_src_reg/CP}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_contains(result["report"], "RECURSIVE_MERGED")
+    assert_contains(result["trace"], "STARTPOINT_PT_CONFIRMED")
+    assert_not_contains(result["trace"], "INVALID_STARTPOINT")
+    assert_not_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
+    validate_static_sdc(result["out_sdc"])
 
 
 def test_top_open_from_infers_static_startpoint():
@@ -1626,6 +1706,8 @@ def main():
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_complete_complete_merge,
         test_live_trace_records_invalid_startpoint_object,
+        test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
+        test_recursive_pt_proven_input_clock_pin_is_accepted,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
         test_object_metadata_batches_explicit_pin_list,
