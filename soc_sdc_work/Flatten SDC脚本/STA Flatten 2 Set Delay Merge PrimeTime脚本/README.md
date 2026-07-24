@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.4。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.5。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -245,6 +245,10 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - v0.9.4 对每个 `INVALID_STARTPOINT` 立即记录实际候选 `from/to` 的 class、
   full name、direction、owner，以及 path、top ID 和 harden ID。该版本只增强
   诊断，不自动放宽 startpoint 合法性规则。
+- v0.9.5 修复 PT 认可的 input clock pin 被误报 `INVALID_STARTPOINT`。当
+  候选 `-from` 不满足静态 direction 规则时，脚本仅在它被最终
+  endpoint 的 `all_fanin -flat -startpoints_only` 精确返回时放行，并记录
+  `STARTPOINT_PT_CONFIRMED`。普通组合逻辑 input pin 仍会进入 review。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
   final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
@@ -438,6 +442,11 @@ max_delay_used/max_delay_total/max_delay_usage/missing_sdc_stages
 结果填入 CSV/Excel 的 `Start Point From`。若仍显示 `NOT FOUND`，通常表示
 当前 PT database 对该 boundary pin 没有返回合法 startpoint，terminal 的
 `PT_QUERY:` 日志会显示对应 `startpoint_count=0`。
+
+对于 `direction=in` 的 pin，Stage 2 不会根据方向直接放行。只有当该候选
+对象出现在最终 endpoint 的 PT `all_fanin -flat -startpoints_only` 结果中，
+才会被标记为 `pt_startpoint=true` 并写入最终 `-from`。确认成功会在
+`stage2_live.log` 中记录 `STARTPOINT_PT_CONFIRMED`。
 
 例如递归链：
 
@@ -836,8 +845,10 @@ python3 regression_test/run_regression.py
   `NOT FOUND`
 - 实时 trace 文件创建、阶段进度，以及非法 startpoint 的 from/to/path/command ID
   诊断内容
+- PT 证明的 `direction=in` clock pin 可在 direct/recursive 发射路径中作为
+  最终 `-from`，而未被 PT startpoint 集合返回的普通 input pin 仍被拒绝
 
-当前共 34 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 36 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 

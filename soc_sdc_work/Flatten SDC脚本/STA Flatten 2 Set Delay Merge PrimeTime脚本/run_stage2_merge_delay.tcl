@@ -122,7 +122,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.4"
+    variable VERSION "v0.9.5"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -2003,6 +2003,9 @@ proc stage2_delay::harden_inst_list_for_debug {} {
 proc stage2_delay::record_debug {rec} {
     array set r $rec
     set text "class=$r(object_class),name=$r(full_name),direction=$r(direction),owner=$r(owner_harden_inst)"
+    if {[info exists r(pt_startpoint)] && [truthy $r(pt_startpoint)]} {
+        append text ",pt_startpoint=true"
+    }
     array unset r
     return $text
 }
@@ -3825,11 +3828,13 @@ proc stage2_delay::emit_graph_delay_cmd {path hseg boundary} {
     set summary_through_groups [summary_through_groups_from_steps $summary_steps $to_rec $p(through_records)]
     set emitted_cmds {}
     foreach from_rec $start_records {
-        if {![validate_startpoint_record $from_rec]} {
+        set confirmed_from [pt_confirm_startpoint_record $from_rec $to_rec]
+        if {$confirmed_from eq ""} {
             trace_invalid_startpoint $from_rec $to_rec "RECURSIVE:[path_id_string [array get p]]" [join $p(top_ids) +] [join [concat $p(harden_ids) [list $h(id)]] +]
             add_review "" [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
             continue
         }
+        set from_rec $confirmed_from
         set cmd "$cmd_name $total"
         append cmd " -from [format_record_collection $from_rec]"
         foreach through_group [command_through_groups $summary_through_groups $from_rec $to_rec] {
@@ -3895,11 +3900,13 @@ proc stage2_delay::emit_graph_terminal_cmd {path} {
     set summary_through_groups [summary_through_groups_from_steps $summary_steps $to_rec $p(through_records)]
     set emitted_cmds {}
     foreach from_rec $start_records {
-        if {![validate_startpoint_record $from_rec]} {
+        set confirmed_from [pt_confirm_startpoint_record $from_rec $to_rec]
+        if {$confirmed_from eq ""} {
             trace_invalid_startpoint $from_rec $to_rec "TERMINAL:[path_id_string [array get p]]" [join $p(top_ids) +] [join $p(harden_ids) +]
             add_review "" "" "INVALID_STARTPOINT" "terminal generated -from object is not a legal startpoint"
             continue
         }
+        set from_rec $confirmed_from
         set cmd "$cmd_name $total"
         append cmd " -from [format_record_collection $from_rec]"
         foreach through_group [command_through_groups $summary_through_groups $from_rec $to_rec] {
@@ -4242,13 +4249,16 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
     set cmd ""
     if {$t(kind) eq "complete"} {
         set from_rec [lindex $t(from_records) 0]
-        if {![validate_startpoint_record $from_rec]} {
+        set confirmed_from [pt_confirm_startpoint_record $from_rec $to_rec]
+        if {$confirmed_from eq ""} {
             trace_invalid_startpoint $from_rec $to_rec "DIRECT" $t(id) $h(id)
             add_review [array get t] [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
             array unset t
             array unset h
             return ""
         }
+        set from_rec $confirmed_from
+        set t(from_records) [list $from_rec]
         if {![validate_endpoint_record $to_rec] && ![is_harden_boundary_output_record $to_rec]} {
             add_review [array get t] [array get h] "INVALID_ENDPOINT" "generated -to object is not a legal endpoint"
             array unset t
@@ -4281,11 +4291,13 @@ proc stage2_delay::emit_generated_delay_cmd {tseg hseg boundary} {
         } else {
             set emitted_cmds {}
             foreach from_rec $start_records {
-                if {![validate_startpoint_record $from_rec]} {
+                set confirmed_from [pt_confirm_startpoint_record $from_rec $to_rec]
+                if {$confirmed_from eq ""} {
                     trace_invalid_startpoint $from_rec $to_rec "OPEN_FROM" $t(id) $h(id)
                     add_review [array get t] [array get h] "INVALID_STARTPOINT" "generated -from object is not a legal startpoint"
                     continue
                 }
+                set from_rec $confirmed_from
                 set one_cmd "$cmd_name $total -from [format_record_collection $from_rec]"
                 foreach through_group [command_through_groups $direct_through_groups $from_rec $to_rec] {
                     append one_cmd " -through [format_through_record_group $through_group]"
@@ -4345,11 +4357,13 @@ proc stage2_delay::emit_residual_through_cmd {hseg boundary reason} {
     set residual_through_groups [segment_through_record_groups [array get h]]
     lappend residual_through_groups [list $boundary]
     foreach from_rec $start_records {
-        if {![validate_startpoint_record $from_rec]} {
+        set confirmed_from [pt_confirm_startpoint_record $from_rec $to_rec]
+        if {$confirmed_from eq ""} {
             trace_invalid_startpoint $from_rec $to_rec "RESIDUAL" "-" $h(id)
             add_review "" [array get h] "INVALID_STARTPOINT" "residual -from object is not a legal startpoint"
             continue
         }
+        set from_rec $confirmed_from
         set cmd "$cmd_name [format_delay $h(delay)] -from [format_record_collection $from_rec]"
         foreach through_group [command_through_groups $residual_through_groups $from_rec $to_rec] {
             append cmd " -through [format_through_record_group $through_group]"
@@ -4385,6 +4399,36 @@ proc stage2_delay::validate_startpoint_record {rec} {
     }
     array unset r
     return $ok
+}
+
+proc stage2_delay::pt_confirm_startpoint_record {rec endpoint} {
+    if {[validate_startpoint_record $rec]} {
+        return $rec
+    }
+
+    array set requested $rec
+    if {$requested(object_class) ni {pin port cell}} {
+        array unset requested
+        return ""
+    }
+    set requested_class $requested(object_class)
+    set requested_name $requested(full_name)
+    array unset requested
+
+    foreach inferred [pt_startpoints_to_boundary $endpoint] {
+        array set candidate $inferred
+        set same_object [expr {
+            $candidate(object_class) eq $requested_class &&
+            $candidate(full_name) eq $requested_name
+        }]
+        array unset candidate
+        if {$same_object} {
+            set confirmed [mark_pt_startpoint_record $rec]
+            trace_event STARTPOINT_PT_CONFIRMED "from={[record_debug $confirmed]} to={[record_debug $endpoint]}"
+            return $confirmed
+        }
+    }
+    return ""
 }
 
 proc stage2_delay::validate_endpoint_record {rec} {
