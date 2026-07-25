@@ -122,7 +122,7 @@ set ::STAGE2_TEXT_ENCODING utf-8
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.5"
+    variable VERSION "v0.9.6"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -152,6 +152,7 @@ namespace eval stage2_delay {
     variable object_attribute_cache
     variable owner_harden_cache
     variable startpoint_cache
+    variable startpoint_cache_status
     variable missing_harden_target_cache
     variable missing_top_target_cache
     variable parsed_command_segments
@@ -263,6 +264,7 @@ proc stage2_delay::reset_state {} {
     variable object_attribute_cache
     variable owner_harden_cache
     variable startpoint_cache
+    variable startpoint_cache_status
     variable missing_harden_target_cache
     variable missing_top_target_cache
     variable parsed_command_segments
@@ -346,6 +348,8 @@ proc stage2_delay::reset_state {} {
     array set owner_harden_cache {}
     array unset startpoint_cache
     array set startpoint_cache {}
+    array unset startpoint_cache_status
+    array set startpoint_cache_status {}
     array unset missing_harden_target_cache
     array set missing_harden_target_cache {}
     array unset missing_top_target_cache
@@ -2712,6 +2716,69 @@ proc stage2_delay::build_segment_indexes {} {
     }
 }
 
+proc stage2_delay::records_are_same_object {left right} {
+    array set l $left
+    array set r $right
+    set result [expr {$l(object_class) eq $r(object_class) && $l(full_name) eq $r(full_name)}]
+    array unset l
+    array unset r
+    return $result
+}
+
+proc stage2_delay::pt_is_clock_pin_record {rec} {
+    array set r $rec
+    set result 0
+    if {$r(object_class) eq "pin" && $r(direction) eq "in"} {
+        set result [truthy [pt_get_attr_by_name $r(object_class) $r(full_name) is_clock_pin]]
+    }
+    array unset r
+    return $result
+}
+
+proc stage2_delay::pt_startpoint_record_membership {endpoint rec} {
+    variable startpoint_cache_status
+    array set e $endpoint
+    set cache_key [list $e(object_class) $e(full_name)]
+    array unset e
+
+    set startpoints [pt_startpoints_to_boundary $endpoint]
+    if {![info exists startpoint_cache_status($cache_key)] ||
+        $startpoint_cache_status($cache_key) ni {startpoints_only fanin_fallback}} {
+        return unknown
+    }
+    foreach startpoint $startpoints {
+        if {[records_are_same_object $startpoint $rec]} {
+            return connected
+        }
+    }
+    return disconnected
+}
+
+proc stage2_delay::matrix_top_pair_has_no_pt_connectivity {tseg} {
+    array set t $tseg
+    set result 0
+    if {$t(source) eq "top" && $t(kind) eq "complete" && $t(split_total) > 1 &&
+        [llength $t(from_records)] == 1 && [llength $t(to_records)] == 1} {
+        set from_rec [lindex $t(from_records) 0]
+        set to_rec [lindex $t(to_records) 0]
+        if {[pt_is_clock_pin_record $from_rec]} {
+            set result [expr {[pt_startpoint_record_membership $to_rec $from_rec] eq "disconnected"}]
+        }
+    }
+    array unset t
+    return $result
+}
+
+proc stage2_delay::record_matrix_no_pt_connectivity_pair {tseg} {
+    array set t $tseg
+    set from_rec [lindex $t(from_records) 0]
+    set to_rec [lindex $t(to_records) 0]
+    set message "top_id=$t(id) original_id=$t(original_id) split=$t(split_index)/$t(split_total) from={[record_debug $from_rec]} to={[record_debug $to_rec]} action=skip_expanded_matrix_pair"
+    trace_event NO_PT_CONNECTIVITY_PAIR $message
+    add_report_item "NO_PT_CONNECTIVITY_PAIR top_id=$t(id) original_id=$t(original_id) from=[record_full_name $from_rec] to=[record_full_name $to_rec] action=skip_expanded_matrix_pair"
+    array unset t
+}
+
 proc stage2_delay::match_delay_graph_segments {} {
     variable options
     variable top_segments
@@ -2726,6 +2793,13 @@ proc stage2_delay::match_delay_graph_segments {} {
 
     foreach tseg $top_segments {
         array set t $tseg
+        if {[matrix_top_pair_has_no_pt_connectivity [array get t]]} {
+            record_matrix_no_pt_connectivity_pair [array get t]
+            consume_segment [array get t]
+            set used_top($t(id)) 1
+            array unset t
+            continue
+        }
         if {[llength $t(to_records)] == 1} {
             foreach path [paths_from_top_segment [array get t]] {
                 lappend queue $path
@@ -3611,6 +3685,7 @@ proc stage2_delay::pt_endpoint_fanout_records {start boundary_name label} {
 
 proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     variable startpoint_cache
+    variable startpoint_cache_status
     array set b $boundary
     set boundary_name $b(full_name)
     set boundary_class $b(object_class)
@@ -3626,6 +3701,7 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     if {[info commands all_fanin] eq "" || [info commands foreach_in_collection] eq "" || [info commands sizeof_collection] eq ""} {
         pt_trace "top startpoint inference skip boundary={$boundary_name} missing_command"
         set startpoint_cache($cache_key) {}
+        set startpoint_cache_status($cache_key) unavailable
         return {}
     }
 
@@ -3636,10 +3712,12 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     if {[info commands $getter] eq ""} {
         pt_trace "top startpoint inference skip boundary={$boundary_name} missing_getter=$getter"
         set startpoint_cache($cache_key) {}
+        set startpoint_cache_status($cache_key) unavailable
         return {}
     }
 
     set value {}
+    set query_status unknown
     pt_trace "$getter -quiet {$boundary_name}"
     if {[catch {
         set target [$getter -quiet $boundary_name]
@@ -3653,6 +3731,9 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
                 pt_trace "all_fanin startpoints_only failed boundary={$boundary_name} error={$err_startpoints}"
                 pt_trace "all_fanin -flat -to {$boundary_name}"
                 set fanin [all_fanin -flat -to $target]
+                set query_status fanin_fallback
+            } else {
+                set query_status startpoints_only
             }
             pt_trace "all_fanin top-open-from result boundary={$boundary_name} count=[sizeof_collection $fanin]"
             foreach_in_collection obj $fanin {
@@ -3666,10 +3747,12 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     } err]} {
         pt_trace "top startpoint inference failed boundary={$boundary_name} error={$err}"
         set startpoint_cache($cache_key) {}
+        set startpoint_cache_status($cache_key) failed
         return {}
     }
     set value [unique_records_by_name $value]
     set startpoint_cache($cache_key) $value
+    set startpoint_cache_status($cache_key) $query_status
     pt_trace "top startpoint inference summary boundary={$boundary_name} startpoint_count=[llength $value]"
     return $value
 }
@@ -4043,6 +4126,14 @@ proc stage2_delay::match_top_to_harden_segments {} {
                 array set t $tseg
                 set pair_key "$t(id)|$h(id)"
                 if {[info exists generated_pair($pair_key)]} {
+                    array unset t
+                    continue
+                }
+                if {[matrix_top_pair_has_no_pt_connectivity [array get t]]} {
+                    record_matrix_no_pt_connectivity_pair [array get t]
+                    consume_segment [array get t]
+                    set matched_top($t(id)) 1
+                    set matched_top_segment($t(id)) [array get t]
                     array unset t
                     continue
                 }
