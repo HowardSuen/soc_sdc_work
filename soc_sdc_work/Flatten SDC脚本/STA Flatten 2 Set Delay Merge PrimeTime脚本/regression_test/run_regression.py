@@ -348,6 +348,9 @@ def test_complete_complete_merge():
     assert_contains(result["removed"], "set_max_delay 2.0")
     assert_contains(result["removed"], "set_max_delay 5.0")
     assert_contains(result["report"], "Merged constraints              : 1")
+    assert_contains(result["review"], "Overall result    : PASS")
+    assert_contains(result["review"], "Highest severity  : NONE")
+    assert_contains(result["review"], "Total reviews     : 0")
     validate_static_sdc(result["out_sdc"])
     validate_static_sdc(result["final"])
 
@@ -378,6 +381,15 @@ proc all_fanin {args} {
     assert_text_contains(trace, "name=u_h0/async_i,direction=in,owner=u_h0")
     assert_text_contains(trace, "name=u_h0/u_reg/D,direction=in,owner=u_h0")
     assert_text_contains(trace, "BUILD_COMPLETE generated=0")
+    review = read_file(result["review"])
+    if review.index("[RUN_CONCLUSION]") > review.index("[DETAIL]"):
+        raise AssertionError("Review conclusion must precede review details")
+    assert_text_contains(review, "Overall result    : REVIEW_REQUIRED")
+    assert_text_contains(review, "Highest severity  : ERROR")
+    assert_text_contains(review, "[REASON_SUMMARY]")
+    assert_text_contains(review, "ERROR     INVALID_STARTPOINT")
+    assert_text_contains(review, "[DETAIL]")
+    assert_text_contains(review, "[ERROR] reason=INVALID_STARTPOINT")
 
 
 def test_pt_proven_input_clock_pin_is_accepted_as_startpoint():
