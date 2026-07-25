@@ -449,6 +449,93 @@ proc all_fanin {args} {
     validate_static_sdc(result["out_sdc"])
 
 
+def test_matrix_clock_pairs_skip_pt_disconnected_cross_pairs():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} {
+        return [list u_src_reg/CP]
+    }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} {
+        return [list u_src_reg_1/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "matrix_clock_pairs_skip_disconnected_cross_pairs",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            )
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = read_file(result["out_sdc"])
+    assert_text_contains(generated, "set_max_delay 7 -from [get_pins {u_src_reg/CP}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_text_contains(generated, "set_max_delay 8 -from [get_pins {u_src_reg_1/CP}] -through [get_pins {u_h1/cfg_i}] -to [get_pins {u_h1/u_reg/D}]")
+    if generated.count("set_max_delay ") != 2:
+        raise AssertionError("Expected only the two PT-connected matrix pairs:\n%s" % generated)
+    trace = read_file(result["trace"])
+    if trace.count("NO_PT_CONNECTIVITY_PAIR") != 2:
+        raise AssertionError("Expected two skipped cross pairs:\n%s" % trace)
+    if "INVALID_STARTPOINT" in trace:
+        raise AssertionError("Disconnected matrix pairs must not become INVALID_STARTPOINT:\n%s" % trace)
+    assert_not_contains(result["review"], "NO_HARDEN_SEGMENT_MATCHED")
+    assert_not_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
+    assert_contains(result["final"], "# STAGE2_CONSUMED CMD000001")
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_matrix_pair_query_failure_does_not_silently_skip():
+    prelude = r'''
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name eq "u_src_reg/CP"} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+'''
+    result = run_case(
+        "matrix_pair_query_failure_keeps_review",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h0/other_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    if "NO_PT_CONNECTIVITY_PAIR" in trace:
+        raise AssertionError("Unavailable PT query must not prove disconnection:\n%s" % trace)
+    assert_text_contains(trace, "INVALID_STARTPOINT")
+    assert_contains(result["final"], "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP]]")
+    assert_contains(result["review"], "INVALID_STARTPOINT")
+
+
 def test_top_open_from_infers_static_startpoint():
     prelude = r'''
 proc all_fanin {args} {
@@ -1708,6 +1795,8 @@ def main():
         test_live_trace_records_invalid_startpoint_object,
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
         test_recursive_pt_proven_input_clock_pin_is_accepted,
+        test_matrix_clock_pairs_skip_pt_disconnected_cross_pairs,
+        test_matrix_pair_query_failure_does_not_silently_skip,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
         test_object_metadata_batches_explicit_pin_list,

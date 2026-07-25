@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.5。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.6。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -249,6 +249,11 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
   候选 `-from` 不满足静态 direction 规则时，脚本仅在它被最终
   endpoint 的 `all_fanin -flat -startpoints_only` 精确返回时放行，并记录
   `STARTPOINT_PT_CONFIRMED`。普通组合逻辑 input pin 仍会进入 review。
+- v0.9.6 对多 object top delay 的矩阵展开 pair 增加 PT 连通性剪枝。
+  对 `direction=in` 且 PT `is_clock_pin=true` 的展开 `-from`，只有当它
+  存在于该 pair 原生 top `-to` boundary 的 startpoint 集合中才进入
+  E2E 递归。不连通的交叉 pair 记录为 `NO_PT_CONNECTIVITY_PAIR`，不进入
+  review，也不触碰 harden delay segment。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
   final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
@@ -447,6 +452,15 @@ max_delay_used/max_delay_total/max_delay_usage/missing_sdc_stages
 对象出现在最终 endpoint 的 PT `all_fanin -flat -startpoints_only` 结果中，
 才会被标记为 `pt_startpoint=true` 并写入最终 `-from`。确认成功会在
 `stage2_live.log` 中记录 `STARTPOINT_PT_CONFIRMED`。
+
+对于由多 object `-from` x `-to` 产生的矩阵 pair，v0.9.6 还会在进入
+递归前检查 clock-pin `-from` 是否为该 pair 原生 top boundary 的 PT
+startpoint。若不是，该 pair 在网表中没有实际 timing path，脚本会记录
+`NO_PT_CONNECTIVITY_PAIR` 并只消费该展开 top pair。其他连通 pair 继续生成
+E2E；harden segment 只在真正生成 E2E 时消费。
+若 boundary 对象不存在、PT 命令不可用或 `all_fanin` 查询报错，这不能证明
+pair 不连通；脚本会保留原有 `INVALID_STARTPOINT` / review 路径，不会
+静默消费该 pair。
 
 例如递归链：
 
@@ -847,8 +861,11 @@ python3 regression_test/run_regression.py
   诊断内容
 - PT 证明的 `direction=in` clock pin 可在 direct/recursive 发射路径中作为
   最终 `-from`，而未被 PT startpoint 集合返回的普通 input pin 仍被拒绝
+- 2x2 clock-pin/boundary 矩阵中只生成两条 PT 连通 E2E，两条交叉 pair
+  标记 `NO_PT_CONNECTIVITY_PAIR`，且最终 SDC 完整消费原始 list 命令
+- PT startpoint 查询不可用或失败时，不得把空结果当成不连通证据
 
-当前共 36 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 38 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
