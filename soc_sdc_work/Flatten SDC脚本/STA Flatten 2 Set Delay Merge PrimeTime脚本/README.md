@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.6。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.7。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -254,6 +254,9 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
   存在于该 pair 原生 top `-to` boundary 的 startpoint 集合中才进入
   E2E 递归。不连通的交叉 pair 记录为 `NO_PT_CONNECTIVITY_PAIR`，不进入
   review，也不触碰 harden delay segment。
+- v0.9.7 在 `unmerged_delay_review.rpt` 开头增加 run conclusion、最高严重度、
+  severity 统计、reason 类型统计和建议动作；逐条详情增加 `[ERROR]` / `[WARNING]` /
+  `[INFO]` 前缀。未知 reason 默认按 `WARNING` 展示，原始 key/value 字段保持不变。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
   final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
@@ -357,7 +360,8 @@ BUDGET_SEMANTICS_UNRESOLVED
 - `integration_delay_merge.rpt`：summary、成功 merge、residual、review 的详细记录。
 - `merged_delay_removed.sdc`：`replace` 模式下被 consume 的原始 top/harden
   delay 命令。
-- `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。
+- `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。文件开头包含
+  `[RUN_CONCLUSION]`、`[REASON_SUMMARY]` 和 `[REASON_ACTION]`，详情位于 `[DETAIL]`。
 - `stage2_live.log`：运行过程中实时更新的阶段、PT query、review 和关键对象诊断。
 - `delay_path_summary/`：delay 推导汇总 CSV bundle，包含 `00_index.csv`、
   `top.csv` 和每个 harden instance 一张 CSV。
@@ -376,6 +380,11 @@ generated_e2e_delay.sdc
 merged_delay_removed.sdc
 <TOP_SDC_basename>_flatten.sdc
 ```
+
+`unmerged_delay_review.rpt` 的整体结论规则：存在 `ERROR` 时为
+`REVIEW_REQUIRED`；只有 `WARNING` 时为 `PASS_WITH_WARNING`；没有 review 时为
+`PASS`。`NO_PT_CONNECTIVITY_PAIR` 是 PT 已证明无实际 timing path 的安全跳过项，
+只进入 `integration_delay_merge.rpt`，不计入 unmerged severity。
 
 长时间运行时可以在另一个 Linux terminal 中实时查看：
 
