@@ -1797,6 +1797,90 @@ proc all_fanout {args} {
     assert_not_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
 
 
+def test_clock_inventory_and_review_template_are_generated_without_active_groups():
+    prelude = r'''
+set ::PT_MOCK_CLOCKS {clk_b clk_a clk_a_div2}
+
+proc get_clocks {args} {
+    set pattern [lindex $args end]
+    if {$pattern eq "*"} {
+        return $::PT_MOCK_CLOCKS
+    }
+    if {$pattern in $::PT_MOCK_CLOCKS} {
+        return [list $pattern]
+    }
+    return {}
+}
+
+rename get_attribute stage2_clock_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "period"} {
+        if {$name eq "clk_a_div2"} { return 4.0 }
+        return 2.0
+    }
+    if {$attr eq "is_generated"} {
+        return [expr {$name eq "clk_a_div2"}]
+    }
+    if {$attr eq "master_clock" && $name eq "clk_a_div2"} {
+        return [list clk_a]
+    }
+    if {$attr eq "sources"} {
+        return [list ${name}_src]
+    }
+    return [stage2_clock_default_get_attribute $obj $attr]
+}
+
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} {
+        return "Report : clock_groups\nTotal logically exclusive groups: 0\nTotal asynchronous groups: 1\n-group {clk_a} -group {clk_b}"
+    }
+    return "Report : clock\nClock clk_a period 2.0\nClock clk_a_div2 period 4.0\nClock clk_b period 2.0"
+}
+'''
+    result = run_case(
+        "clock_inventory_and_review_template",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    case_dir = result["case_dir"]
+    inventory = os.path.join(case_dir, "top_clock_inventory.rpt")
+    groups = os.path.join(case_dir, "top_clock_groups_existing.rpt")
+    review_sdc = os.path.join(case_dir, "top_clock_groups_review.sdc")
+    for path in (inventory, groups, review_sdc):
+        assert_exists(path)
+    assert_contains(inventory, "clock_name=clk_a")
+    assert_contains(inventory, "clock_name=clk_a_div2")
+    assert_contains(inventory, "master_clock=clk_a")
+    assert_contains(groups, "Total asynchronous groups: 1")
+    review = read_file(review_sdc)
+    if "REVIEW ONLY" not in review:
+        raise AssertionError("Expected review-only marker:\n%s" % review)
+    if "# set_clock_groups -asynchronous" not in review:
+        raise AssertionError("Expected commented clock group template:\n%s" % review)
+    if re.search(r"(?m)^(?!#).*set_clock_groups", review):
+        raise AssertionError("Clock review SDC must not contain active set_clock_groups:\n%s" % review)
+    assert_contains(result["report"], "Clock review enabled            : true")
+    assert_contains(result["report"], "Active clock groups added       : 0")
+    assert_not_contains(result["final"], "set_clock_groups")
+
+
+def test_clock_review_can_be_disabled():
+    result = run_case(
+        "clock_review_disabled",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-generate_clock_group_review", "false"],
+    )
+    require_ok(result)
+    for name in ("top_clock_inventory.rpt", "top_clock_groups_existing.rpt", "top_clock_groups_review.sdc"):
+        if os.path.exists(os.path.join(result["case_dir"], name)):
+            raise AssertionError("Clock output should not exist when review is disabled: %s" % name)
+    assert_contains(result["report"], "Clock review enabled            : false")
+
+
 def main():
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
@@ -1840,6 +1924,8 @@ def main():
         test_harden_input_to_output_boundary_merges,
         test_harden_feedthrough_missing_upstream_top_uses_pt_startpoint,
         test_harden_feedthrough_to_top_output_terminal,
+        test_clock_inventory_and_review_template_are_generated_without_active_groups,
+        test_clock_review_can_be_disabled,
     ]
     for test in tests:
         test()

@@ -119,10 +119,17 @@ set ::WRITE_PATH_SUMMARY true
 # in GBK/GB2312 and look garbled, override this before source.
 set ::STAGE2_TEXT_ENCODING utf-8
 
+# Clock review outputs.  The generated set_clock_groups template is commented
+# by default and is never appended to the final flatten SDC automatically.
+set ::GENERATE_CLOCK_GROUP_REVIEW true
+set ::OUT_CLOCK_INVENTORY ""
+set ::OUT_CLOCK_GROUPS_REPORT ""
+set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
+
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.7"
+    variable VERSION "v0.9.8"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -197,6 +204,10 @@ namespace eval stage2_delay {
         -verbose_pt_query "true"
         -write_path_summary "true"
         -text_encoding "utf-8"
+        -generate_clock_group_review "true"
+        -out_clock_inventory ""
+        -out_clock_groups_report ""
+        -out_clock_group_review_sdc ""
     }
     set live_trace_handle ""
 }
@@ -417,6 +428,13 @@ proc stage2_delay::build {args} {
         match_top_to_harden_segments
     }
     trace_event PHASE "write_outputs"
+    if {[truthy $options(-generate_clock_group_review)]} {
+        trace_event PHASE "write_clock_group_review"
+        write_clock_group_outputs \
+            $options(-out_clock_inventory) \
+            $options(-out_clock_groups_report) \
+            $options(-out_clock_group_review_sdc)
+    }
     write_e2e_sdc $options(-out_e2e_sdc)
     write_removed_sdc $options(-out_removed_sdc)
     write_review_report $options(-out_review_rpt)
@@ -519,6 +537,17 @@ proc stage2_delay::apply_derived_options {} {
     if {$options(-out_trace_file) eq ""} {
         set out_dir [file dirname [file normalize $options(-out_report)]]
         set options(-out_trace_file) [file join $out_dir stage2_live.log]
+    }
+    set out_dir [file dirname [file normalize $options(-out_report)]]
+    set top_name [top_name_from_sdc_path $options(-top_sdc)]
+    if {$options(-out_clock_inventory) eq ""} {
+        set options(-out_clock_inventory) [file join $out_dir "${top_name}_clock_inventory.rpt"]
+    }
+    if {$options(-out_clock_groups_report) eq ""} {
+        set options(-out_clock_groups_report) [file join $out_dir "${top_name}_clock_groups_existing.rpt"]
+    }
+    if {$options(-out_clock_group_review_sdc) eq ""} {
+        set options(-out_clock_group_review_sdc) [file join $out_dir "${top_name}_clock_groups_review.sdc"]
     }
 }
 
@@ -4834,6 +4863,196 @@ proc stage2_delay::add_report_item {text} {
     lappend report_items $text
 }
 
+proc stage2_delay::clock_object_names {} {
+    if {[info commands get_clocks] eq ""} {
+        pt_trace "get_clocks unavailable; clock review outputs will be empty"
+        return {}
+    }
+    pt_trace "get_clocks -quiet *"
+    if {[catch {set clocks [get_clocks -quiet *]} err]} {
+        pt_trace "get_clocks failed error={$err}"
+        return {}
+    }
+    set names {}
+    if {[info commands foreach_in_collection] ne ""} {
+        foreach_in_collection clock $clocks {
+            set name [collection_object_name $clock]
+            if {$name ne ""} {
+                lappend names $name
+            }
+        }
+    } else {
+        foreach clock $clocks {
+            set name [collection_object_name $clock]
+            if {$name ne ""} {
+                lappend names $name
+            }
+        }
+    }
+    set names [lsort -dictionary -unique $names]
+    pt_trace "get_clocks result count=[llength $names]"
+    return $names
+}
+
+proc stage2_delay::clock_attribute_text {clock_name attribute {default "-"}} {
+    if {[info commands get_clocks] eq "" || [info commands get_attribute] eq ""} {
+        return $default
+    }
+    if {[catch {set clock [get_clocks -quiet $clock_name]}] || $clock eq ""} {
+        return $default
+    }
+    if {[catch {set value [get_attribute $clock $attribute]}] || $value eq ""} {
+        return $default
+    }
+    return $value
+}
+
+proc stage2_delay::clock_attribute_object_names {clock_name attributes} {
+    if {[info commands get_clocks] eq "" || [info commands get_attribute] eq ""} {
+        return "-"
+    }
+    if {[catch {set clock [get_clocks -quiet $clock_name]}] || $clock eq ""} {
+        return "-"
+    }
+    foreach attribute $attributes {
+        if {[catch {set value [get_attribute $clock $attribute]}] || $value eq ""} {
+            continue
+        }
+        if {[info commands get_object_name] ne ""} {
+            if {![catch {set names [get_object_name $value]}] && $names ne ""} {
+                return [join $names ","]
+            }
+        }
+        return [join $value ","]
+    }
+    return "-"
+}
+
+proc stage2_delay::capture_pt_report {command temp_path} {
+    catch {file delete -force $temp_path}
+    set error_text ""
+    if {[info commands redirect] ne ""} {
+        pt_trace "redirect -file {$temp_path} {$command}"
+        if {[catch {redirect -file $temp_path $command} err]} {
+            set error_text $err
+            pt_trace "PT report redirect failed command={$command} error={$err}"
+        } elseif {[file exists $temp_path]} {
+            set fin [open_text $temp_path r]
+            set text [read $fin]
+            close $fin
+            catch {file delete -force $temp_path}
+            return $text
+        }
+    }
+    set report_command [lindex $command 0]
+    if {[info commands $report_command] ne ""} {
+        pt_trace "fallback direct PT report command={$command}"
+        if {![catch {set text [uplevel #0 $command]} err] && $text ne ""} {
+            return $text
+        }
+        if {$error_text eq "" && [info exists err]} {
+            set error_text $err
+        }
+    }
+    if {$error_text eq ""} {
+        set error_text "command unavailable or returned no capturable text"
+    }
+    return "# PT report unavailable: $error_text"
+}
+
+proc stage2_delay::write_clock_inventory_report {path clock_names raw_report} {
+    set fout [open_text $path w]
+    write_author_banner $fout
+    puts $fout ""
+    puts $fout "# Clock inventory generated by run_stage2_merge_delay.tcl"
+    puts $fout "# Current PT design: [current_scope_name]"
+    puts $fout "# Clock count      : [llength $clock_names]"
+    puts $fout ""
+    puts $fout "\[CLOCK_INVENTORY\]"
+    if {[llength $clock_names] == 0} {
+        puts $fout "No clocks found in the linked PrimeTime design."
+    } else {
+        foreach clock_name $clock_names {
+            set period [clock_attribute_text $clock_name period]
+            set is_generated [clock_attribute_text $clock_name is_generated]
+            set master_clock [clock_attribute_object_names $clock_name {master_clock master}]
+            set sources [clock_attribute_object_names $clock_name {sources source}]
+            puts $fout [join_kv [list \
+                clock_name $clock_name \
+                period $period \
+                is_generated $is_generated \
+                master_clock $master_clock \
+                sources $sources]]
+        }
+    }
+    puts $fout ""
+    puts $fout "\[REPORT_CLOCK_RAW\]"
+    puts $fout $raw_report
+    close $fout
+}
+
+proc stage2_delay::write_existing_clock_groups_report {path raw_report} {
+    set fout [open_text $path w]
+    write_author_banner $fout
+    puts $fout ""
+    puts $fout "# Existing PrimeTime clock groups generated by report_clock -groups"
+    puts $fout "# Current PT design: [current_scope_name]"
+    puts $fout ""
+    puts $fout $raw_report
+    close $fout
+}
+
+proc stage2_delay::write_clock_group_review_sdc {path clock_names inventory_path groups_path} {
+    set fout [open_text $path w]
+    write_author_banner $fout "# "
+    puts $fout "#"
+    puts $fout "# Clock-group review template generated by run_stage2_merge_delay.tcl"
+    puts $fout "# Clock inventory       : $inventory_path"
+    puts $fout "# Existing groups report: $groups_path"
+    puts $fout "#"
+    puts $fout "# REVIEW ONLY: every command in this file is commented out."
+    puts $fout "# Stage 2 does not source this file and does not append it to the final flatten SDC."
+    puts $fout "# One clock per group makes every group asynchronous to every other group."
+    puts $fout "# Merge clocks that are synchronous or share intentional timing relationships before enabling."
+    puts $fout ""
+    puts $fout "# Detected clocks: [llength $clock_names]"
+    foreach clock_name $clock_names {
+        puts $fout "#   $clock_name"
+    }
+    puts $fout ""
+    if {[llength $clock_names] < 2} {
+        puts $fout "# No set_clock_groups proposal generated because fewer than two clocks were found."
+        close $fout
+        return
+    }
+    puts $fout "# Proposed manual-review template:"
+    puts $fout "# set_clock_groups -asynchronous \\"
+    set last_idx [expr {[llength $clock_names] - 1}]
+    for {set idx 0} {$idx <= $last_idx} {incr idx} {
+        set clock_name [lindex $clock_names $idx]
+        set suffix " \\"
+        if {$idx == $last_idx} {
+            set suffix ""
+        }
+        puts $fout "#     -group \[get_clocks [brace_name $clock_name]\]$suffix"
+    }
+    close $fout
+}
+
+proc stage2_delay::write_clock_group_outputs {inventory_path groups_path review_sdc_path} {
+    set clock_names [clock_object_names]
+    set temp_dir [file dirname [file normalize $inventory_path]]
+    if {![file isdirectory $temp_dir]} {
+        file mkdir $temp_dir
+    }
+    set raw_clock [capture_pt_report [list report_clock] [file join $temp_dir .stage2_report_clock.tmp]]
+    set raw_groups [capture_pt_report [list report_clock -groups] [file join $temp_dir .stage2_report_clock_groups.tmp]]
+    write_clock_inventory_report $inventory_path $clock_names $raw_clock
+    write_existing_clock_groups_report $groups_path $raw_groups
+    write_clock_group_review_sdc $review_sdc_path $clock_names $inventory_path $groups_path
+    trace_event CLOCK_REVIEW "clocks=[llength $clock_names] inventory={$inventory_path} existing_groups={$groups_path} review_sdc={$review_sdc_path} active_constraints_added=0"
+}
+
 proc stage2_delay::write_e2e_sdc {path} {
     variable VERSION
     variable TOOL_NAME
@@ -5002,6 +5221,11 @@ proc stage2_delay::write_report {path} {
     puts $fout "Final flatten SDC               : $options(-out_final_sdc)"
     puts $fout "Path summary dir                : $options(-out_summary_dir)"
     puts $fout "Live trace file                 : $options(-out_trace_file)"
+    puts $fout "Clock review enabled            : $options(-generate_clock_group_review)"
+    puts $fout "Clock inventory report          : $options(-out_clock_inventory)"
+    puts $fout "Existing clock groups report    : $options(-out_clock_groups_report)"
+    puts $fout "Clock groups review SDC         : $options(-out_clock_group_review_sdc)"
+    puts $fout "Active clock groups added       : 0"
     puts $fout "Write path summary              : $options(-write_path_summary)"
     puts $fout "Total top merge candidates      : [llength $top_segments]"
     puts $fout "Total top chain candidates      : [llength $chain_top_segments]"
@@ -5813,6 +6037,10 @@ proc stage2_delay::run_from_user_settings {} {
     set out_final_sdc [file normalize [global_setting OUT_FINAL_SDC [file join $out_dir ${top_module}_flatten.sdc]]]
     set out_summary_dir [file normalize [global_setting OUT_SUMMARY_DIR [file join $out_dir delay_path_summary]]]
     set out_trace_file [file normalize [global_setting STAGE2_TRACE_FILE [file join $out_dir stage2_live.log]]]
+    set generate_clock_group_review [global_setting GENERATE_CLOCK_GROUP_REVIEW true]
+    set out_clock_inventory [file normalize [global_setting OUT_CLOCK_INVENTORY [file join $out_dir ${top_module}_clock_inventory.rpt]]]
+    set out_clock_groups_report [file normalize [global_setting OUT_CLOCK_GROUPS_REPORT [file join $out_dir ${top_module}_clock_groups_existing.rpt]]]
+    set out_clock_group_review_sdc [file normalize [global_setting OUT_CLOCK_GROUP_REVIEW_SDC [file join $out_dir ${top_module}_clock_groups_review.sdc]]]
 
     set merge_mode [global_setting MERGE_MODE replace]
     set partial_merge_policy [global_setting PARTIAL_MERGE_POLICY residual_through]
@@ -5851,6 +6079,10 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting OUT_FINAL_SDC $out_final_sdc
     set_global_setting OUT_SUMMARY_DIR $out_summary_dir
     set_global_setting STAGE2_TRACE_FILE $out_trace_file
+    set_global_setting GENERATE_CLOCK_GROUP_REVIEW $generate_clock_group_review
+    set_global_setting OUT_CLOCK_INVENTORY $out_clock_inventory
+    set_global_setting OUT_CLOCK_GROUPS_REPORT $out_clock_groups_report
+    set_global_setting OUT_CLOCK_GROUP_REVIEW_SDC $out_clock_group_review_sdc
     set_global_setting TOP_MODULE_NAME $top_module
     set_global_setting TOP_OPEN_FROM_MODE $top_open_from_mode
     set_global_setting TOP_PORT_BOUNDARY_MAP_MODE $top_port_boundary_map_mode
@@ -5871,6 +6103,10 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Final flatten SDC   : $out_final_sdc"
     puts "INFO: Path summary dir    : $out_summary_dir"
     puts "INFO: Live trace file     : $out_trace_file"
+    puts "INFO: Clock review        : $generate_clock_group_review"
+    puts "INFO: Clock inventory     : $out_clock_inventory"
+    puts "INFO: Existing clock grps : $out_clock_groups_report"
+    puts "INFO: Clock review SDC    : $out_clock_group_review_sdc"
     puts "INFO: Write path summary  : $write_path_summary"
     puts "INFO: Merge mode          : $merge_mode"
     puts "INFO: Top open_from mode  : $top_open_from_mode"
@@ -5891,6 +6127,10 @@ proc stage2_delay::run_from_user_settings {} {
         -out_final_sdc $out_final_sdc \
         -out_summary_dir $out_summary_dir \
         -out_trace_file $out_trace_file \
+        -generate_clock_group_review $generate_clock_group_review \
+        -out_clock_inventory $out_clock_inventory \
+        -out_clock_groups_report $out_clock_groups_report \
+        -out_clock_group_review_sdc $out_clock_group_review_sdc \
         -merge_mode $merge_mode \
         -partial_merge_policy $partial_merge_policy \
         -unmatched_harden_policy $unmatched_harden_policy \
@@ -5914,6 +6154,9 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Removed constraints : $out_removed_sdc"
     puts "INFO: Review report       : $out_review_rpt"
     puts "INFO: Final flatten SDC   : $out_final_sdc"
+    puts "INFO: Clock inventory     : $out_clock_inventory"
+    puts "INFO: Existing clock grps : $out_clock_groups_report"
+    puts "INFO: Clock review SDC    : $out_clock_group_review_sdc"
     puts "INFO: Open-to optimization: [stage2_delay::open_to_stats_summary]"
     puts "INFO: Performance stats   : [stage2_delay::performance_stats_summary]"
     if {[truthy $write_path_summary]} {

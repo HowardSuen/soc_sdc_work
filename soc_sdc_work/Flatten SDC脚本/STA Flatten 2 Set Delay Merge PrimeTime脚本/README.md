@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.7。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.8。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -90,6 +90,16 @@ set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
 set ::OUT_SUMMARY_DIR [file join $::OUT_DIR delay_path_summary]
 set ::STAGE2_TEXT_ENCODING utf-8
+set ::GENERATE_CLOCK_GROUP_REVIEW true
+set ::OUT_CLOCK_INVENTORY [file join $::OUT_DIR <top>_clock_inventory.rpt]
+set ::OUT_CLOCK_GROUPS_REPORT [file join $::OUT_DIR <top>_clock_groups_existing.rpt]
+set ::OUT_CLOCK_GROUP_REVIEW_SDC [file join $::OUT_DIR <top>_clock_groups_review.sdc]
+```
+
+如果暂时不需要 clock review 输出，可以关闭：
+
+```tcl
+set ::GENERATE_CLOCK_GROUP_REVIEW false
 ```
 
 如果只是想把主脚本当 proc library 使用，source 前关闭 auto-run：
@@ -363,6 +373,13 @@ BUDGET_SEMANTICS_UNRESOLVED
 - `unmerged_delay_review.rpt`：不能自动 merge、需要人工 review 的约束。文件开头包含
   `[RUN_CONCLUSION]`、`[REASON_SUMMARY]` 和 `[REASON_ACTION]`，详情位于 `[DETAIL]`。
 - `stage2_live.log`：运行过程中实时更新的阶段、PT query、review 和关键对象诊断。
+- `<top>_clock_inventory.rpt`：通过 `get_clocks -quiet *` 收集的 clock 清单，包含
+  名称、period、generated 属性、master clock 和 source。PT 不支持的可选属性显示为 `-`。
+- `<top>_clock_groups_existing.rpt`：当前 PT 数据库中 `report_clock -groups` 的原始结果，
+  记录已经加载的 asynchronous、logically exclusive 和 physically exclusive group。
+- `<top>_clock_groups_review.sdc`：全部 clock 按“一 clock 一 group”生成的**注释模板**，
+  只供人工 review。脚本不会 source 该文件，也不会把 active `set_clock_groups` 写入最终
+  flatten SDC。
 - `delay_path_summary/`：delay 推导汇总 CSV bundle，包含 `00_index.csv`、
   `top.csv` 和每个 harden instance 一张 CSV。
 - `<TOP_SDC_basename>_flatten.sdc`：最终单文件 SDC，包含 top 剩余约束、Stage 2
@@ -819,6 +836,7 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -batch_open_to_query true
 -verbose_pt_query true
 -write_path_summary true
+-generate_clock_group_review true
 -max_endpoints 1000
 -max_enum_objects 64
 ```
@@ -873,8 +891,11 @@ python3 regression_test/run_regression.py
 - 2x2 clock-pin/boundary 矩阵中只生成两条 PT 连通 E2E，两条交叉 pair
   标记 `NO_PT_CONNECTIVITY_PAIR`，且最终 SDC 完整消费原始 list 命令
 - PT startpoint 查询不可用或失败时，不得把空结果当成不连通证据
+- `report_clock` / `report_clock -groups` 的 clock inventory、现有 group 原始报告和
+  注释 review SDC 模板；验证 review 模板不含 active `set_clock_groups`，且最终 flatten
+  SDC 不被 clock review 功能修改
 
-当前共 38 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 40 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -885,3 +906,13 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.8 Clock Review
+
+- Stage 2 在当前 linked PT design 中执行 `get_clocks -quiet *`，收集所有 clock 的名称和可用 metadata。
+- Stage 2 执行 `report_clock` 和 `report_clock -groups`，分别保存 clock 原始报告和当前已经生效的 clock group 报告。
+- `report_clock -groups` 只反映已经由 SDC 声明并加载到 PT 的 group，不代表 PT 自动证明了所有 clock 的设计意图。
+- Stage 2 可以按每个 clock 一个 group 输出 review 模板，但默认全部加注释。这类模板不能直接使用，因为它会把每个 clock 与其他 clock 都视为异步，可能错误切断 generated/master clock 之间的同步路径。
+- 人工 review 时，应将同步 clock、同一 master clock 派生的 clock 或有明确 timing 关系的 clock 合并到同一 group；逻辑互斥和物理互斥必须依据设计意图确认。
+- Stage 2 不自动修改已有 clock group，不自动推断异步关系，不把任何 active `set_clock_groups` 追加到 `<top>_flatten.sdc`。
+- `integration_delay_merge.rpt` 会记录 clock review 输出路径和 `Active clock groups added : 0`，用于确认该功能没有改变 delay merge 结果。
