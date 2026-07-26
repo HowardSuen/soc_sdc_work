@@ -894,8 +894,11 @@ python3 regression_test/run_regression.py
 - `report_clock` / `report_clock -groups` 的 clock inventory、现有 group 原始报告和
   注释 review SDC 模板；验证 review 模板不含 active `set_clock_groups`，且最终 flatten
   SDC 不被 clock review 功能修改
+- 128-clock 大集合完整性与稳定排序、generated/master clock metadata、特殊 clock 名、
+  asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
+  optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 40 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 45 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 

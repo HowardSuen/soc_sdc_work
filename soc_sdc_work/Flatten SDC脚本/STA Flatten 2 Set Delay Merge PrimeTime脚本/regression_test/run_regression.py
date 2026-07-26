@@ -1881,6 +1881,261 @@ def test_clock_review_can_be_disabled():
     assert_contains(result["report"], "Clock review enabled            : false")
 
 
+def test_clock_review_complex_generated_groups_and_redirect_capture():
+    prelude = r'''
+set ::PT_MOCK_CLOCKS [list clk_z {u_pll/clk_out} {clk_bus[0]} clk_root clk_root_div2 clk_root_div4 scan_clk test_clk]
+
+proc get_clocks {args} {
+    set pattern [lindex $args end]
+    if {$pattern eq "*"} {
+        return $::PT_MOCK_CLOCKS
+    }
+    if {[lsearch -exact $::PT_MOCK_CLOCKS $pattern] >= 0} {
+        return [list $pattern]
+    }
+    return {}
+}
+
+rename get_attribute stage2_complex_clock_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "period"} {
+        array set periods {
+            clk_z 10.0
+            u_pll/clk_out 1.25
+            {clk_bus[0]} 5.0
+            clk_root 2.0
+            clk_root_div2 4.0
+            clk_root_div4 8.0
+            scan_clk 20.0
+            test_clk 25.0
+        }
+        return $periods($name)
+    }
+    if {$attr eq "is_generated"} {
+        return [expr {$name in {u_pll/clk_out clk_root_div2 clk_root_div4}}]
+    }
+    if {$attr eq "master_clock"} {
+        if {$name in {clk_root_div2 clk_root_div4}} { return [list clk_root] }
+        if {$name eq "u_pll/clk_out"} { return [list ref_clk] }
+        return ""
+    }
+    if {$attr eq "sources"} {
+        if {$name eq "clk_root"} { return [list top/clk_i top/clk_mux/Z] }
+        return [list ${name}_source]
+    }
+    return [stage2_complex_clock_default_get_attribute $obj $attr]
+}
+
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} {
+        return "Report : clock_groups\nTotal logically exclusive groups: 1\nNAME : func_test_mux\n-group {clk_root clk_root_div2 clk_root_div4}\n-group {test_clk}\nTotal asynchronous groups: 2\nNAME : async_scan_func (allow_paths: true)\n-group {scan_clk}\n-group {clk_root}\nTotal physically exclusive groups: 1\n-group {u_pll/clk_out}\n-group {clk_z}"
+    }
+    return "Report : clock\nClock count: 8\nGenerated clocks: u_pll/clk_out clk_root_div2 clk_root_div4"
+}
+
+proc redirect {args} {
+    set file_idx [lsearch -exact $args "-file"]
+    if {$file_idx < 0} { error "missing -file" }
+    set path [lindex $args [expr {$file_idx + 1}]]
+    set command [lindex $args end]
+    set text [uplevel #0 $command]
+    set fout [open $path w]
+    puts -nonewline $fout $text
+    close $fout
+}
+'''
+    result = run_case(
+        "clock_review_complex_generated_groups_redirect",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    inventory = os.path.join(result["case_dir"], "top_clock_inventory.rpt")
+    groups = os.path.join(result["case_dir"], "top_clock_groups_existing.rpt")
+    review_sdc = os.path.join(result["case_dir"], "top_clock_groups_review.sdc")
+    assert_contains(inventory, "Clock count      : 8")
+    assert_contains(inventory, "clock_name=clk_root_div4 period=8.0 is_generated=1 master_clock=clk_root")
+    assert_contains(inventory, "clock_name=u_pll/clk_out period=1.25 is_generated=1 master_clock=ref_clk")
+    assert_contains(inventory, "sources=top/clk_i,top/clk_mux/Z")
+    assert_contains(inventory, "Generated clocks: u_pll/clk_out clk_root_div2 clk_root_div4")
+    assert_contains(groups, "Total logically exclusive groups: 1")
+    assert_contains(groups, "Total asynchronous groups: 2")
+    assert_contains(groups, "Total physically exclusive groups: 1")
+    assert_contains(groups, "allow_paths: true")
+    review = read_file(review_sdc)
+    if review.count("#     -group [get_clocks ") != 8:
+        raise AssertionError("Expected one commented group per clock:\n%s" % review)
+    expected_order = ["clk_bus[0]", "clk_root", "clk_root_div2", "clk_root_div4", "clk_z", "scan_clk", "test_clk", "u_pll/clk_out"]
+    offsets = [review.index("[get_clocks {%s}]" % name) for name in expected_order]
+    if offsets != sorted(offsets):
+        raise AssertionError("Clock template is not dictionary-sorted:\n%s" % review)
+    if re.search(r"(?m)^(?!#).*set_clock_groups", review):
+        raise AssertionError("Complex review emitted an active clock group:\n%s" % review)
+    assert_contains(result["trace"], "redirect -file")
+    assert_not_contains(result["final"], "set_clock_groups")
+
+
+def test_clock_review_optional_attributes_unsupported_is_nonfatal():
+    prelude = r'''
+set ::PT_MOCK_CLOCKS {clk_a clk_b}
+
+proc get_clocks {args} {
+    set pattern [lindex $args end]
+    if {$pattern eq "*"} { return $::PT_MOCK_CLOCKS }
+    if {[lsearch -exact $::PT_MOCK_CLOCKS $pattern] >= 0} { return [list $pattern] }
+    return {}
+}
+
+rename get_attribute stage2_unsupported_clock_default_get_attribute
+proc get_attribute {obj attr} {
+    if {$attr in {period is_generated master_clock master sources source}} {
+        error "attribute $attr is unavailable in this PT version"
+    }
+    return [stage2_unsupported_clock_default_get_attribute $obj $attr]
+}
+
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} { return "Report : clock_groups\nTotal asynchronous groups: 0" }
+    return "Report : clock\nclk_a clk_b"
+}
+'''
+    result = run_case(
+        "clock_review_optional_attributes_unsupported",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    inventory = os.path.join(result["case_dir"], "top_clock_inventory.rpt")
+    assert_contains(inventory, "clock_name=clk_a period=- is_generated=- master_clock=- sources=-")
+    assert_contains(inventory, "clock_name=clk_b period=- is_generated=- master_clock=- sources=-")
+    assert_contains(os.path.join(result["case_dir"], "top_clock_groups_existing.rpt"), "Total asynchronous groups: 0")
+    assert_not_contains(result["final"], "set_clock_groups")
+
+
+def test_clock_review_zero_and_single_clock_boundaries_are_safe():
+    zero_prelude = r'''
+proc get_clocks {args} { return {} }
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} { return "Report : clock_groups\nNo clock groups." }
+    return "Report : clock\nNo clocks."
+}
+'''
+    zero = run_case(
+        "clock_review_zero_clocks",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=zero_prelude,
+    )
+    require_ok(zero)
+    zero_inventory = os.path.join(zero["case_dir"], "top_clock_inventory.rpt")
+    zero_review = os.path.join(zero["case_dir"], "top_clock_groups_review.sdc")
+    assert_contains(zero_inventory, "Clock count      : 0")
+    assert_contains(zero_inventory, "No clocks found in the linked PrimeTime design.")
+    assert_contains(zero_review, "fewer than two clocks")
+    assert_not_contains(zero_review, "# set_clock_groups -asynchronous")
+
+    one_prelude = r'''
+proc get_clocks {args} {
+    set pattern [lindex $args end]
+    if {$pattern eq "*" || $pattern eq "only_clk"} { return [list only_clk] }
+    return {}
+}
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} { return "Report : clock_groups\nNo clock groups." }
+    return "Report : clock\nClock only_clk"
+}
+'''
+    one = run_case(
+        "clock_review_single_clock",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=one_prelude,
+    )
+    require_ok(one)
+    one_review = os.path.join(one["case_dir"], "top_clock_groups_review.sdc")
+    assert_contains(os.path.join(one["case_dir"], "top_clock_inventory.rpt"), "Clock count      : 1")
+    assert_contains(one_review, "#   only_clk")
+    assert_contains(one_review, "fewer than two clocks")
+    assert_not_contains(one_review, "# set_clock_groups -asynchronous")
+
+
+def test_clock_review_large_clock_set_is_complete_and_deterministic():
+    prelude = r'''
+set ::PT_MOCK_CLOCKS {}
+for {set idx 127} {$idx >= 0} {incr idx -1} {
+    lappend ::PT_MOCK_CLOCKS [format "clk_%03d" $idx]
+}
+
+proc get_clocks {args} {
+    set pattern [lindex $args end]
+    if {$pattern eq "*"} { return $::PT_MOCK_CLOCKS }
+    if {[lsearch -exact $::PT_MOCK_CLOCKS $pattern] >= 0} { return [list $pattern] }
+    return {}
+}
+
+rename get_attribute stage2_large_clock_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "period"} { return 2.5 }
+    if {$attr eq "is_generated"} { return false }
+    if {$attr eq "sources"} { return [list ${name}_src] }
+    return [stage2_large_clock_default_get_attribute $obj $attr]
+}
+
+proc report_clock {args} {
+    if {[lsearch -exact $args "-groups"] >= 0} { return "Report : clock_groups\nTotal asynchronous groups: 0" }
+    return "Report : clock\nClock count: 128"
+}
+'''
+    result = run_case(
+        "clock_review_large_128_clock_set",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    inventory = read_file(os.path.join(result["case_dir"], "top_clock_inventory.rpt"))
+    review = read_file(os.path.join(result["case_dir"], "top_clock_groups_review.sdc"))
+    if inventory.count("clock_name=clk_") != 128:
+        raise AssertionError("Large inventory did not preserve all clocks")
+    if review.count("#     -group [get_clocks {clk_") != 128:
+        raise AssertionError("Large review did not preserve all singleton groups")
+    if review.index("[get_clocks {clk_000}]") > review.index("[get_clocks {clk_127}]"):
+        raise AssertionError("Large review clock order is unstable")
+    if re.search(r"(?m)^(?!#).*set_clock_groups", review):
+        raise AssertionError("Large review emitted an active clock group")
+    assert_not_contains(result["final"], "set_clock_groups")
+
+
+def test_clock_review_disabled_performs_zero_clock_queries():
+    prelude = r'''
+set ::CLOCK_GET_CALLS 0
+set ::CLOCK_REPORT_CALLS 0
+proc get_clocks {args} {
+    incr ::CLOCK_GET_CALLS
+    return [list should_not_be_queried]
+}
+proc report_clock {args} {
+    incr ::CLOCK_REPORT_CALLS
+    return "should not be queried"
+}
+'''
+    result = run_case(
+        "clock_review_disabled_zero_queries",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-generate_clock_group_review", "false"],
+        prelude=prelude,
+        post_build_tcl='puts "CLOCK_QUERY_COUNTS get=$::CLOCK_GET_CALLS report=$::CLOCK_REPORT_CALLS"',
+    )
+    require_ok(result)
+    assert_text_contains(result["stdout"], "CLOCK_QUERY_COUNTS get=0 report=0")
+    assert_contains(result["report"], "Clock review enabled            : false")
+
+
 def main():
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
@@ -1926,6 +2181,11 @@ def main():
         test_harden_feedthrough_to_top_output_terminal,
         test_clock_inventory_and_review_template_are_generated_without_active_groups,
         test_clock_review_can_be_disabled,
+        test_clock_review_complex_generated_groups_and_redirect_capture,
+        test_clock_review_optional_attributes_unsupported_is_nonfatal,
+        test_clock_review_zero_and_single_clock_boundaries_are_safe,
+        test_clock_review_large_clock_set_is_complete_and_deterministic,
+        test_clock_review_disabled_performs_zero_clock_queries,
     ]
     for test in tests:
         test()
