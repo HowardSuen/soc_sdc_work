@@ -556,6 +556,308 @@ proc get_attribute {obj attr} {
     assert_contains(result["review"], "INVALID_STARTPOINT")
 
 
+def test_structural_passthrough_skips_getters_and_matrix_expansion():
+    top_from = get_pins_list("u_h0/u_src/Q", range(4896))
+    top_to = get_pins_list("u_h0/u_dst/D", range(2156))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to %s\n"
+        "set_min_delay 0.0 -from %s -to %s\n"
+        % (top_from, top_to, top_from, top_to)
+    )
+    harden_sdc = (
+        "set_max_delay 5.0 -from %s -to %s\n"
+        % (
+            get_pins_list("u_h0/u_src/Q", range(2)),
+            get_pins_list("u_h0/u_dst/D", range(2)),
+        )
+    )
+    prelude = r'''
+set ::STRUCTURAL_GETTER_CALLS 0
+
+proc get_pins {args} {
+    incr ::STRUCTURAL_GETTER_CALLS
+    error "structural passthrough must not query get_pins"
+}
+'''
+    result = run_case(
+        "structural_passthrough_zero_getters",
+        top_sdc,
+        harden_sdc,
+        extra_build_args=[
+            "-max_segment_pairs", "2",
+            "-generate_clock_group_review", "false",
+        ],
+        prelude=prelude,
+        post_build_tcl='puts "STRUCTURAL_GETTER_CALLS=$::STRUCTURAL_GETTER_CALLS"',
+    )
+    require_ok(result)
+    assert_text_contains(result["stdout"], "STRUCTURAL_GETTER_CALLS=0")
+    report = read_file(result["report"])
+    expected_stats = {
+        "structural_passthrough_commands": 3,
+        "structural_passthrough_objects": 14108,
+        "matrix_pairs_avoided": 21111556,
+        "matrix_expansion_limited": 0,
+        "matrix_pairs_expanded": 0,
+        "matrix_expand_elapsed_ms": 0,
+        "metadata_batch_queries": 0,
+        "metadata_individual_queries": 0,
+    }
+    for name, expected in expected_stats.items():
+        actual = stat_value(report, name)
+        if actual != expected:
+            raise AssertionError(
+                "Unexpected structural passthrough statistic %s=%d, expected %d:\n%s"
+                % (name, actual, expected, report)
+            )
+    assert_contains(result["report"], "Passthrough constraints         : 3")
+    assert_contains(result["report"], "Review required constraints     : 0")
+    assert_contains(result["report"], "Max segment pairs               : 2")
+    trace = read_file(result["trace"])
+    if trace.count("action=STRUCTURAL_PASSTHROUGH") != 3:
+        raise AssertionError("Expected one structural plan per source command:\n%s" % trace)
+    if delay_command_lines(result["out_sdc"]):
+        raise AssertionError("Structural passthrough unexpectedly generated E2E delays")
+    assert_contains(result["final"], top_sdc.strip())
+    assert_contains(result["final"], harden_sdc.strip())
+    assert_not_contains(result["final"], "STAGE2_CONSUMED")
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN")
+    validate_static_sdc(result["final"])
+
+
+def test_matrix_segment_pair_limit_and_inclusive_boundary():
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to %s\n"
+        % (get_pins_list("src", range(3)), get_pins_list("u_h0/cfg", range(2)))
+    )
+    prelude = r'''
+for {set idx 0} {$idx < 3} {incr idx} {
+    set ::PT_MOCK_DIRECTIONS([format {src[%d]} $idx]) out
+}
+for {set idx 0} {$idx < 2} {incr idx} {
+    set ::PT_MOCK_DIRECTIONS([format {u_h0/cfg[%d]} $idx]) in
+}
+'''
+    limited = run_case(
+        "matrix_segment_pair_limit_5",
+        top_sdc,
+        "",
+        extra_build_args=[
+            "-max_segment_pairs", "5",
+            "-generate_clock_group_review", "false",
+        ],
+        prelude=prelude,
+    )
+    require_ok(limited)
+    limited_report = read_file(limited["report"])
+    for name, expected in {
+        "structural_passthrough_commands": 0,
+        "matrix_expansion_limited": 1,
+        "matrix_pairs_avoided": 6,
+        "matrix_pairs_expanded": 0,
+    }.items():
+        actual = stat_value(limited_report, name)
+        if actual != expected:
+            raise AssertionError(
+                "Unexpected limited matrix statistic %s=%d, expected %d:\n%s"
+                % (name, actual, expected, limited_report)
+            )
+    assert_contains(limited["report"], "Max segment pairs               : 5")
+    assert_contains(limited["report"], "MATRIX_EXPANSION_LIMIT")
+    assert_contains(limited["review"], "reason=MATRIX_EXPANSION_LIMIT")
+    if read_file(limited["review"]).count("reason=MATRIX_EXPANSION_LIMIT") != 1:
+        raise AssertionError("Limited matrix must create exactly one detailed review item")
+    assert_contains(limited["review"], "matrix_from_count=3")
+    assert_contains(limited["review"], "matrix_to_count=2")
+    assert_contains(limited["review"], "matrix_pair_count=6")
+    assert_contains(limited["review"], "matrix_limit=5")
+    assert_contains(limited["trace"], "product=6 action=MATRIX_EXPANSION_LIMIT limit=5 original=preserved")
+    assert_contains(limited["final"], top_sdc.strip())
+    assert_not_contains(limited["final"], "STAGE2_REWRITTEN CMD000001")
+    if delay_command_lines(limited["out_sdc"]):
+        raise AssertionError("Limited matrix unexpectedly generated E2E delays")
+
+    inclusive = run_case(
+        "matrix_segment_pair_inclusive_6",
+        top_sdc,
+        "",
+        extra_build_args=[
+            "-max_segment_pairs", "6",
+            "-generate_clock_group_review", "false",
+        ],
+        prelude=prelude,
+    )
+    require_ok(inclusive)
+    inclusive_report = read_file(inclusive["report"])
+    for name, expected in {
+        "structural_passthrough_commands": 0,
+        "matrix_expansion_limited": 0,
+        "matrix_pairs_avoided": 0,
+        "matrix_pairs_expanded": 6,
+    }.items():
+        actual = stat_value(inclusive_report, name)
+        if actual != expected:
+            raise AssertionError(
+                "Unexpected inclusive matrix statistic %s=%d, expected %d:\n%s"
+                % (name, actual, expected, inclusive_report)
+            )
+    if stat_value(inclusive_report, "matrix_expand_elapsed_ms") < 0:
+        raise AssertionError("Matrix expansion elapsed time must not be negative")
+    assert_contains(inclusive["report"], "Max segment pairs               : 6")
+    assert_not_contains(inclusive["review"], "MATRIX_EXPANSION_LIMIT")
+    assert_contains(inclusive["trace"], "SEGMENT_EXPAND_END")
+    assert_contains(inclusive["trace"], "expanded=6 product=6 elapsed_ms=")
+
+
+def test_structural_passthrough_immediate_boundary_uses_legacy_hydration():
+    prelude = r'''
+set ::BOUNDARY_METADATA_LOG [file join [pwd] boundary_metadata_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    set fout [open $::BOUNDARY_METADATA_LOG a]
+    puts $fout [join $patterns ,]
+    close $fout
+    return $patterns
+}
+'''
+    result = run_case(
+        "structural_immediate_boundary_fallback",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-generate_clock_group_review", "false"],
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(
+        result["out_sdc"],
+        "set_max_delay 7 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]",
+    )
+    report = read_file(result["report"])
+    if stat_value(report, "structural_passthrough_commands") != 0:
+        raise AssertionError("Immediate harden boundaries must bypass structural passthrough")
+    if stat_value(report, "structural_passthrough_objects") != 0:
+        raise AssertionError("Immediate boundary records must use legacy hydration")
+    if stat_value(report, "metadata_individual_queries") != 3:
+        raise AssertionError("Expected three cached individual metadata queries:\n%s" % report)
+    calls = read_file(os.path.join(result["case_dir"], "boundary_metadata_calls.log")).splitlines()
+    if calls != ["u_src_reg/Q", "u_h0/cfg_i", "u_h0/u_reg/D"]:
+        raise AssertionError("Unexpected immediate-boundary metadata calls: %r" % calls)
+    assert_not_contains(result["trace"], "action=STRUCTURAL_PASSTHROUGH")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_structural_passthrough_unsafe_object_shapes_use_legacy_flow():
+    prelude = r'''
+set ::LEGACY_GET_PINS_CALLS 0
+set ::LEGACY_GET_PORTS_CALLS 0
+
+proc get_pins {args} {
+    incr ::LEGACY_GET_PINS_CALLS
+    return [lindex $args end]
+}
+
+proc get_ports {args} {
+    incr ::LEGACY_GET_PORTS_CALLS
+    return [lindex $args end]
+}
+
+rename get_attribute stage2_shape_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "direction"} {
+        if {$name in {u_local/src u_local/src_* src_i}} {
+            return out
+        }
+        if {$name in {u_local/dst u_local/dst_* dst_o}} {
+            return in
+        }
+    }
+    return [stage2_shape_default_get_attribute $obj $attr]
+}
+'''
+    cases = [
+        (
+            "unknown",
+            "set_max_delay 2.0 -from [get_foo u_local/src] -to [get_pins u_local/dst]\n",
+            1,
+            0,
+            1,
+            "CLOCK_OR_UNKNOWN_OBJECT",
+        ),
+        (
+            "clock",
+            "set_max_delay 2.0 -from [get_clocks CLK] -to [get_pins u_local/dst]\n",
+            1,
+            0,
+            1,
+            "CLOCK_OR_UNKNOWN_OBJECT",
+        ),
+        (
+            "port",
+            "set_max_delay 2.0 -from [get_ports src_i] -to [get_ports dst_o]\n",
+            0,
+            2,
+            2,
+            None,
+        ),
+        (
+            "wildcard",
+            "set_max_delay 2.0 -from [get_pins {u_local/src_*}] -to [get_pins {u_local/dst_*}]\n",
+            2,
+            0,
+            2,
+            None,
+        ),
+        (
+            "dynamic",
+            "set_max_delay 2.0 -from [get_pins [all_registers]] -to [get_pins u_local/dst]\n",
+            2,
+            0,
+            2,
+            None,
+        ),
+    ]
+    for token, top_sdc, pin_calls, port_calls, individual_queries, review_reason in cases:
+        result = run_case(
+            "structural_shape_fallback_%s" % token,
+            top_sdc,
+            "",
+            extra_build_args=[
+                "-top_port_boundary_map_mode", "off",
+                "-generate_clock_group_review", "false",
+            ],
+            prelude=prelude,
+            post_build_tcl=(
+                'puts "LEGACY_CALLS pins=$::LEGACY_GET_PINS_CALLS ports=$::LEGACY_GET_PORTS_CALLS"'
+            ),
+        )
+        require_ok(result)
+        assert_text_contains(
+            result["stdout"],
+            "LEGACY_CALLS pins=%d ports=%d" % (pin_calls, port_calls),
+        )
+        report = read_file(result["report"])
+        if stat_value(report, "structural_passthrough_commands") != 0:
+            raise AssertionError("%s objects must use legacy classification:\n%s" % (token, report))
+        if stat_value(report, "structural_passthrough_objects") != 0:
+            raise AssertionError("%s objects were incorrectly counted as structural" % token)
+        if stat_value(report, "metadata_individual_queries") != individual_queries:
+            raise AssertionError("Unexpected %s individual query count:\n%s" % (token, report))
+        assert_contains(result["final"], top_sdc.strip())
+        assert_not_contains(result["final"], "STAGE2_CONSUMED")
+        if review_reason is not None:
+            assert_contains(result["review"], review_reason)
+            assert_contains(result["report"], "Review required constraints     : 1")
+        else:
+            assert_contains(result["report"], "Passthrough constraints         : 1")
+            assert_contains(result["report"], "Review required constraints     : 0")
+
+
 def test_top_open_from_infers_static_startpoint():
     prelude = r'''
 proc all_fanin {args} {
@@ -1038,6 +1340,19 @@ def test_object_metadata_batch_size_validation():
         if result["code"] == 0:
             raise AssertionError("metadata_batch_size=%s must be rejected" % value)
         assert_text_contains(result["stderr"], "-metadata_batch_size must be an integer >= 1")
+
+
+def test_max_segment_pairs_validation():
+    for value, token in (("0", "zero"), ("-2", "negative"), ("abc", "text")):
+        result = run_case(
+            "max_segment_pairs_invalid_%s" % token,
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+            "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+            extra_build_args=["-max_segment_pairs", value],
+        )
+        if result["code"] == 0:
+            raise AssertionError("max_segment_pairs=%s must be rejected" % value)
+        assert_text_contains(result["stderr"], "-max_segment_pairs must be an integer >= 1")
 
 
 def test_startpoint_and_boundary_queries_are_cached():
@@ -2446,6 +2761,10 @@ def main():
         test_recursive_pt_proven_input_clock_pin_is_accepted,
         test_matrix_clock_pairs_skip_pt_disconnected_cross_pairs,
         test_matrix_pair_query_failure_does_not_silently_skip,
+        test_structural_passthrough_skips_getters_and_matrix_expansion,
+        test_matrix_segment_pair_limit_and_inclusive_boundary,
+        test_structural_passthrough_immediate_boundary_uses_legacy_hydration,
+        test_structural_passthrough_unsafe_object_shapes_use_legacy_flow,
         test_top_open_from_infers_static_startpoint,
         test_top_open_to_multi_from_through_and_endpoint_expansion,
         test_object_metadata_batches_explicit_pin_list,
@@ -2455,6 +2774,7 @@ def main():
         test_object_metadata_mismatched_middle_chunk_only_falls_back,
         test_object_metadata_batch_can_be_disabled_without_skipping_queries,
         test_object_metadata_batch_size_validation,
+        test_max_segment_pairs_validation,
         test_startpoint_and_boundary_queries_are_cached,
         test_missing_path_fanout_queries_are_cached,
         test_final_rewrite_reuses_parsed_segments_and_skips_untouched_sdc,

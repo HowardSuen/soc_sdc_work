@@ -85,6 +85,10 @@ set ::MAX_CHAIN_DEPTH 6
 set ::MAX_ENDPOINTS 1000
 set ::MAX_ENUM_OBJECTS 64
 
+# Maximum from x to pairs materialized for one delay command. Commands above
+# this limit are preserved unchanged and reported for review.
+set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+
 # Performance controls for open-to delay commands.  Bus compression is only
 # applied after PT proves that the wildcard selector resolves to exactly the
 # original member set.  Batch fanout queries fall back to one seed at a time
@@ -135,7 +139,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.9"
+    variable VERSION "v0.9.10"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -200,6 +204,7 @@ namespace eval stage2_delay {
         -max_chain_depth 6
         -max_endpoints 1000
         -max_enum_objects 64
+        -max_segment_pairs 100000
         -compact_bus "true"
         -compact_bus_min_members 4
         -batch_open_to_query "true"
@@ -343,6 +348,12 @@ proc stage2_delay::reset_state {} {
         metadata_batch_elapsed_ms 0
         metadata_batch_disabled_groups 0
         metadata_individual_queries 0
+        structural_passthrough_commands 0
+        structural_passthrough_objects 0
+        matrix_pairs_avoided 0
+        matrix_expansion_limited 0
+        matrix_pairs_expanded 0
+        matrix_expand_elapsed_ms 0
         attribute_cache_hits 0
         owner_cache_hits 0
         boundary_cache_hits 0
@@ -535,6 +546,9 @@ proc stage2_delay::validate_options {} {
     }
     if {![string is integer -strict $options(-metadata_batch_size)] || $options(-metadata_batch_size) < 1} {
         error "-metadata_batch_size must be an integer >= 1"
+    }
+    if {![string is integer -strict $options(-max_segment_pairs)] || $options(-max_segment_pairs) < 1} {
+        error "-max_segment_pairs must be an integer >= 1"
     }
 }
 
@@ -922,6 +936,126 @@ proc stage2_delay::find_matching {text start open_code close_code} {
     return -1
 }
 
+proc stage2_delay::structural_exact_pin_name {name} {
+    if {$name eq "" || [string first "*" $name] >= 0 || [string first "?" $name] >= 0 || [string first "$" $name] >= 0} {
+        return 0
+    }
+    set without_bus_indices $name
+    regsub -all {\[[0-9]+\]} $without_bus_indices "" without_bus_indices
+    if {[string first "\[" $without_bus_indices] >= 0 || [string first "\]" $without_bus_indices] >= 0} {
+        return 0
+    }
+    return 1
+}
+
+proc stage2_delay::structural_exact_pin_expression {expr} {
+    set expr [string trim $expr]
+    set expr_len [string length $expr]
+    if {$expr_len < 2 || [scan [string index $expr 0] %c] != 91 || [scan [string index $expr end] %c] != 93} {
+        return 0
+    }
+
+    set words [tokenize_words [string range $expr 1 end-1]]
+    if {[llength $words] == 0} {
+        return 0
+    }
+    set command [lindex $words 0]
+    if {$command eq "list"} {
+        if {[llength $words] < 2} {
+            return 0
+        }
+        foreach item [lrange $words 1 end] {
+            if {![structural_exact_pin_expression $item]} {
+                return 0
+            }
+        }
+        return 1
+    }
+    if {$command ne "get_pins"} {
+        return 0
+    }
+
+    set object_count 0
+    foreach word [lrange $words 1 end] {
+        if {$word in {-quiet -exact}} {
+            continue
+        }
+        if {[string match "-*" $word]} {
+            return 0
+        }
+        foreach name [split_object_list $word] {
+            if {![structural_exact_pin_name $name]} {
+                return 0
+            }
+            incr object_count
+        }
+    }
+    return [expr {$object_count > 0}]
+}
+
+proc stage2_delay::structural_records_are_exact_pins {records} {
+    if {[llength $records] == 0} {
+        return 0
+    }
+    foreach rec $records {
+        array set r $rec
+        set exact [expr {$r(object_class) eq "pin" && [structural_exact_pin_name $r(full_name)]}]
+        array unset r
+        if {!$exact} {
+            return 0
+        }
+    }
+    return 1
+}
+
+proc stage2_delay::record_is_immediate_pin_of_instance {rec inst} {
+    if {$inst eq ""} {
+        return 0
+    }
+    array set r $rec
+    set result 0
+    if {$r(object_class) eq "pin" && [string match "${inst}/*" $r(full_name)]} {
+        set rest [string range $r(full_name) [expr {[string length $inst] + 1}] end]
+        set result [expr {$rest ne "" && [string first "/" $rest] < 0}]
+    }
+    array unset r
+    return $result
+}
+
+proc stage2_delay::structural_passthrough_eligible {source harden_inst from_expr to_expr through_exprs from_records to_records through_record_groups delay flags} {
+    if {$from_expr eq "" || $to_expr eq "" || $delay eq "" || ![string is double -strict $delay] || [has_edge_specific_flag $flags]} {
+        return 0
+    }
+    if {![structural_exact_pin_expression $from_expr] || ![structural_exact_pin_expression $to_expr]} {
+        return 0
+    }
+    if {![structural_records_are_exact_pins $from_records] || ![structural_records_are_exact_pins $to_records]} {
+        return 0
+    }
+    if {[llength $through_exprs] != [llength $through_record_groups]} {
+        return 0
+    }
+    for {set idx 0} {$idx < [llength $through_exprs]} {incr idx} {
+        if {![structural_exact_pin_expression [lindex $through_exprs $idx]] ||
+            ![structural_records_are_exact_pins [lindex $through_record_groups $idx]]} {
+            return 0
+        }
+    }
+
+    foreach records [concat [list $from_records $to_records] $through_record_groups] {
+        foreach rec $records {
+            if {$source eq "top"} {
+                if {[is_immediate_harden_pin_record $rec]} {
+                    return 0
+                }
+            } elseif {[record_is_immediate_pin_of_instance $rec $harden_inst]} {
+                return 0
+            }
+        }
+    }
+    return 1
+}
+
 proc stage2_delay::segment_from_words {words source file line cmd_id original harden_inst} {
     set command [lindex $words 0]
     set type [expr {$command eq "set_max_delay" ? "max" : "min"}]
@@ -964,71 +1098,104 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         incr idx
     }
 
-    set from_records {}
-    set to_records {}
-    set through_records {}
-    set through_record_groups {}
+    set raw_from_records {}
+    set raw_to_records {}
+    set raw_through_records {}
+    set raw_through_record_groups {}
     set status "ok"
     set reason ""
     if {$from_expr ne ""} {
-        set from_records [resolve_object_expr $from_expr]
+        set raw_from_records [parse_object_expr_records $from_expr]
     }
     if {$to_expr ne ""} {
-        set to_records [resolve_object_expr $to_expr]
+        set raw_to_records [parse_object_expr_records $to_expr]
     }
     foreach expr $through_exprs {
-        set group [resolve_object_expr $expr]
-        lappend through_record_groups $group
+        set group [parse_object_expr_records $expr]
+        lappend raw_through_record_groups $group
         foreach rec $group {
-            lappend through_records $rec
+            lappend raw_through_records $rec
         }
     }
-    if {$source eq "harden" && $harden_inst ne ""} {
-        set from_records [map_harden_port_records_to_instance_pins $from_records $harden_inst]
-        set to_records [map_harden_port_records_to_instance_pins $to_records $harden_inst]
-        set through_records [map_harden_port_records_to_instance_pins $through_records $harden_inst]
-        set mapped_groups {}
-        foreach group $through_record_groups {
-            lappend mapped_groups [map_harden_port_records_to_instance_pins $group $harden_inst]
-        }
-        set through_record_groups $mapped_groups
-    }
-    if {$to_expr eq "" && $from_expr ne ""} {
-        set from_records [compact_open_to_records $from_records "$source:$cmd_id:-from" true]
-        set compact_groups {}
+
+    set structural_passthrough [structural_passthrough_eligible \
+        $source $harden_inst $from_expr $to_expr $through_exprs \
+        $raw_from_records $raw_to_records $raw_through_record_groups $delay $flags]
+    set structural_passthrough_reason ""
+    set open_to_inferred false
+    set open_to_seed_records {}
+    if {$structural_passthrough} {
+        set from_records $raw_from_records
+        set to_records $raw_to_records
+        set through_records $raw_through_records
+        set through_record_groups $raw_through_record_groups
+        set structural_passthrough_reason NO_IMMEDIATE_HARDEN_BOUNDARY
+        set from_count [llength $from_records]
+        set to_count [llength $to_records]
+        set pair_count [expr {$from_count * $to_count}]
+        set object_count [expr {$from_count + $to_count + [llength $through_records]}]
+        performance_stat_add structural_passthrough_commands
+        performance_stat_add structural_passthrough_objects $object_count
+        performance_stat_add matrix_pairs_avoided $pair_count
+        trace_event SEGMENT_PLAN \
+            "source=$source id=$cmd_id file={$file} line=$line from=$from_count to=$to_count product=$pair_count action=STRUCTURAL_PASSTHROUGH reason=$structural_passthrough_reason"
+    } else {
+        set from_records [hydrate_object_records $raw_from_records]
+        set to_records [hydrate_object_records $raw_to_records]
         set through_records {}
-        set through_index 0
-        foreach group $through_record_groups {
-            incr through_index
-            set group [compact_open_to_records $group "$source:$cmd_id:-through#$through_index"]
-            lappend compact_groups $group
+        set through_record_groups {}
+        foreach raw_group $raw_through_record_groups {
+            set group [hydrate_object_records $raw_group]
+            lappend through_record_groups $group
             foreach rec $group {
                 lappend through_records $rec
             }
         }
-        set through_record_groups $compact_groups
-    }
-    set open_to_inferred false
-    set open_to_seed_records {}
-    if {$to_expr eq ""} {
-        if {$from_expr eq ""} {
-            set status "review"
-            set reason "OPEN_FROM_AND_TO_UNSUPPORTED"
-        } else {
-            set open_to_seed_records $from_records
-            if {[llength $through_record_groups] > 0} {
-                set open_to_seed_records [lindex $through_record_groups end]
+        if {$source eq "harden" && $harden_inst ne ""} {
+            set from_records [map_harden_port_records_to_instance_pins $from_records $harden_inst]
+            set to_records [map_harden_port_records_to_instance_pins $to_records $harden_inst]
+            set through_records [map_harden_port_records_to_instance_pins $through_records $harden_inst]
+            set mapped_groups {}
+            foreach group $through_record_groups {
+                lappend mapped_groups [map_harden_port_records_to_instance_pins $group $harden_inst]
             }
-            set to_records [pt_open_to_targets $open_to_seed_records $source $harden_inst]
-            if {[llength $to_records] == 0} {
+            set through_record_groups $mapped_groups
+        }
+        if {$to_expr eq "" && $from_expr ne ""} {
+            set from_records [compact_open_to_records $from_records "$source:$cmd_id:-from" true]
+            set compact_groups {}
+            set through_records {}
+            set through_index 0
+            foreach group $through_record_groups {
+                incr through_index
+                set group [compact_open_to_records $group "$source:$cmd_id:-through#$through_index"]
+                lappend compact_groups $group
+                foreach rec $group {
+                    lappend through_records $rec
+                }
+            }
+            set through_record_groups $compact_groups
+        }
+        if {$to_expr eq ""} {
+            if {$from_expr eq ""} {
                 set status "review"
-                set reason "OPEN_TO_ENDPOINT_NOT_INFERRED"
-            } elseif {[llength $to_records] > $::stage2_delay::options(-max_endpoints)} {
-                set status "review"
-                set reason "TOO_MANY_OPEN_TO_ENDPOINTS"
-                set to_records {}
+                set reason "OPEN_FROM_AND_TO_UNSUPPORTED"
             } else {
-                set open_to_inferred true
+                set open_to_seed_records $from_records
+                if {[llength $through_record_groups] > 0} {
+                    set open_to_seed_records [lindex $through_record_groups end]
+                }
+                set to_records [pt_open_to_targets $open_to_seed_records $source $harden_inst]
+                if {[llength $to_records] == 0} {
+                    set status "review"
+                    set reason "OPEN_TO_ENDPOINT_NOT_INFERRED"
+                } elseif {[llength $to_records] > $::stage2_delay::options(-max_endpoints)} {
+                    set status "review"
+                    set reason "TOO_MANY_OPEN_TO_ENDPOINTS"
+                    set to_records {}
+                } else {
+                    set open_to_inferred true
+                }
             }
         }
     }
@@ -1070,20 +1237,43 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         boundary_pins {} \
         open_to_inferred $open_to_inferred \
         open_to_seed_records $open_to_seed_records \
+        structural_passthrough $structural_passthrough \
+        structural_passthrough_reason $structural_passthrough_reason \
         status $status \
         failure_reason $reason \
     ]
 }
 
 proc stage2_delay::expand_segment {seg} {
+    variable options
     array set s $seg
+    set from_count [llength $s(from_records)]
+    set effective_from_count [expr {$from_count > 0 ? $from_count : 1}]
+    set to_count [llength $s(to_records)]
+    set total [expr {$effective_from_count * $to_count}]
+    set s(matrix_from_count) $from_count
+    set s(matrix_to_count) $to_count
+    set s(matrix_pair_count) $total
+    set s(matrix_limit) $options(-max_segment_pairs)
+
     if {$s(status) ne "ok"} {
+        trace_event SEGMENT_PLAN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total action=SKIP reason=$s(failure_reason)"
+        set result [array get s]
         array unset s
-        return [list $seg]
+        return [list $result]
     }
-    if {[llength $s(to_records)] == 0} {
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        set result [array get s]
         array unset s
-        return [list $seg]
+        return [list $result]
+    }
+    if {$to_count == 0} {
+        trace_event SEGMENT_PLAN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=0 product=0 action=SKIP reason=NO_TO_OBJECT"
+        set result [array get s]
+        array unset s
+        return [list $result]
     }
 
     set from_choices $s(from_records)
@@ -1091,17 +1281,46 @@ proc stage2_delay::expand_segment {seg} {
         set from_choices [list {}]
     }
     set to_choices $s(to_records)
-    set total [expr {[llength $from_choices] * [llength $to_choices]}]
     if {$total <= 1} {
+        trace_event SEGMENT_PLAN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total action=SINGLE"
         set s(split_total) 1
         set s(split_index) 1
+        performance_stat_add matrix_pairs_expanded $total
         set result [array get s]
         array unset s
         return [list $result]
     }
 
+    if {$total > $options(-max_segment_pairs)} {
+        set s(status) review
+        set s(failure_reason) MATRIX_EXPANSION_LIMIT
+        performance_stat_add matrix_expansion_limited
+        performance_stat_add matrix_pairs_avoided $total
+        trace_event SEGMENT_PLAN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total action=MATRIX_EXPANSION_LIMIT limit=$options(-max_segment_pairs) original=preserved"
+        add_report_item "MATRIX_EXPANSION_LIMIT source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total limit=$options(-max_segment_pairs) original=preserved"
+        set result [array get s]
+        array unset s
+        return [list $result]
+    }
+
+    trace_event SEGMENT_PLAN \
+        "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total action=EXPAND limit=$options(-max_segment_pairs)"
+    set start_ms [metadata_clock_milliseconds]
+    trace_event SEGMENT_EXPAND_BEGIN \
+        "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total"
     set out {}
     set idx 0
+    set progress_step 0
+    set next_progress 0
+    if {$total >= 10000} {
+        set progress_step [expr {($total + 9) / 10}]
+        if {$progress_step < 10000} {
+            set progress_step 10000
+        }
+        set next_progress $progress_step
+    }
     foreach from_rec $from_choices {
         foreach to_rec $to_choices {
             incr idx
@@ -1119,8 +1338,25 @@ proc stage2_delay::expand_segment {seg} {
             set e(to_records) [list $to_rec]
             lappend out [array get e]
             array unset e
+            if {$progress_step > 0 && $idx >= $next_progress && $idx < $total} {
+                set progress_elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+                if {$progress_elapsed_ms < 0} {
+                    set progress_elapsed_ms 0
+                }
+                trace_event SEGMENT_EXPAND_PROGRESS \
+                    "source=$s(source) id=$s(original_id) completed=$idx total=$total elapsed_ms=$progress_elapsed_ms"
+                incr next_progress $progress_step
+            }
         }
     }
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add matrix_pairs_expanded $total
+    performance_stat_add matrix_expand_elapsed_ms $elapsed_ms
+    trace_event SEGMENT_EXPAND_END \
+        "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) expanded=$idx product=$total elapsed_ms=$elapsed_ms"
     array unset s
     return $out
 }
@@ -2045,6 +2281,11 @@ proc stage2_delay::classify_segments {} {
 proc stage2_delay::top_passthrough_reason {seg} {
     variable options
     array set s $seg
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        set reason "STRUCTURAL_$s(structural_passthrough_reason)"
+        array unset s
+        return $reason
+    }
     set reason "TOP_PASSTHROUGH_UNKNOWN"
     if {[llength $s(to_records)] == 1} {
         array set to [lindex $s(to_records) 0]
@@ -2077,6 +2318,11 @@ proc stage2_delay::top_passthrough_reason {seg} {
 
 proc stage2_delay::harden_passthrough_reason {seg} {
     array set s $seg
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        set reason "STRUCTURAL_$s(structural_passthrough_reason)"
+        array unset s
+        return $reason
+    }
     set reason "HARDEN_PASSTHROUGH_UNKNOWN"
     if {[llength $s(to_records)] == 1} {
         array set to [lindex $s(to_records) 0]
@@ -2130,6 +2376,10 @@ proc stage2_delay::classify_top_segment {seg} {
         set result $s(failure_reason)
         array unset s
         return $result
+    }
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        array unset s
+        return "passthrough"
     }
     if {[llength $s(to_records)] == 0} {
         array unset s
@@ -2192,6 +2442,10 @@ proc stage2_delay::classify_harden_segment {seg} {
         set result $s(failure_reason)
         array unset s
         return $result
+    }
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        array unset s
+        return "passthrough"
     }
     if {[llength $s(to_records)] == 0} {
         array unset s
@@ -4817,7 +5071,10 @@ proc stage2_delay::performance_stats_summary {} {
         metadata_batch_queries metadata_batch_records metadata_batch_successes
         metadata_batch_fallbacks metadata_batch_returned_records
         metadata_batch_elapsed_ms metadata_batch_disabled_groups
-        metadata_individual_queries attribute_cache_hits owner_cache_hits
+        metadata_individual_queries structural_passthrough_commands
+        structural_passthrough_objects matrix_pairs_avoided
+        matrix_expansion_limited matrix_pairs_expanded matrix_expand_elapsed_ms
+        attribute_cache_hits owner_cache_hits
         boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
         final_rewrite_skipped_files parsed_segment_reuse_hits
@@ -4840,6 +5097,11 @@ proc stage2_delay::consume_segment {seg} {
     variable consumed_command_segments
     variable consumed_source_files
     array set s $seg
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        set segment_id $s(id)
+        array unset s
+        error "internal error: structural passthrough segment cannot be consumed: $segment_id"
+    }
     if {[info exists s(missing_sdc)] && [truthy $s(missing_sdc)]} {
         array unset s
         return
@@ -4869,6 +5131,24 @@ proc stage2_delay::add_review {top_seg harden_seg reason action} {
         array set h $harden_seg
         lappend item harden_id $h(id) harden_file $h(source_file) harden_line $h(line_no)
         array unset h
+    }
+    if {$reason eq "MATRIX_EXPANSION_LIMIT"} {
+        foreach candidate [list $top_seg $harden_seg] {
+            if {$candidate eq ""} {
+                continue
+            }
+            array set matrix $candidate
+            if {[info exists matrix(matrix_pair_count)] && $matrix(matrix_pair_count) > 0} {
+                lappend item \
+                    matrix_from_count $matrix(matrix_from_count) \
+                    matrix_to_count $matrix(matrix_to_count) \
+                    matrix_pair_count $matrix(matrix_pair_count) \
+                    matrix_limit $matrix(matrix_limit)
+                array unset matrix
+                break
+            }
+            array unset matrix
+        }
     }
     lappend review_items $item
     live_trace_event REVIEW [join_kv $item]
@@ -4931,6 +5211,9 @@ proc stage2_delay::review_action {reason} {
         }
         PARTIAL_MERGE_REVIEW {
             return "检查未匹配的 boundary；确认 residual_through 或改为人工 review"
+        }
+        MATRIX_EXPANSION_LIMIT {
+            return "原约束已保留；检查矩阵对象集合，确认后提高 STAGE2_MAX_SEGMENT_PAIRS 或拆分约束"
         }
         default {
             if {[string match "TOO_MANY_*" $reason]} {
@@ -5330,6 +5613,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
     puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
     puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
+    puts $fout "Max segment pairs               : $options(-max_segment_pairs)"
     puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
     puts $fout "Stage2 performance statistics   : [performance_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
@@ -5357,15 +5641,28 @@ proc stage2_delay::passthrough_report_line {seg} {
     if {[info exists s(passthrough_reason)]} {
         set reason $s(passthrough_reason)
     }
-    set line [list \
-        source $s(source) \
-        id $s(id) \
-        file $s(source_file) \
-        line $s(line_no) \
-        reason $reason \
-        from [records_debug_list $s(from_records)] \
-        to [records_debug_list $s(to_records)] \
-    ]
+    if {[info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)]} {
+        set line [list \
+            source $s(source) \
+            id $s(id) \
+            file $s(source_file) \
+            line $s(line_no) \
+            reason $reason \
+            from_count $s(matrix_from_count) \
+            to_count $s(matrix_to_count) \
+            pair_count $s(matrix_pair_count) \
+        ]
+    } else {
+        set line [list \
+            source $s(source) \
+            id $s(id) \
+            file $s(source_file) \
+            line $s(line_no) \
+            reason $reason \
+            from [records_debug_list $s(from_records)] \
+            to [records_debug_list $s(to_records)] \
+        ]
+    }
     array unset s
     return [join_kv $line]
 }
@@ -6137,6 +6434,7 @@ proc stage2_delay::run_from_user_settings {} {
     set max_chain_depth [global_setting MAX_CHAIN_DEPTH 6]
     set max_endpoints [global_setting MAX_ENDPOINTS 1000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
+    set max_segment_pairs [global_setting STAGE2_MAX_SEGMENT_PAIRS 100000]
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
@@ -6180,6 +6478,7 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
     set_global_setting STAGE2_METADATA_BATCH_ENABLED $metadata_batch_enabled
     set_global_setting STAGE2_METADATA_BATCH_SIZE $metadata_batch_size
+    set_global_setting STAGE2_MAX_SEGMENT_PAIRS $max_segment_pairs
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
     set_global_setting STAGE2_TEXT_ENCODING $text_encoding
@@ -6204,6 +6503,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
     puts "INFO: Batch open-to query : $batch_open_to_query"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
+    puts "INFO: Max segment pairs   : $max_segment_pairs"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
     puts "INFO: Text encoding       : $text_encoding"
 
@@ -6234,6 +6534,7 @@ proc stage2_delay::run_from_user_settings {} {
         -allow_through $allow_through \
         -max_endpoints $max_endpoints \
         -max_enum_objects $max_enum_objects \
+        -max_segment_pairs $max_segment_pairs \
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
         -batch_open_to_query $batch_open_to_query \
