@@ -93,6 +93,12 @@ set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 
+# Direction metadata queries are grouped by object class and split into bounded
+# chunks before calling get_pins/get_ports/get_cells/get_nets. Disable batching
+# only for diagnosis; disabled mode still queries every object's direction.
+set ::STAGE2_METADATA_BATCH_ENABLED true
+set ::STAGE2_METADATA_BATCH_SIZE 128
+
 # Optional output file overrides. Leave empty to use OUT_DIR defaults.
 set ::OUT_E2E_SDC ""
 set ::OUT_REPORT ""
@@ -129,7 +135,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.8"
+    variable VERSION "v0.9.9"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -197,6 +203,8 @@ namespace eval stage2_delay {
         -compact_bus "true"
         -compact_bus_min_members 4
         -batch_open_to_query "true"
+        -metadata_batch_enabled "true"
+        -metadata_batch_size 128
         -check_units "true"
         -expect_units ""
         -strict "false"
@@ -329,7 +337,11 @@ proc stage2_delay::reset_state {} {
     array set performance_stats {
         metadata_batch_queries 0
         metadata_batch_records 0
+        metadata_batch_successes 0
         metadata_batch_fallbacks 0
+        metadata_batch_returned_records 0
+        metadata_batch_elapsed_ms 0
+        metadata_batch_disabled_groups 0
         metadata_individual_queries 0
         attribute_cache_hits 0
         owner_cache_hits 0
@@ -520,6 +532,9 @@ proc stage2_delay::validate_options {} {
     }
     if {![string is integer -strict $options(-compact_bus_min_members)] || $options(-compact_bus_min_members) < 2} {
         error "-compact_bus_min_members must be an integer >= 2"
+    }
+    if {![string is integer -strict $options(-metadata_batch_size)] || $options(-metadata_batch_size) < 1} {
+        error "-metadata_batch_size must be an integer >= 1"
     }
 }
 
@@ -1292,6 +1307,7 @@ proc stage2_delay::object_record_from_get {cmd name} {
 
 proc stage2_delay::hydrate_object_records {records} {
     variable object_attribute_cache
+    variable options
 
     array set pending_by_class {}
     array set pending_seen {}
@@ -1317,26 +1333,45 @@ proc stage2_delay::hydrate_object_records {records} {
 
     foreach object_class $class_order {
         set names $pending_by_class($object_class)
-        if {[llength $names] > 1} {
-            performance_stat_add metadata_batch_queries
-            performance_stat_add metadata_batch_records [llength $names]
-            array set batch [pt_batch_object_directions $object_class $names]
-            if {$batch(ok)} {
-                array set directions $batch(values)
-                foreach name $names {
-                    set cache_key [list $object_class $name direction]
-                    set object_attribute_cache($cache_key) $directions($name)
+        if {[truthy $options(-metadata_batch_enabled)] && [llength $names] > 1} {
+            set batch_size $options(-metadata_batch_size)
+            set chunk_total [expr {([llength $names] + $batch_size - 1) / $batch_size}]
+            set chunk_index 0
+            for {set start 0} {$start < [llength $names]} {incr start $batch_size} {
+                incr chunk_index
+                set chunk_names [lrange $names $start [expr {$start + $batch_size - 1}]]
+                performance_stat_add metadata_batch_queries
+                performance_stat_add metadata_batch_records [llength $chunk_names]
+                array set batch [pt_batch_object_directions \
+                    $object_class $chunk_names $chunk_index $chunk_total]
+                if {$batch(ok)} {
+                    performance_stat_add metadata_batch_successes
+                    array set directions $batch(values)
+                    foreach name $chunk_names {
+                        set cache_key [list $object_class $name direction]
+                        set object_attribute_cache($cache_key) $directions($name)
+                    }
+                    array unset directions
+                } else {
+                    performance_stat_add metadata_batch_fallbacks
+                    trace_event METADATA_BATCH_FALLBACK \
+                        "class=$object_class chunk=$chunk_index/$chunk_total patterns=[llength $chunk_names] reason={$batch(reason)} mode=individual"
+                    pt_trace "object metadata batch fallback class=$object_class chunk=$chunk_index/$chunk_total records=[llength $chunk_names] reason={$batch(reason)}"
+                    foreach name $chunk_names {
+                        pt_get_attr_by_name $object_class $name direction
+                    }
                 }
-                array unset directions
                 array unset batch
-                continue
             }
-            performance_stat_add metadata_batch_fallbacks
-            pt_trace "object metadata batch fallback class=$object_class records=[llength $names] reason={$batch(reason)}"
-            array unset batch
-        }
-        foreach name $names {
-            pt_get_attr_by_name $object_class $name direction
+        } else {
+            if {[llength $names] > 1} {
+                performance_stat_add metadata_batch_disabled_groups
+                trace_event METADATA_BATCH_DISABLED \
+                    "class=$object_class records=[llength $names] mode=individual"
+            }
+            foreach name $names {
+                pt_get_attr_by_name $object_class $name direction
+            }
         }
     }
 
@@ -1362,15 +1397,41 @@ proc stage2_delay::is_batch_exact_object_name {name} {
     return [expr {[string first "*" $name] < 0 && [string first "?" $name] < 0}]
 }
 
-proc stage2_delay::pt_batch_object_directions {object_class names} {
+proc stage2_delay::metadata_clock_milliseconds {} {
+    if {![catch {clock milliseconds} value]} {
+        return $value
+    }
+    if {![catch {clock clicks -milliseconds} value]} {
+        return $value
+    }
+    return [expr {[clock seconds] * 1000}]
+}
+
+proc stage2_delay::pt_batch_object_directions {object_class names {chunk_index 1} {chunk_total 1}} {
     set getter [pt_getter_for_class $object_class]
+    set pattern_count [llength $names]
+    set start_ms [metadata_clock_milliseconds]
+    if {$getter eq ""} {
+        set trace_getter "-"
+    } else {
+        set trace_getter $getter
+    }
+    trace_event METADATA_BATCH_BEGIN \
+        "class=$object_class chunk=$chunk_index/$chunk_total getter=$trace_getter patterns=$pattern_count"
     if {$getter eq "" || [info commands $getter] eq "" || [info commands foreach_in_collection] eq "" || [info commands get_attribute] eq ""} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add metadata_batch_elapsed_ms $elapsed_ms
+        trace_event METADATA_BATCH_END \
+            "class=$object_class chunk=$chunk_index/$chunk_total status=UNAVAILABLE patterns=$pattern_count returned=0 elapsed_ms=$elapsed_ms reason={missing_collection_command}"
         return [list ok false values {} reason missing_collection_command]
     }
 
     array set directions {}
     set actual_names {}
-    pt_trace "$getter -quiet <metadata batch patterns=[llength $names]>"
+    pt_trace "$getter -quiet <metadata batch class=$object_class chunk=$chunk_index/$chunk_total patterns=$pattern_count>"
     if {[catch {
         set coll [$getter -quiet $names]
         foreach_in_collection obj $coll {
@@ -1381,14 +1442,34 @@ proc stage2_delay::pt_batch_object_directions {object_class names} {
             lappend actual_names $name
         }
     } err]} {
-        return [list ok false values {} reason "batch_query_failed:$err"]
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add metadata_batch_returned_records [llength $actual_names]
+        performance_stat_add metadata_batch_elapsed_ms $elapsed_ms
+        set one_line_err [string map [list "\n" " " "\r" " "] $err]
+        trace_event METADATA_BATCH_END \
+            "class=$object_class chunk=$chunk_index/$chunk_total status=ERROR patterns=$pattern_count returned=[llength $actual_names] elapsed_ms=$elapsed_ms reason={$one_line_err}"
+        return [list ok false values {} reason "batch_query_failed:$one_line_err"]
     }
 
     set expected [lsort -unique $names]
     set actual [lsort -unique $actual_names]
+    set returned_count [llength $actual_names]
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add metadata_batch_returned_records $returned_count
+    performance_stat_add metadata_batch_elapsed_ms $elapsed_ms
     if {$actual ne $expected} {
+        trace_event METADATA_BATCH_END \
+            "class=$object_class chunk=$chunk_index/$chunk_total status=MISMATCH patterns=$pattern_count returned=$returned_count unique_returned=[llength $actual] elapsed_ms=$elapsed_ms"
         return [list ok false values {} reason "batch_set_mismatch:expected=[llength $expected],actual=[llength $actual]"]
     }
+    trace_event METADATA_BATCH_END \
+        "class=$object_class chunk=$chunk_index/$chunk_total status=OK patterns=$pattern_count returned=$returned_count unique_returned=[llength $actual] elapsed_ms=$elapsed_ms"
     return [list ok true values [array get directions] reason ""]
 }
 
@@ -4733,7 +4814,9 @@ proc stage2_delay::performance_stat_add {name {delta 1}} {
 proc stage2_delay::performance_stats_summary {} {
     variable performance_stats
     set names {
-        metadata_batch_queries metadata_batch_records metadata_batch_fallbacks
+        metadata_batch_queries metadata_batch_records metadata_batch_successes
+        metadata_batch_fallbacks metadata_batch_returned_records
+        metadata_batch_elapsed_ms metadata_batch_disabled_groups
         metadata_individual_queries attribute_cache_hits owner_cache_hits
         boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
@@ -5245,6 +5328,8 @@ proc stage2_delay::write_report {path} {
     puts $fout "Bus compression                 : $options(-compact_bus)"
     puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
+    puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
+    puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
     puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
     puts $fout "Stage2 performance statistics   : [performance_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
@@ -6055,6 +6140,8 @@ proc stage2_delay::run_from_user_settings {} {
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
+    set metadata_batch_enabled [global_setting STAGE2_METADATA_BATCH_ENABLED true]
+    set metadata_batch_size [global_setting STAGE2_METADATA_BATCH_SIZE 128]
     set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY true]
     set write_path_summary [global_setting WRITE_PATH_SUMMARY true]
     set text_encoding [global_setting STAGE2_TEXT_ENCODING utf-8]
@@ -6091,6 +6178,8 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting STAGE2_COMPACT_BUS $compact_bus
     set_global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS $compact_bus_min_members
     set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
+    set_global_setting STAGE2_METADATA_BATCH_ENABLED $metadata_batch_enabled
+    set_global_setting STAGE2_METADATA_BATCH_SIZE $metadata_batch_size
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
     set_global_setting STAGE2_TEXT_ENCODING $text_encoding
@@ -6114,6 +6203,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Recursive mode      : $recursive_chain_mode"
     puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
     puts "INFO: Batch open-to query : $batch_open_to_query"
+    puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
     puts "INFO: Text encoding       : $text_encoding"
 
@@ -6146,7 +6236,9 @@ proc stage2_delay::run_from_user_settings {} {
         -max_enum_objects $max_enum_objects \
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
-        -batch_open_to_query $batch_open_to_query
+        -batch_open_to_query $batch_open_to_query \
+        -metadata_batch_enabled $metadata_batch_enabled \
+        -metadata_batch_size $metadata_batch_size
 
     puts "INFO: Stage 2 complete."
     puts "INFO: Generated E2E SDC   : $out_e2e_sdc"
