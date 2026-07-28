@@ -709,6 +709,129 @@ for {set idx 0} {$idx < 2} {incr idx} {
     assert_contains(inclusive["trace"], "expanded=6 product=6 elapsed_ms=")
 
 
+def test_top_port_mapping_cannot_bypass_matrix_pair_limit():
+    top_sdc = "set_max_delay 2.0 -from %s -to [get_ports cfg_top]\n" % get_pins_list(
+        "src", range(2)
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    src[0] out
+    src[1] out
+    cfg_top out
+    u_h0/cfg_i in
+    u_h1/cfg_i in
+    u_h2/cfg_i in
+}
+
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/cfg_i u_h2/cfg_i]
+        }
+        return {}
+    }
+    return [lindex $args end]
+}
+'''
+    result = run_case(
+        "top_port_mapping_matrix_limit",
+        top_sdc,
+        "",
+        extra_build_args=[
+            "-max_segment_pairs", "2",
+            "-generate_clock_group_review", "false",
+        ],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1"),
+            ("h2", "u_h2", "harden2"),
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    report = read_file(result["report"])
+    for name, expected in {
+        "matrix_expansion_limited": 1,
+        "matrix_pairs_avoided": 6,
+        "matrix_pairs_expanded": 2,
+    }.items():
+        actual = stat_value(report, name)
+        if actual != expected:
+            raise AssertionError(
+                "Unexpected mapped matrix statistic %s=%d, expected %d:\n%s"
+                % (name, actual, expected, report)
+            )
+    assert_contains(result["review"], "reason=MATRIX_EXPANSION_LIMIT")
+    assert_contains(result["review"], "matrix_from_count=2")
+    assert_contains(result["review"], "matrix_to_count=3")
+    assert_contains(result["review"], "matrix_pair_count=6")
+    if read_file(result["review"]).count("reason=MATRIX_EXPANSION_LIMIT") != 1:
+        raise AssertionError("Mapped matrix limit must create one command-level review")
+    assert_contains(
+        result["trace"],
+        "product=6 action=MATRIX_EXPANSION_LIMIT limit=2 phase=TOP_PORT_MAP original=preserved",
+    )
+    assert_not_contains(result["report"], "TOP_PORT_BOUNDARY_MAP")
+    assert_contains(result["final"], top_sdc.strip())
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+    if delay_command_lines(result["out_sdc"]):
+        raise AssertionError("Mapped over-limit matrix unexpectedly generated E2E delays")
+
+
+def test_final_rewrite_preserves_structural_and_limited_commands():
+    merged_top = "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]"
+    structural_top = "set_max_delay 1.0 -from %s -to %s" % (
+        get_pins_list("u_local/src", range(2)),
+        get_pins_list("u_local/dst", range(2)),
+    )
+    limited_top = "set_max_delay 3.0 -from %s -to %s" % (
+        get_pins_list("src", range(3)),
+        get_pins_list("u_h0/cfg", range(2)),
+    )
+    top_sdc = "\n".join([merged_top, structural_top, limited_top]) + "\n"
+    prelude = r'''
+for {set idx 0} {$idx < 3} {incr idx} {
+    set ::PT_MOCK_DIRECTIONS([format {src[%d]} $idx]) out
+}
+for {set idx 0} {$idx < 2} {incr idx} {
+    set ::PT_MOCK_DIRECTIONS([format {u_h0/cfg[%d]} $idx]) in
+}
+'''
+    result = run_case(
+        "final_rewrite_preserves_structural_and_limited",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=[
+            "-max_segment_pairs", "5",
+            "-generate_clock_group_review", "false",
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["out_sdc"], "set_max_delay 7")
+    assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+    assert_contains(result["final"], structural_top)
+    assert_contains(result["final"], limited_top)
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000002")
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000003")
+    assert_contains(result["review"], "reason=MATRIX_EXPANSION_LIMIT")
+    if read_file(result["review"]).count("reason=MATRIX_EXPANSION_LIMIT") != 1:
+        raise AssertionError("Final rewrite case must keep one limited command review")
+    report = read_file(result["report"])
+    if stat_value(report, "structural_passthrough_commands") != 1:
+        raise AssertionError("Expected one structural command in mixed final rewrite case")
+    if stat_value(report, "matrix_expansion_limited") != 1:
+        raise AssertionError("Expected one limited command in mixed final rewrite case")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
 def test_structural_passthrough_immediate_boundary_uses_legacy_hydration():
     prelude = r'''
 set ::BOUNDARY_METADATA_LOG [file join [pwd] boundary_metadata_calls.log]
@@ -2763,6 +2886,8 @@ def main():
         test_matrix_pair_query_failure_does_not_silently_skip,
         test_structural_passthrough_skips_getters_and_matrix_expansion,
         test_matrix_segment_pair_limit_and_inclusive_boundary,
+        test_top_port_mapping_cannot_bypass_matrix_pair_limit,
+        test_final_rewrite_preserves_structural_and_limited_commands,
         test_structural_passthrough_immediate_boundary_uses_legacy_hydration,
         test_structural_passthrough_unsafe_object_shapes_use_legacy_flow,
         test_top_open_from_infers_static_startpoint,
