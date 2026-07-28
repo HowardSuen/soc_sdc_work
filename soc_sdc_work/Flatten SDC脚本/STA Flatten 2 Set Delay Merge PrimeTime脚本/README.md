@@ -288,7 +288,9 @@ set STAGE2_MAX_SEGMENT_PAIRS 100000
 - `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
   `from x to` pair 数，对应 build option `-max_segment_pairs`。结构直通判定优先于
   此上限；仍可能涉及 boundary 且乘积超过上限时，脚本不截断、不部分消费，而是
-  保留整条原约束并增加一条 `MATRIX_EXPANSION_LIMIT` review。
+  保留整条原约束并增加一条 `MATRIX_EXPANSION_LIMIT` review。top port 经 direct
+  connectivity 映射到多个 harden boundary 后，会按原始命令重新汇总映射后的总
+  pair 数并再次判限，不能通过二次展开绕过该保护。
 - v0.9.10 对每条 delay 输出 `SEGMENT_PLAN`；实际多 pair 展开另有
   `SEGMENT_EXPAND_BEGIN`、有界 `SEGMENT_EXPAND_PROGRESS` 和
   `SEGMENT_EXPAND_END`，包含 from/to/product、完成数和 elapsed_ms。
@@ -938,7 +940,7 @@ python3 regression_test/run_regression.py
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 55 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 57 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -982,7 +984,8 @@ SEGMENT_EXPAND_END source=top id=CMD000125 file={...} line=12002 expanded=20000 
 `-max_segment_pairs` 必须是大于等于 1 的整数。提高上限只影响 Stage 2 自动展开
 能力；上限触发时 source SDC 约束仍保留，因此不会因为性能保护而静默失去 timing
 constraint。需要提高上限前，应先结合 `stage2_live.log`、内存和 review 确认该矩阵
-确实需要逐 pair 合并。
+确实需要逐 pair 合并。对于 `get_ports` endpoint，限制同时应用于 connectivity
+映射后的 command-level pair 总数；超限时不会生成部分 boundary mapping。
 
 同一台机器上的 mock-Tcl `200 x 200` 受控微基准，v0.9.9 三次中位数为
 `287 ms`、生成 40000 个 segment 并调用 4 次 getter；v0.9.10 中位数为

@@ -2067,13 +2067,105 @@ proc stage2_delay::map_top_port_boundary_segments {} {
         return
     }
 
-    set mapped {}
+    array set command_segments {}
+    set command_order {}
     foreach seg $top_segments {
-        foreach mapped_seg [map_top_port_boundary_segment $seg] {
+        array set s $seg
+        set command_key [list $s(source_file) $s(original_id)]
+        if {![info exists command_segments($command_key)]} {
+            set command_segments($command_key) {}
+            lappend command_order $command_key
+        }
+        lappend command_segments($command_key) $seg
+        array unset s
+    }
+
+    set mapped {}
+    foreach command_key $command_order {
+        foreach mapped_seg [map_top_port_boundary_command_segments $command_segments($command_key)] {
             lappend mapped $mapped_seg
         }
     }
     set top_segments $mapped
+}
+
+proc stage2_delay::map_top_port_boundary_command_segments {segments} {
+    variable options
+    if {[llength $segments] == 0} {
+        return {}
+    }
+
+    set mapped_total 0
+    set has_port_mapping 0
+    foreach seg $segments {
+        set boundaries [top_port_input_boundaries_for_segment $seg]
+        if {[llength $boundaries] > 0} {
+            incr mapped_total [llength $boundaries]
+            set has_port_mapping 1
+        } else {
+            incr mapped_total
+        }
+    }
+
+    if {$has_port_mapping && $mapped_total > $options(-max_segment_pairs)} {
+        array set s [lindex $segments 0]
+        set from_count $s(matrix_from_count)
+        set effective_from_count [expr {$from_count > 0 ? $from_count : 1}]
+        set mapped_to_count [expr {$mapped_total / $effective_from_count}]
+        set s(id) $s(original_id)
+        set s(split_index) 1
+        set s(split_total) 1
+        set s(status) review
+        set s(failure_reason) MATRIX_EXPANSION_LIMIT
+        set s(matrix_from_count) $from_count
+        set s(matrix_to_count) $mapped_to_count
+        set s(matrix_pair_count) $mapped_total
+        set s(matrix_limit) $options(-max_segment_pairs)
+        set s(top_port_map_limited) true
+        unset -nocomplain s(rewrite_to_records)
+        unset -nocomplain s(top_port_map_group)
+        unset -nocomplain s(top_port_map_total)
+        unset -nocomplain s(mapped_from_top_port)
+        unset -nocomplain s(mapped_boundary_index)
+        unset -nocomplain s(mapped_boundary_name)
+        performance_stat_add matrix_expansion_limited
+        performance_stat_add matrix_pairs_avoided $mapped_total
+        trace_event SEGMENT_PLAN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$mapped_to_count product=$mapped_total action=MATRIX_EXPANSION_LIMIT limit=$options(-max_segment_pairs) phase=TOP_PORT_MAP original=preserved"
+        add_report_item "MATRIX_EXPANSION_LIMIT source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$mapped_to_count product=$mapped_total limit=$options(-max_segment_pairs) phase=TOP_PORT_MAP original=preserved"
+        set result [array get s]
+        array unset s
+        return [list $result]
+    }
+
+    set out {}
+    foreach seg $segments {
+        foreach mapped_seg [map_top_port_boundary_segment $seg] {
+            lappend out $mapped_seg
+        }
+    }
+    return $out
+}
+
+proc stage2_delay::top_port_input_boundaries_for_segment {seg} {
+    array set s $seg
+    if {$s(status) ne "ok" || [llength $s(to_records)] != 1} {
+        array unset s
+        return {}
+    }
+
+    array set to [lindex $s(to_records) 0]
+    if {$to(object_class) ne "port" || $to(owner_harden_inst) ne ""} {
+        array unset to
+        array unset s
+        return {}
+    }
+
+    set connected [pt_harden_pins_connected_to_port $to(full_name)]
+    set result [filter_harden_boundary_input_records $connected]
+    array unset to
+    array unset s
+    return $result
 }
 
 proc stage2_delay::map_top_port_boundary_segment {seg} {
@@ -2091,8 +2183,7 @@ proc stage2_delay::map_top_port_boundary_segment {seg} {
         return [list $seg]
     }
 
-    set connected [pt_harden_pins_connected_to_port $to(full_name)]
-    set input_boundaries [filter_harden_boundary_input_records $connected]
+    set input_boundaries [top_port_input_boundaries_for_segment $seg]
     if {[llength $input_boundaries] == 0} {
         array unset to
         array unset s
