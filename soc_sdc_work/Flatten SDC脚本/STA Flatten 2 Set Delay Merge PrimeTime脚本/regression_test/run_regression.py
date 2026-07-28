@@ -192,6 +192,14 @@ def assert_text_contains(text, needle):
         raise AssertionError("Expected %r in text\n--- text ---\n%s" % (needle, text))
 
 
+def delay_command_lines(path):
+    return [
+        line.strip()
+        for line in read_file(path).splitlines()
+        if line.strip().startswith(("set_max_delay ", "set_min_delay "))
+    ]
+
+
 def stat_value(text, name):
     match = re.search(r"(?:^|[,: ])%s=([0-9]+)" % re.escape(name), text)
     if not match:
@@ -740,6 +748,296 @@ proc get_pins {args} {
     assert_text_contains(result["stdout"], "object metadata batch fallback")
     validate_static_sdc(result["out_sdc"])
     validate_static_sdc(result["final"])
+
+
+def test_object_metadata_chunk_sizes_preserve_output_and_trace():
+    indices = list(range(10))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+for {set idx 0} {$idx < 10} {incr idx} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+set ::METADATA_CHUNK_LOG [file join [pwd] metadata_chunk_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    set fout [open $::METADATA_CHUNK_LOG a]
+    puts $fout "[llength $patterns]|[join $patterns ,]"
+    close $fout
+    return [lreverse $patterns]
+}
+'''
+    commands_by_size = {}
+    results = {}
+    for size in (1, 4, 128):
+        result = run_case(
+            "metadata_chunk_size_%d" % size,
+            top_sdc,
+            "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+            extra_build_args=["-metadata_batch_size", str(size)],
+            prelude=prelude,
+        )
+        require_ok(result)
+        commands_by_size[size] = delay_command_lines(result["out_sdc"])
+        results[size] = result
+        if len(commands_by_size[size]) != len(indices):
+            raise AssertionError(
+                "Metadata chunk size %d changed generated command count: %s"
+                % (size, commands_by_size[size])
+            )
+
+    if commands_by_size[1] != commands_by_size[4] or commands_by_size[4] != commands_by_size[128]:
+        raise AssertionError("Metadata chunk size changed generated SDC semantics: %r" % commands_by_size)
+
+    functional_outputs = {}
+    for size, result in results.items():
+        output_paths = [
+            result["out_sdc"],
+            result["final"],
+            result["removed"],
+            result["review"],
+            os.path.join(result["summary"], "00_index.csv"),
+            os.path.join(result["summary"], "top.csv"),
+            os.path.join(result["summary"], "u_h0.csv"),
+        ]
+        case_dir = result["case_dir"].replace("\\", "/")
+        functional_outputs[size] = [
+            read_file(path).replace(case_dir, "<CASE_DIR>")
+            for path in output_paths
+        ]
+    if functional_outputs[1] != functional_outputs[4] or functional_outputs[4] != functional_outputs[128]:
+        raise AssertionError("Metadata chunk size changed normalized functional outputs")
+
+    chunked = results[4]
+    calls = read_file(os.path.join(chunked["case_dir"], "metadata_chunk_calls.log")).splitlines()
+    source_batch_sizes = [
+        int(line.split("|", 1)[0])
+        for line in calls
+        if "|src[" in line
+    ]
+    if source_batch_sizes != [4, 4, 2]:
+        raise AssertionError("Expected metadata chunks 4/4/2, got %r from %r" % (source_batch_sizes, calls))
+    report = read_file(chunked["report"])
+    if stat_value(report, "metadata_batch_queries") != 3:
+        raise AssertionError("Expected three metadata chunk queries:\n%s" % report)
+    if stat_value(report, "metadata_batch_successes") != 3:
+        raise AssertionError("Expected three successful metadata chunks:\n%s" % report)
+    if stat_value(report, "metadata_batch_records") != len(indices):
+        raise AssertionError("Unexpected metadata chunk record count:\n%s" % report)
+    assert_contains(chunked["report"], "Metadata batch enabled          : true")
+    assert_contains(chunked["report"], "Metadata batch size             : 4")
+    assert_contains(chunked["trace"], "METADATA_BATCH_BEGIN class=pin chunk=1/3 getter=get_pins patterns=4")
+    assert_contains(chunked["trace"], "METADATA_BATCH_END class=pin chunk=3/3 status=OK patterns=2 returned=2")
+    assert_contains(chunked["trace"], "elapsed_ms=")
+    validate_static_sdc(chunked["out_sdc"])
+    validate_static_sdc(chunked["final"])
+
+
+def test_object_metadata_failed_middle_chunk_only_falls_back():
+    indices = list(range(10))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+for {set idx 0} {$idx < 10} {incr idx} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+set ::METADATA_FAILURE_LOG [file join [pwd] metadata_failure_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    set mode [expr {[llength $patterns] > 1 ? "BATCH" : "SINGLE"}]
+    set fout [open $::METADATA_FAILURE_LOG a]
+    puts $fout "$mode|[join $patterns ,]"
+    close $fout
+    return $patterns
+}
+
+proc foreach_in_collection {var coll body} {
+    upvar 1 $var item
+    set visited 0
+    foreach item $coll {
+        uplevel 1 $body
+        incr visited
+        if {[llength $coll] == 4 &&
+            [lsearch -exact $coll {src[4]}] >= 0 &&
+            $visited == 2} {
+            error "mock failure after partial middle metadata chunk"
+        }
+    }
+}
+'''
+    result = run_case(
+        "metadata_failed_middle_chunk",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-metadata_batch_size", "4"],
+        prelude=prelude,
+    )
+    require_ok(result)
+    if len(delay_command_lines(result["out_sdc"])) != len(indices):
+        raise AssertionError("Failed metadata chunk lost generated constraints")
+    calls = read_file(os.path.join(result["case_dir"], "metadata_failure_calls.log")).splitlines()
+    source_singles = sorted(
+        line.split("|", 1)[1]
+        for line in calls
+        if line.startswith("SINGLE|src[")
+    )
+    expected_singles = ["src[%d]" % idx for idx in range(4, 8)]
+    if source_singles != expected_singles:
+        raise AssertionError("Only the failed middle chunk should fall back: %r" % calls)
+    report = read_file(result["report"])
+    if stat_value(report, "metadata_batch_queries") != 3:
+        raise AssertionError("Expected all three chunks to run:\n%s" % report)
+    if stat_value(report, "metadata_batch_successes") != 2:
+        raise AssertionError("Expected two successful chunks:\n%s" % report)
+    if stat_value(report, "metadata_batch_fallbacks") != 1:
+        raise AssertionError("Expected one failed-chunk fallback:\n%s" % report)
+    if stat_value(report, "metadata_batch_returned_records") != 8:
+        raise AssertionError("Expected partial failed-chunk returns in statistics:\n%s" % report)
+    assert_contains(result["trace"], "METADATA_BATCH_END class=pin chunk=2/3 status=ERROR patterns=4 returned=2")
+    assert_contains(result["trace"], "METADATA_BATCH_FALLBACK class=pin chunk=2/3 patterns=4")
+    assert_contains(result["trace"], "METADATA_BATCH_END class=pin chunk=3/3 status=OK")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_object_metadata_mismatched_middle_chunk_only_falls_back():
+    indices = list(range(10))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+for {set idx 0} {$idx < 10} {incr idx} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+set ::METADATA_MISMATCH_LOG [file join [pwd] metadata_mismatch_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    set mode [expr {[llength $patterns] > 1 ? "BATCH" : "SINGLE"}]
+    set fout [open $::METADATA_MISMATCH_LOG a]
+    puts $fout "$mode|[join $patterns ,]"
+    close $fout
+    if {$mode eq "BATCH" && [lsearch -exact $patterns {src[4]}] >= 0} {
+        return [lrange $patterns 0 end-1]
+    }
+    return $patterns
+}
+'''
+    result = run_case(
+        "metadata_mismatched_middle_chunk",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-metadata_batch_size", "4"],
+        prelude=prelude,
+    )
+    require_ok(result)
+    if len(delay_command_lines(result["out_sdc"])) != len(indices):
+        raise AssertionError("Mismatched metadata chunk lost generated constraints")
+    calls = read_file(os.path.join(result["case_dir"], "metadata_mismatch_calls.log")).splitlines()
+    source_singles = sorted(
+        line.split("|", 1)[1]
+        for line in calls
+        if line.startswith("SINGLE|src[")
+    )
+    expected_singles = ["src[%d]" % idx for idx in range(4, 8)]
+    if source_singles != expected_singles:
+        raise AssertionError("Only the mismatched middle chunk should fall back: %r" % calls)
+    report = read_file(result["report"])
+    if stat_value(report, "metadata_batch_successes") != 2:
+        raise AssertionError("Expected two successful chunks around mismatch:\n%s" % report)
+    if stat_value(report, "metadata_batch_fallbacks") != 1:
+        raise AssertionError("Expected one mismatch fallback:\n%s" % report)
+    assert_contains(result["trace"], "METADATA_BATCH_END class=pin chunk=2/3 status=MISMATCH patterns=4 returned=3")
+    assert_contains(result["trace"], "METADATA_BATCH_FALLBACK class=pin chunk=2/3 patterns=4")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_object_metadata_batch_can_be_disabled_without_skipping_queries():
+    indices = list(range(8))
+    top_sdc = (
+        "set_max_delay 2.0 -from %s -to [get_pins u_h0/cfg_i]\n"
+        % get_pins_list("src", indices)
+    )
+    prelude = r'''
+for {set idx 0} {$idx < 8} {incr idx} {
+    set name [format {src[%d]} $idx]
+    set ::PT_MOCK_DIRECTIONS($name) out
+}
+set ::METADATA_DISABLED_LOG [file join [pwd] metadata_disabled_calls.log]
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1} {
+        error "metadata batching must be disabled"
+    }
+    set fout [open $::METADATA_DISABLED_LOG a]
+    puts $fout [lindex $patterns 0]
+    close $fout
+    return $patterns
+}
+'''
+    result = run_case(
+        "metadata_batch_disabled",
+        top_sdc,
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-metadata_batch_enabled", "false"],
+        prelude=prelude,
+    )
+    require_ok(result)
+    if len(delay_command_lines(result["out_sdc"])) != len(indices):
+        raise AssertionError("Disabled metadata batch skipped direction queries")
+    calls = read_file(os.path.join(result["case_dir"], "metadata_disabled_calls.log")).splitlines()
+    source_calls = sorted(name for name in calls if name.startswith("src["))
+    expected_calls = ["src[%d]" % idx for idx in indices]
+    if source_calls != expected_calls:
+        raise AssertionError("Expected every source pin to be queried individually: %r" % calls)
+    report = read_file(result["report"])
+    if stat_value(report, "metadata_batch_queries") != 0:
+        raise AssertionError("Disabled metadata batch issued a batch query:\n%s" % report)
+    if stat_value(report, "metadata_batch_disabled_groups") != 1:
+        raise AssertionError("Expected one disabled metadata group:\n%s" % report)
+    if stat_value(report, "metadata_individual_queries") < len(indices):
+        raise AssertionError("Expected individual metadata queries:\n%s" % report)
+    assert_contains(result["report"], "Metadata batch enabled          : false")
+    assert_contains(result["trace"], "METADATA_BATCH_DISABLED class=pin records=8 mode=individual")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
+def test_object_metadata_batch_size_validation():
+    for value, token in (("0", "zero"), ("-2", "negative"), ("abc", "text")):
+        result = run_case(
+            "metadata_batch_invalid_size_%s" % token,
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+            "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+            extra_build_args=["-metadata_batch_size", value],
+        )
+        if result["code"] == 0:
+            raise AssertionError("metadata_batch_size=%s must be rejected" % value)
+        assert_text_contains(result["stderr"], "-metadata_batch_size must be an integer >= 1")
 
 
 def test_startpoint_and_boundary_queries_are_cached():
@@ -2152,6 +2450,11 @@ def main():
         test_top_open_to_multi_from_through_and_endpoint_expansion,
         test_object_metadata_batches_explicit_pin_list,
         test_object_metadata_batch_failure_falls_back_without_loss,
+        test_object_metadata_chunk_sizes_preserve_output_and_trace,
+        test_object_metadata_failed_middle_chunk_only_falls_back,
+        test_object_metadata_mismatched_middle_chunk_only_falls_back,
+        test_object_metadata_batch_can_be_disabled_without_skipping_queries,
+        test_object_metadata_batch_size_validation,
         test_startpoint_and_boundary_queries_are_cached,
         test_missing_path_fanout_queries_are_cached,
         test_final_rewrite_reuses_parsed_segments_and_skips_untouched_sdc,

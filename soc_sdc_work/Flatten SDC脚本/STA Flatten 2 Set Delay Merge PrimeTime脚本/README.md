@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.8。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.9。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -85,6 +85,8 @@ set ::MAX_CHAIN_DEPTH 6
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
+set ::STAGE2_METADATA_BATCH_ENABLED true
+set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -143,6 +145,8 @@ set ::MAX_CHAIN_DEPTH 6
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
+set ::STAGE2_METADATA_BATCH_ENABLED true
+set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -183,6 +187,8 @@ set MAX_ENUM_OBJECTS 64
 set STAGE2_COMPACT_BUS true
 set STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set STAGE2_BATCH_OPEN_TO_QUERY true
+set STAGE2_METADATA_BATCH_ENABLED true
+set STAGE2_METADATA_BATCH_SIZE 128
 ```
 
 这些默认值含义如下：
@@ -267,9 +273,20 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 - v0.9.7 在 `unmerged_delay_review.rpt` 开头增加 run conclusion、最高严重度、
   severity 统计、reason 类型统计和建议动作；逐条详情增加 `[ERROR]` / `[WARNING]` /
   `[INFO]` 前缀。未知 reason 默认按 `WARNING` 展示，原始 key/value 字段保持不变。
+- v0.9.9 将 direction metadata 的 pin/port/cell/net 查询限制为可配置分块，默认
+  每块 128 个 pattern。每块独立比较 expected/actual `full_name` 集合；成功块立即
+  写入 cache，命令报错、少返回或多返回时只对失败块逐对象回退。关闭 batching
+  也只是切换到逐对象查询，不会跳过 direction 检查或改变最终约束语义。
+- `STAGE2_METADATA_BATCH_SIZE=128`：控制一次 `get_pins` / `get_ports` /
+  `get_cells` / `get_nets` metadata 查询的最大 pattern 数。大型 PT database 中
+  若单块仍然较慢，可以降为 64 或 32；增大数值会减少调用次数，但可能重新放大
+  单次 multi-pattern 查询延迟。
+- `STAGE2_METADATA_BATCH_ENABLED=false`：诊断开关。关闭后所有待查对象使用原有
+  逐对象 getter 和 `get_attribute direction` 路径，功能校验仍完整执行。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
-  会记录 metadata batch/fallback、单对象查询、缓存命中、segment index lookup、
-  final rewrite 命中、signature lookup 与跳过文件数，便于定位大型设计中的实际热点。
+  会记录 metadata chunk 成功/失败、返回对象数、总耗时、关闭分组、单对象查询、
+  缓存命中、segment index lookup、final rewrite 命中、signature lookup 与跳过文件数，
+  便于定位大型设计中的实际热点。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -834,6 +851,8 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -compact_bus true
 -compact_bus_min_members 4
 -batch_open_to_query true
+-metadata_batch_enabled true
+-metadata_batch_size 128
 -verbose_pt_query true
 -write_path_summary true
 -generate_clock_group_review true
@@ -861,8 +880,9 @@ python3 regression_test/run_regression.py
   验证 top open_to 只执行一次批量 endpoint fanout
 - bus 缺 bit、wildcard 额外匹配时拒绝压缩并保留精确成员
 - multi-pattern getter 报错时自动回退逐 seed 查询，确认所有约束仍完整生成
-- 64 个显式 pin 的 direction metadata 批量查询，以及批量返回集合不完整时的
-  逐对象安全回退
+- 64 个显式 pin 的 direction metadata 批量查询；不同 chunk size 输出等价、
+  collection 返回顺序变化不影响约束顺序、中间 chunk 报错或集合不完整时只回退
+  失败块、关闭 batching 后仍逐对象查询，以及非法 batch size 参数拒绝
 - harden boundary/startpoint 和 missing-SDC fanin/fanout 查询缓存，确认同一
   logical key 不重复调用 PT
 - segment boundary 索引、首次解析结果复用，以及未消费 SDC 文件直接写出
@@ -898,7 +918,7 @@ python3 regression_test/run_regression.py
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 45 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 50 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -909,6 +929,34 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.9 Metadata Batch Chunking
+
+大型 linked design 中，一次提交数千个 full-name pattern 的 `get_pins -quiet`
+可能长时间不返回。v0.9.9 默认把同一 object class 的待查名称按 128 个一组提交。
+例如 2156 个 pin 会拆成 17 个 chunk，而不是一次查询全部对象。
+
+`stage2_live.log` 对每个 chunk 写入实时 BEGIN/END：
+
+```text
+METADATA_BATCH_BEGIN class=pin chunk=1/17 getter=get_pins patterns=128
+METADATA_BATCH_END class=pin chunk=1/17 status=OK patterns=128 returned=128 unique_returned=128 elapsed_ms=420
+```
+
+异常块会记录 `status=ERROR` 或 `status=MISMATCH`，随后出现：
+
+```text
+METADATA_BATCH_FALLBACK class=pin chunk=6/17 patterns=128 ... mode=individual
+```
+
+前后已经成功的 chunk 不会重复查询。计时和日志只用于诊断，不参与 merge、方向
+判断或约束生成。若需要验证是否为 multi-pattern getter 导致性能问题，可以设置：
+
+```tcl
+set ::STAGE2_METADATA_BATCH_ENABLED false
+```
+
+该模式仍会逐个查询每个对象的 direction，因此不会因为关闭优化而漏掉功能检查。
 
 ## v0.9.8 Clock Review
 
