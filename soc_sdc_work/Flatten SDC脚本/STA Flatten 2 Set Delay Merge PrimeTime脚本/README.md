@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.9。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.10。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -87,6 +87,7 @@ set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
+set ::STAGE2_MAX_SEGMENT_PAIRS 100000
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -147,6 +148,7 @@ set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
+set ::STAGE2_MAX_SEGMENT_PAIRS 100000
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -189,6 +191,7 @@ set STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set STAGE2_BATCH_OPEN_TO_QUERY true
 set STAGE2_METADATA_BATCH_ENABLED true
 set STAGE2_METADATA_BATCH_SIZE 128
+set STAGE2_MAX_SEGMENT_PAIRS 100000
 ```
 
 这些默认值含义如下：
@@ -277,6 +280,18 @@ set STAGE2_METADATA_BATCH_SIZE 128
   每块 128 个 pattern。每块独立比较 expected/actual `full_name` 集合；成功块立即
   写入 cache，命令报错、少返回或多返回时只对失败块逐对象回退。关闭 batching
   也只是切换到逐对象查询，不会跳过 direction 检查或改变最终约束语义。
+- v0.9.10 在 metadata hydration 和 `from x to` 展开前增加结构直通判定。仅当
+  `-from`、`-to` 及可选 `-through` 都是非空、无 wildcard 的精确 `get_pins`
+  表达式，并且没有任何对象可能是当前 Stage 2 harden 的 immediate boundary pin
+  时，整条命令直接记为一个 structural passthrough。原始 SDC 命令逐字保留，
+  不查询 direction、不生成 pair segment，也不进入 consume/partial rewrite。
+- `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
+  `from x to` pair 数，对应 build option `-max_segment_pairs`。结构直通判定优先于
+  此上限；仍可能涉及 boundary 且乘积超过上限时，脚本不截断、不部分消费，而是
+  保留整条原约束并增加一条 `MATRIX_EXPANSION_LIMIT` review。
+- v0.9.10 对每条 delay 输出 `SEGMENT_PLAN`；实际多 pair 展开另有
+  `SEGMENT_EXPAND_BEGIN`、有界 `SEGMENT_EXPAND_PROGRESS` 和
+  `SEGMENT_EXPAND_END`，包含 from/to/product、完成数和 elapsed_ms。
 - `STAGE2_METADATA_BATCH_SIZE=128`：控制一次 `get_pins` / `get_ports` /
   `get_cells` / `get_nets` metadata 查询的最大 pattern 数。大型 PT database 中
   若单块仍然较慢，可以降为 64 或 32；增大数值会减少调用次数，但可能重新放大
@@ -285,8 +300,9 @@ set STAGE2_METADATA_BATCH_SIZE 128
   逐对象 getter 和 `get_attribute direction` 路径，功能校验仍完整执行。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata chunk 成功/失败、返回对象数、总耗时、关闭分组、单对象查询、
-  缓存命中、segment index lookup、final rewrite 命中、signature lookup 与跳过文件数，
-  便于定位大型设计中的实际热点。
+  structural passthrough 命令/对象、避免及实际展开的 matrix pair、上限触发次数、
+  展开耗时、缓存命中、segment index lookup、final rewrite 命中、signature lookup
+  与跳过文件数，便于定位大型设计中的实际热点。
 - `RECURSIVE_CHAIN_MODE=auto`：自动沿 harden output -> harden input 的 top
   delay 继续递归串接，不需要用户手工调用单跳输出。
 - `MAX_CHAIN_DEPTH=6`：递归串接最大深度，用于防止异常环路。
@@ -773,10 +789,13 @@ stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束
   boundary pin，或只映射到 harden output boundary pin。
 - PT `get_attribute <object> direction` 返回空，导致脚本无法 golden 判断
   input/output 方向。
+- 非结构直通的单条 delay 若 `from x to` 超过 `STAGE2_MAX_SEGMENT_PAIRS`，进入
+  `MATRIX_EXPANSION_LIMIT` review；原始命令完整保留。
 
 passthrough segment 只在 report 中计数，不会塞进人工 review 报告。例如 harden
 内部对象到内部对象的纯内部 delay，或者 top 内部 delay，默认都不是 Stage 2
-merge candidate。
+merge candidate。v0.9.10 对可静态证明不含 immediate harden boundary 的精确
+pin 矩阵按原始命令计为一个 passthrough，而不是按笛卡尔积 pair 数计数。
 
 ## PrimeTime API 假设
 
@@ -853,6 +872,7 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -batch_open_to_query true
 -metadata_batch_enabled true
 -metadata_batch_size 128
+-max_segment_pairs 100000
 -verbose_pt_query true
 -write_path_summary true
 -generate_clock_group_review true
@@ -918,7 +938,7 @@ python3 regression_test/run_regression.py
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 50 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 55 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -929,6 +949,48 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.10 Structural Passthrough 与 Matrix Guard
+
+DC 可能生成包含数千个 `-from` 和 `-to` pin 的完整 delay 命令。旧流程先查询
+所有对象 direction，再立即生成完整笛卡尔积，最后才在 classification 阶段发现
+这些深层 internal-to-internal pair 全部是 passthrough。例如 `4896 x 2156` 会产生
+`10,555,776` 个中间 segment；对应 max/min 两条命令会重复这次展开。
+
+v0.9.10 先解析静态 object record。满足以下全部条件时执行 structural passthrough：
+
+- 同时存在显式 `-from` 和 `-to`，delay 数值有效且没有 edge-specific option。
+- `-from`、`-to` 和每个 `-through` 都只由精确 `get_pins` / `list` 构成。
+- 不包含 wildcard、变量、clock、port、cell、net、unknown 或动态 collection option。
+- top 命令的所有对象都不是任一 listed harden 的 immediate pin；harden 命令的
+  所有对象都不是当前 harden instance 的 immediate pin。
+
+命中后不会调用 `get_pins` / `get_attribute direction`，不会 materialize pair，
+不会 consume 原命令。final flatten SDC 仍保留 source SDC 中的原始命令文本。
+包含一个 boundary 候选的 mixed matrix 会整体回落旧 metadata/classification 流程，
+因此不会把可合并的 boundary pair 错判为 passthrough。
+
+实时 trace 示例：
+
+```text
+SEGMENT_PLAN source=top id=CMD000123 file={...} line=11957 from=4896 to=2156 product=10555776 action=STRUCTURAL_PASSTHROUGH reason=NO_IMMEDIATE_HARDEN_BOUNDARY
+SEGMENT_PLAN source=top id=CMD000124 file={...} line=12001 from=400 to=400 product=160000 action=MATRIX_EXPANSION_LIMIT limit=100000 original=preserved
+SEGMENT_EXPAND_BEGIN source=top id=CMD000125 file={...} line=12002 from=100 to=200 product=20000
+SEGMENT_EXPAND_END source=top id=CMD000125 file={...} line=12002 expanded=20000 product=20000 elapsed_ms=...
+```
+
+`-max_segment_pairs` 必须是大于等于 1 的整数。提高上限只影响 Stage 2 自动展开
+能力；上限触发时 source SDC 约束仍保留，因此不会因为性能保护而静默失去 timing
+constraint。需要提高上限前，应先结合 `stage2_live.log`、内存和 review 确认该矩阵
+确实需要逐 pair 合并。
+
+同一台机器上的 mock-Tcl `200 x 200` 受控微基准，v0.9.9 三次中位数为
+`287 ms`、生成 40000 个 segment 并调用 4 次 getter；v0.9.10 中位数为
+`47 ms`、保留 1 个 command-level segment 且 getter 为 0，耗时减少约 83.6%，
+约 6.1x。真实 `link_local.sdc` 第 11947-11958 行的 12 条命令也已逐条解析验证，
+共避免 `22,082,432` 个 pair，其中 `4896 x 2156` 单条避免 `10,555,776` 个。
+这些数字只衡量 mock/解析路径，不代表真实 PrimeTime 全流程的固定加速比例；真实
+收益仍需用新旧版本的 `BUILD_START/BUILD_COMPLETE` 和各 phase 时间对比。
 
 ## v0.9.9 Metadata Batch Chunking
 
