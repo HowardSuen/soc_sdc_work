@@ -535,6 +535,61 @@ proc all_fanin {args} {
     validate_static_sdc(result["final"])
 
 
+def test_sparse_matrix_numeric_bus_clock_bits_remain_exact_pins():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    {u_clk/CP[0]} in
+    {u_clk/CP[1]} in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+
+rename get_attribute stage2_numeric_bus_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {{u_clk/CP[0]} {u_clk/CP[1]}}} {
+        return true
+    }
+    return [stage2_numeric_bus_get_attribute $obj $attr]
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} {
+        return [list {u_clk/CP[0]}]
+    }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} {
+        return [list {u_clk/CP[1]}]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_numeric_bus_clock_bits",
+        "set_max_delay 2.0 -from [list [get_pins -quiet -exact {u_clk/CP[0]}] [get_pins -exact {u_clk/CP[1]}]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            )
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "product=4 pruned=2 retained=2")
+    generated = delay_command_lines(result["out_sdc"])
+    if len(generated) != 2:
+        raise AssertionError("Numeric bus clock bits were not treated as exact pins:\n%s" % read_file(result["out_sdc"]))
+    assert_contains(result["out_sdc"], "-from [get_pins {u_clk/CP[0]}]")
+    assert_contains(result["out_sdc"], "-from [get_pins {u_clk/CP[1]}]")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
+
+
 def test_matrix_pair_query_failure_does_not_silently_skip():
     prelude = r'''
 rename get_attribute stage2_default_get_attribute
@@ -559,6 +614,129 @@ proc get_attribute {obj attr} {
     assert_text_contains(trace, "INVALID_STARTPOINT")
     assert_contains(result["final"], "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP]]")
     assert_contains(result["review"], "INVALID_STARTPOINT")
+
+
+def test_sparse_matrix_missing_collection_iterator_is_unknown():
+    original = (
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] "
+        "[get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] "
+        "[get_pins u_h1/cfg_i]]"
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_attribute stage2_missing_iterator_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_missing_iterator_get_attribute $obj $attr]
+}
+rename foreach_in_collection {}
+'''
+    result = run_case(
+        "sparse_missing_collection_iterator",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=[
+            "-generate_clock_group_review", "false",
+            "-write_path_summary", "false",
+        ],
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            )
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "SPARSE_MATRIX_CLOCK_BATCH_FALLBACK")
+    assert_text_contains(trace, "missing_collection_command:get_pins")
+    if "NO_PT_CONNECTIVITY_PAIR" in trace or "SPARSE_MATRIX_PLAN" in trace:
+        raise AssertionError("Missing collection iterator was treated as disconnection")
+    if original not in delay_command_lines(result["final"]):
+        raise AssertionError("Unknown collection query did not preserve the original matrix")
+
+
+def test_pt_collection_runtime_iterator_failure_returns_unavailable():
+    post_build_tcl = r'''
+set rec [stage2_delay::object_record pin u_src_reg/CP in ""]
+rename foreach_in_collection stage2_runtime_default_iterator
+proc foreach_in_collection {var coll body} {
+    error "mock iterator failure"
+}
+array set result [stage2_delay::pt_collection_for_records [list $rec] runtime-iterator]
+puts "RUNTIME_ITERATOR_OK=$result(ok)"
+puts "RUNTIME_ITERATOR_REASON=$result(reason)"
+'''
+    result = run_case(
+        "pt_collection_runtime_iterator_failure",
+        "",
+        "",
+        extra_build_args=[
+            "-generate_clock_group_review", "false",
+            "-write_path_summary", "false",
+        ],
+        post_build_tcl=post_build_tcl,
+    )
+    require_ok(result)
+    assert_text_contains(result["stdout"], "RUNTIME_ITERATOR_OK=false")
+    assert_text_contains(
+        result["stdout"],
+        "RUNTIME_ITERATOR_REASON=batch_collection_iteration_failed:mock iterator failure",
+    )
+
+
+def test_sparse_matrix_unresolved_fanin_object_is_unknown():
+    original = (
+        "set_max_delay 2.0 -from [get_pins u_src_reg/CP] "
+        "-to [list [get_pins u_h0/other_i] [get_pins u_h0/unused_i]]"
+    )
+    prelude = r'''
+rename get_attribute stage2_unresolved_fanin_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$name eq "opaque_startpoint" && $attr eq "full_name"} {
+        error "mock full_name unavailable"
+    }
+    if {$attr eq "is_clock_pin" && $name eq "u_src_reg/CP"} {
+        return true
+    }
+    return [stage2_unresolved_fanin_get_attribute $obj $attr]
+}
+
+proc get_object_name {obj} {
+    if {[lindex $obj 0] eq "opaque_startpoint"} {
+        error "mock object name unavailable"
+    }
+    return [lindex $obj 0]
+}
+
+proc all_fanin {args} {
+    return [list opaque_startpoint]
+}
+'''
+    result = run_case(
+        "sparse_unresolved_fanin_object",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "unable to resolve collection object full_name")
+    if "NO_PT_CONNECTIVITY_PAIR" in trace or "SPARSE_MATRIX_PLAN" in trace:
+        raise AssertionError("An unresolved collection handle was treated as disconnection")
+    if original not in delay_command_lines(result["final"]):
+        raise AssertionError("An unresolved fanin object did not preserve the original matrix")
 
 
 def test_sparse_matrix_prune_can_be_disabled_for_legacy_diagnosis():
@@ -683,7 +861,7 @@ proc all_fanin {args} { return {} }
     assert_contains(result["removed"], "pruned=4 retained=0 product=4")
     assert_contains(
         os.path.join(result["summary"], "00_index.csv"),
-        '"top.csv","0","0","0","0","1","1","1/1","0"',
+        '"top.csv","0","0","0","0","0","1","0/1","0"',
     )
 
 
@@ -854,6 +1032,421 @@ proc all_fanin {args} {
         raise AssertionError("Sparse scale case retained more than the connected diagonal:\n%s" % report)
     if stat_value(report, "sparse_matrix_pairs_pruned") != size * size - size:
         raise AssertionError("Sparse scale case pruned count mismatch:\n%s" % report)
+
+
+def test_sparse_matrix_non_exact_clock_selector_is_never_pruned():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS { u_src_0/CP in }
+
+rename get_pins stage2_non_exact_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set out {}
+    foreach pattern [lindex $args end] {
+        if {$pattern eq {u_src_*/CP} ||
+            $pattern eq {u_src_[0-9]/CP} ||
+            $pattern eq {$clock_pin}} {
+            lappend out u_src_0/CP
+        } else {
+            lappend out $pattern
+        }
+    }
+    return $out
+}
+
+rename get_attribute stage2_non_exact_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name eq "u_src_0/CP"} {
+        return true
+    }
+    return [stage2_non_exact_get_attribute $obj $attr]
+}
+
+proc all_fanin {args} {
+    return [list u_src_0/CP]
+}
+'''
+    selectors = (
+        ("star", "[get_pins {u_src_*/CP}]"),
+        ("bracket", "[get_pins {u_src_[0-9]/CP}]"),
+        ("variable", "[get_pins {$clock_pin}]"),
+        ("regexp", "[get_pins -regexp {u_src_0/CP}]"),
+        ("hierarchical", "[get_pins -hierarchical {u_src_0/CP}]"),
+        ("hier", "[get_pins -hier {u_src_0/CP}]"),
+        ("nocase", "[get_pins -nocase {u_src_0/CP}]"),
+        ("filter", "[get_pins -filter {direction == in} {u_src_0/CP}]"),
+        ("of_objects", "[get_pins -of_objects [get_cells u_src_0]]"),
+    )
+    for token, from_expr in selectors:
+        original = (
+            "set_max_delay 2.0 -from %s "
+            "-to [list [get_pins u_h0/cfg_i] [get_pins u_h0/other_i]]"
+            % from_expr
+        )
+        for enabled in ("true", "false"):
+            result = run_case(
+                "sparse_non_exact_clock_selector_%s_%s" % (token, enabled),
+                original + "\n",
+                "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+                extra_build_args=["-sparse_matrix_prune", enabled],
+                prelude=prelude,
+            )
+            require_ok(result)
+            trace = read_file(result["trace"])
+            if "NO_PT_CONNECTIVITY_PAIR" in trace or "SPARSE_MATRIX_PLAN" in trace:
+                raise AssertionError(
+                    "A non-exact selector was treated as a concrete clock pin:\n%s" % trace
+                )
+            if original not in delay_command_lines(result["final"]):
+                raise AssertionError("Non-exact selector constraint was not preserved")
+
+
+def test_non_exact_to_and_through_selectors_are_preserved():
+    cases = (
+        (
+            "to_regexp",
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins -regexp {u_h0/cfg_i}]",
+        ),
+        (
+            "to_wildcard",
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins {u_h0/*_i}]",
+        ),
+        (
+            "port_nocase",
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_ports -nocase cfg_top]",
+        ),
+        (
+            "through_hierarchical",
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -through [get_pins -hierarchical {u_h0/cfg_i}] -to [get_pins u_h0/u_reg/D]",
+        ),
+        (
+            "through_dynamic",
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -through [get_pins [all_registers]] -to [get_pins u_h0/u_reg/D]",
+        ),
+    )
+    for token, original in cases:
+        for enabled in ("true", "false"):
+            result = run_case(
+                "non_exact_to_through_%s_%s" % (token, enabled),
+                original + "\n",
+                "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+                extra_build_args=["-sparse_matrix_prune", enabled],
+            )
+            require_ok(result)
+            if original not in delay_command_lines(result["final"]):
+                raise AssertionError("A non-exact to/through selector was rewritten")
+            assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+            assert_contains(result["review"], "CLOCK_OR_UNKNOWN_OBJECT")
+            assert_not_contains(result["trace"], "SPARSE_MATRIX_PLAN")
+
+
+def test_sparse_matrix_compact_clock_record_is_conservative():
+    prelude = r'''
+rename get_pins stage2_compact_clock_get_pins
+proc get_pins {args} {
+    set out {}
+    foreach pattern [lindex $args end] {
+        if {$pattern eq {clk[*]}} {
+            foreach idx {0 1 2 3} {
+                lappend out [format {clk[%d]} $idx]
+            }
+        } else {
+            lappend out $pattern
+        }
+    }
+    return $out
+}
+rename get_attribute stage2_compact_clock_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && [regexp {^clk\[[0-9]+\]$} $name]} {
+        return true
+    }
+    return [stage2_compact_clock_get_attribute $obj $attr]
+}
+'''
+    post_build_tcl = r'''
+set members {}
+set names {}
+foreach idx {0 1 2 3} {
+    set name [format {clk[%d]} $idx]
+    lappend names $name
+    lappend members [stage2_delay::object_record pin $name in ""]
+}
+set compact [stage2_delay::make_compact_bus_record $members {clk[*]} $names]
+puts "COMPACT_CLOCK_FLAGS=[stage2_delay::pt_clock_pin_flags [list $compact]]"
+'''
+    result = run_case(
+        "sparse_compact_clock_record",
+        "",
+        "",
+        extra_build_args=["-generate_clock_group_review", "false"],
+        prelude=prelude,
+        post_build_tcl=post_build_tcl,
+    )
+    require_ok(result)
+    assert_text_contains(result["stdout"], "COMPACT_CLOCK_FLAGS=0")
+
+
+def test_sparse_matrix_clock_metadata_batch_respects_disable_switch():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+set ::CLOCK_METADATA_MULTI_CALLS 0
+rename get_pins stage2_clock_batch_disabled_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return {}
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1} {
+        incr ::CLOCK_METADATA_MULTI_CALLS
+        error "metadata batching must be disabled"
+    }
+    return [stage2_clock_batch_disabled_get_pins {*}$args]
+}
+rename get_attribute stage2_clock_batch_disabled_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_clock_batch_disabled_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} { return [list u_src_reg/CP] }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} { return [list u_src_reg_1/CP] }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_clock_metadata_batch_disabled",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-metadata_batch_enabled", "false"],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=prelude,
+        post_build_tcl='puts "CLOCK_METADATA_MULTI_CALLS=$::CLOCK_METADATA_MULTI_CALLS"',
+    )
+    require_ok(result)
+    assert_text_contains(result["stdout"], "CLOCK_METADATA_MULTI_CALLS=0")
+    assert_contains(result["trace"], "SPARSE_MATRIX_CLOCK_BATCH_DISABLED records=2 mode=individual")
+    assert_contains(result["trace"], "product=4 pruned=2 retained=2")
+    report = read_file(result["report"])
+    if stat_value(report, "sparse_matrix_clock_batches") != 0:
+        raise AssertionError("Disabled clock metadata path issued a batch query")
+    if len(delay_command_lines(result["out_sdc"])) != 2:
+        raise AssertionError("Disabled clock metadata batching changed E2E output")
+
+
+def test_sparse_matrix_top_port_limit_rolls_back_to_original_command():
+    original = (
+        "set_max_delay 2.0 -from [list [get_pins src0/CP] [get_pins src1/CP]] "
+        "-to [list [get_pins u_h0/cfg_i] [get_ports cfg_top]]"
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    src0/CP in
+    src1/CP in
+    cfg_top out
+    u_h1/cfg_i in
+    u_h2/cfg_i in
+}
+rename get_attribute stage2_sparse_port_limit_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {src0/CP src1/CP}} {
+        return true
+    }
+    return [stage2_sparse_port_limit_get_attribute $obj $attr]
+}
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+rename get_pins stage2_sparse_port_limit_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/cfg_i u_h2/cfg_i]
+        }
+        return {}
+    }
+    return [stage2_sparse_port_limit_get_pins {*}$args]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} {
+        return [list src0/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_then_top_port_matrix_limit",
+        original + "\n",
+        "",
+        extra_build_args=[
+            "-max_segment_pairs", "3",
+            "-generate_clock_group_review", "false",
+        ],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1"),
+            ("h2", "u_h2", "harden2"),
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "product=4 pruned=1 retained=3")
+    assert_text_contains(trace, "SPARSE_MATRIX_ROLLBACK")
+    assert_text_contains(trace, "phase=TOP_PORT_MAP original=preserved")
+    if delay_command_lines(result["final"]) != [original]:
+        raise AssertionError("Top-port limit did not preserve the exact active command")
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+    assert_not_contains(result["removed"], "PT_DISCONNECTED_MATRIX_PAIRS")
+
+
+def test_sparse_matrix_top_port_under_limit_partial_and_complete_rewrite():
+    original = (
+        "set_max_delay 2.0 -from [list [get_pins src0/CP] [get_pins src1/CP]] "
+        "-to [list [get_pins u_h0/cfg_i] [get_ports cfg_top]]"
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    src0/CP in
+    src1/CP in
+    cfg_top out
+    u_h1/cfg_i in
+}
+rename get_attribute stage2_sparse_port_under_limit_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {src0/CP src1/CP}} {
+        return true
+    }
+    return [stage2_sparse_port_under_limit_get_attribute $obj $attr]
+}
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+rename get_pins stage2_sparse_port_under_limit_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/cfg_i]
+        }
+        return {}
+    }
+    return [stage2_sparse_port_under_limit_get_pins {*}$args]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} {
+        return [list src0/CP]
+    }
+    return {}
+}
+'''
+    common_args = [
+        "-max_segment_pairs", "10",
+        "-generate_clock_group_review", "false",
+    ]
+    partial = run_case(
+        "sparse_then_top_port_under_limit_partial",
+        original + "\n",
+        "",
+        extra_build_args=common_args,
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=prelude,
+    )
+    require_ok(partial)
+    assert_contains(partial["trace"], "product=4 pruned=1 retained=3")
+    assert_not_contains(partial["trace"], "SPARSE_MATRIX_ROLLBACK")
+    assert_contains(partial["report"], "TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL")
+    expected_partial = [
+        "set_max_delay 2 -from [get_pins {src0/CP}] -to [get_pins {u_h0/cfg_i}]",
+        "set_max_delay 2 -from [get_pins {src0/CP}] -to [get_ports {cfg_top}]",
+    ]
+    if delay_command_lines(partial["final"]) != expected_partial:
+        raise AssertionError(
+            "Sparse/top-port partial rewrite lost or retained the wrong pairs:\n%s"
+            % read_file(partial["final"])
+        )
+
+    complete = run_case(
+        "sparse_then_top_port_under_limit_complete",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=common_args,
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=prelude,
+    )
+    require_ok(complete)
+    assert_contains(complete["trace"], "product=4 pruned=1 retained=3")
+    assert_contains(complete["report"], "TOP_PORT_BOUNDARY_MAP_CONSUMED")
+    if len(delay_command_lines(complete["out_sdc"])) != 1:
+        raise AssertionError("Sparse/top-port complete rewrite changed generated E2E cardinality")
+    if original in delay_command_lines(complete["final"]):
+        raise AssertionError("Sparse/top-port complete group kept the original command")
+    assert_contains(complete["final"], "STAGE2_CONSUMED CMD000001")
+
+    failed_emit_prelude = prelude + r'''
+rename all_fanin stage2_sparse_port_connected_all_fanin
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/cfg_i"} {
+        return [list src0/CP]
+    }
+    return {}
+}
+'''
+    failed_emit = run_case(
+        "sparse_then_top_port_duplicate_emit_failure",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=common_args,
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=failed_emit_prelude,
+    )
+    failed_emit_legacy = run_case(
+        "sparse_then_top_port_duplicate_emit_failure_legacy",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=common_args + ["-sparse_matrix_prune", "false"],
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=failed_emit_prelude,
+    )
+    for failed_case in (failed_emit, failed_emit_legacy):
+        require_ok(failed_case)
+        if delay_command_lines(failed_case["out_sdc"]):
+            raise AssertionError("A failed duplicate path unexpectedly emitted E2E")
+        failed_lines = delay_command_lines(failed_case["final"])
+        for expected in expected_partial + [
+            "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]"
+        ]:
+            if expected not in failed_lines:
+                raise AssertionError(
+                    "A failed first duplicate path consumed an un-emitted constraint:\n%s"
+                    % read_file(failed_case["final"])
+                )
+        assert_not_contains(failed_case["final"], "STAGE2_CONSUMED CMD000002")
+    if delay_command_lines(failed_emit["final"]) != delay_command_lines(failed_emit_legacy["final"]):
+        raise AssertionError("Sparse on/off changed failed-duplicate final constraints")
 
 
 def test_structural_passthrough_skips_getters_and_matrix_expansion():
@@ -1231,18 +1824,18 @@ proc get_attribute {obj attr} {
         (
             "wildcard",
             "set_max_delay 2.0 -from [get_pins {u_local/src_*}] -to [get_pins {u_local/dst_*}]\n",
-            2,
             0,
-            2,
-            None,
+            0,
+            0,
+            "CLOCK_OR_UNKNOWN_OBJECT",
         ),
         (
             "dynamic",
             "set_max_delay 2.0 -from [get_pins [all_registers]] -to [get_pins u_local/dst]\n",
-            2,
+            1,
             0,
-            2,
-            None,
+            1,
+            "CLOCK_OR_UNKNOWN_OBJECT",
         ),
     ]
     for token, top_sdc, pin_calls, port_calls, individual_queries, review_reason in cases:
@@ -2488,6 +3081,89 @@ def test_recursive_harden_output_to_harden_input_chain():
         raise AssertionError("Expected top sheet through stage to be highlighted")
 
 
+def test_recursive_chain_top_port_partial_mapping_keeps_original_command():
+    chain_command = (
+        "set_max_delay 2.0 -from [get_pins u_h0/o_niu_rst_n] -to [get_ports cfg_top]"
+    )
+    top_sdc = (
+        "set_max_delay 1.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n"
+        + chain_command
+        + "\n"
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    cfg_top out
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+    u_h2/cfg_i in
+    u_h2/u_reg/D in
+}
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+rename get_pins stage2_recursive_chain_port_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h1/cfg_i u_h2/cfg_i]
+        }
+        return {}
+    }
+    return [stage2_recursive_chain_port_get_pins {*}$args]
+}
+'''
+    result = run_case(
+        "recursive_chain_top_port_partial_group",
+        top_sdc,
+        "set_max_delay 3.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/o_niu_rst_n]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 4.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            ),
+            ("h2", "u_h2", "harden2"),
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    if chain_command not in delay_command_lines(result["final"]):
+        raise AssertionError("Partially matched recursive chain port group was consumed")
+    assert_contains(result["report"], "TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL")
+    assert_contains(result["report"], "matched=1 total=2 mode=recursive")
+
+    complete = run_case(
+        "recursive_chain_top_port_complete_group",
+        top_sdc,
+        "set_max_delay 3.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/o_niu_rst_n]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 4.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            ),
+            (
+                "h2",
+                "u_h2",
+                "harden2",
+                "set_max_delay 5.0 -from [get_pins u_h2/cfg_i] -to [get_pins u_h2/u_reg/D]\n",
+            ),
+        ],
+        prelude=prelude,
+    )
+    require_ok(complete)
+    if chain_command in delay_command_lines(complete["final"]):
+        raise AssertionError("Fully matched recursive chain port group kept its original command")
+    assert_contains(complete["final"], "STAGE2_CONSUMED CMD000002")
+    assert_contains(complete["report"], "TOP_PORT_BOUNDARY_MAP_CONSUMED")
+    assert_contains(complete["report"], "matched=2 total=2 mode=recursive")
+
+
 def test_missing_harden_sdc_stage_assumes_zero_and_reports_not_found():
     result = run_case(
         "missing_harden_sdc_stage",
@@ -2739,6 +3415,189 @@ proc get_attribute {obj attr} {
     assert_contains(result["report"], "Verbose PT query                : true")
     assert_contains(result["final"], "STAGE2_CONSUMED CMD000001")
     assert_text_contains(result["stdout"], "PT_QUERY: get_ports -quiet {cfg_top}")
+
+
+def test_top_port_mixed_known_and_unknown_boundaries_preserves_original():
+    original = "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_ports cfg_top]"
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    cfg_top out
+}
+
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+
+rename get_pins stage2_mixed_direction_port_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/mystery_i]
+        }
+        return {}
+    }
+    return [stage2_mixed_direction_port_get_pins {*}$args]
+}
+'''
+    result = run_case(
+        "top_port_mixed_known_unknown_direction",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=prelude,
+    )
+    require_ok(result)
+    if delay_command_lines(result["out_sdc"]):
+        raise AssertionError("A partially known top-port fanout was merged")
+    if original not in delay_command_lines(result["final"]):
+        raise AssertionError("A partially known top-port fanout lost its original constraint")
+    assert_contains(
+        result["report"],
+        "TOP_PORT_CONNECTED_TO_HARDEN_BOUNDARY_WITH_UNKNOWN_DIRECTION",
+    )
+    assert_contains(result["trace"], "unknown_direction_pins=1")
+
+
+def test_direct_top_port_partial_group_with_disconnected_branch_keeps_original():
+    original = (
+        "set_max_delay 2.0 -from [list [get_pins u_clk/CP] "
+        "[get_pins u_src_reg/Q]] -to [get_ports cfg_top]"
+    )
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_clk/CP in
+    cfg_top out
+    u_h1/cfg_i in
+}
+
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+
+rename get_pins stage2_direct_port_group_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/cfg_i]
+        }
+        return {}
+    }
+    return [stage2_direct_port_group_get_pins {*}$args]
+}
+
+rename get_attribute stage2_direct_port_group_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name eq "u_clk/CP"} {
+        return true
+    }
+    return [stage2_direct_port_group_get_attribute $obj $attr]
+}
+
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/cfg_i"} {
+        return [list u_src_reg/Q]
+    }
+    if {$target eq "u_h1/cfg_i"} {
+        return [list u_clk/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "direct_top_port_partial_group_disconnected_branch",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-recursive_chain_mode", "off"],
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "NO_PT_CONNECTIVITY_PAIR")
+    assert_contains(result["report"], "TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL")
+    if original not in delay_command_lines(result["final"]):
+        raise AssertionError(
+            "A disconnected mapped child partially consumed the original port pair:\n%s"
+            % read_file(result["final"])
+        )
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+
+
+def test_recursive_top_port_partial_mapping_keeps_original_command():
+    original = "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_ports cfg_top]"
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    cfg_top out
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+proc get_nets {args} {
+    if {[lindex $args end] eq "cfg_top"} {
+        return [list cfg_net]
+    }
+    return {}
+}
+rename get_pins stage2_recursive_port_group_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        if {[lindex $args end] eq "cfg_net"} {
+            return [list u_h0/cfg_i u_h1/cfg_i]
+        }
+        return {}
+    }
+    return [stage2_recursive_port_group_get_pins {*}$args]
+}
+'''
+    result = run_case(
+        "recursive_top_port_partial_group",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[("h1", "u_h1", "harden1")],
+        prelude=prelude,
+    )
+    require_ok(result)
+    generated = delay_command_lines(result["out_sdc"])
+    if len(generated) != 1 or "u_h0/u_reg/D" not in generated[0]:
+        raise AssertionError("Expected only the mapped h0 branch to generate E2E")
+    if original not in delay_command_lines(result["final"]):
+        raise AssertionError("Partially matched recursive port group lost its original command")
+    assert_not_contains(result["final"], "STAGE2_CONSUMED CMD000001")
+    assert_not_contains(result["final"], "STAGE2_REWRITTEN CMD000001")
+    assert_contains(
+        result["report"],
+        "TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL",
+    )
+    assert_contains(result["report"], "matched=1 total=2 mode=recursive")
+
+    complete = run_case(
+        "recursive_top_port_complete_group",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            (
+                "h1",
+                "u_h1",
+                "harden1",
+                "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n",
+            )
+        ],
+        prelude=prelude,
+    )
+    require_ok(complete)
+    if len(delay_command_lines(complete["out_sdc"])) != 2:
+        raise AssertionError("A fully matched recursive port group lost a generated branch")
+    if original in delay_command_lines(complete["final"]):
+        raise AssertionError("A fully matched recursive port group kept the original command")
+    assert_contains(complete["final"], "STAGE2_CONSUMED CMD000001")
+    assert_contains(complete["report"], "TOP_PORT_BOUNDARY_MAP_CONSUMED")
+    assert_contains(complete["report"], "matched=2 total=2 mode=recursive")
 
 
 def test_harden_input_to_output_boundary_merges():
@@ -3183,13 +4042,23 @@ def main():
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
         test_recursive_pt_proven_input_clock_pin_is_accepted,
         test_matrix_clock_pairs_skip_pt_disconnected_cross_pairs,
+        test_sparse_matrix_numeric_bus_clock_bits_remain_exact_pins,
         test_matrix_pair_query_failure_does_not_silently_skip,
+        test_sparse_matrix_missing_collection_iterator_is_unknown,
+        test_pt_collection_runtime_iterator_failure_returns_unavailable,
+        test_sparse_matrix_unresolved_fanin_object_is_unknown,
         test_sparse_matrix_prune_can_be_disabled_for_legacy_diagnosis,
         test_sparse_matrix_clock_batch_failure_falls_back_without_loss,
         test_sparse_matrix_all_disconnected_uses_compact_command_bookkeeping,
         test_sparse_matrix_partial_rewrite_excludes_pruned_cross_pair,
         test_sparse_matrix_prunes_before_pair_limit_but_falls_back_if_retained_exceeds_limit,
         test_sparse_matrix_scale_200x200_materializes_only_connected_diagonal,
+        test_sparse_matrix_non_exact_clock_selector_is_never_pruned,
+        test_non_exact_to_and_through_selectors_are_preserved,
+        test_sparse_matrix_compact_clock_record_is_conservative,
+        test_sparse_matrix_clock_metadata_batch_respects_disable_switch,
+        test_sparse_matrix_top_port_limit_rolls_back_to_original_command,
+        test_sparse_matrix_top_port_under_limit_partial_and_complete_rewrite,
         test_structural_passthrough_skips_getters_and_matrix_expansion,
         test_matrix_segment_pair_limit_and_inclusive_boundary,
         test_top_port_mapping_cannot_bypass_matrix_pair_limit,
@@ -3223,6 +4092,7 @@ def main():
         test_multi_hop_review,
         test_review_top_open_from_summary_infers_startpoint,
         test_recursive_harden_output_to_harden_input_chain,
+        test_recursive_chain_top_port_partial_mapping_keeps_original_command,
         test_missing_harden_sdc_stage_assumes_zero_and_reports_not_found,
         test_recursive_terminal_missing_harden_sdc_uses_pt_endpoint,
         test_recursive_missing_top_and_terminal_harden_sdc_use_pt_graph,
@@ -3230,6 +4100,9 @@ def main():
         test_multi_object_lists_expand_and_rewrite_remaining,
         test_one_top_boundary_reused_for_multiple_harden_endpoints,
         test_top_port_maps_to_connected_harden_input,
+        test_top_port_mixed_known_and_unknown_boundaries_preserves_original,
+        test_direct_top_port_partial_group_with_disconnected_branch_keeps_original,
+        test_recursive_top_port_partial_mapping_keeps_original_command,
         test_harden_input_to_output_boundary_merges,
         test_harden_feedthrough_missing_upstream_top_uses_pt_startpoint,
         test_harden_feedthrough_to_top_output_terminal,

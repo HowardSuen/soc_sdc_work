@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.11。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.12。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -293,6 +293,22 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `from` 后只为实际连通或 query 状态为 unknown 的 pair 创建 segment。PT 成功
   返回但集合中不存在该 `from` 时才剪枝；命令缺失、对象不存在或查询失败都走
   原流程。可用 `STAGE2_SPARSE_MATRIX_PRUNE=false` 切回 v0.9.10 诊断路径。
+- v0.9.12 将 sparse clock 剪枝限制为无 wildcard 的原子精确 pin；非精确
+  selector（包括 `-regexp/-hierarchical/-hier/-nocase/-filter/-of_objects`）和
+  compact bus record 一律按 unknown 保留。PT collection object 无法解析
+  `full_name` 时同样按 query unknown 保留。`STAGE2_METADATA_BATCH_ENABLED=false`
+  现在同时关闭 direction 和 `is_clock_pin` 批量查询。若 sparse plan 之后的
+  top-port mapping 触发 matrix limit，会先撤销 sparse rewrite bookkeeping，再原样保留
+  整条命令。同时 max-delay usage 仅统计真正参与 MERGED/RESIDUAL 输出的原始
+  命令，全部被 PT 证明不连通的命令记为 `0/1`。recursive matcher
+  中的 top-port 一对多 mapping 也改为全组成功才消费；部分成功时保留原 port
+  命令，避免未匹配 boundary 的 delay 丢失。非递归 matcher 中被 PT 证明
+  不连通的 mapped child 也遵守同一全组消费规则，不会单独触发 original pair rewrite。
+  若 top port 同时连到已知 input 和 direction unknown 的 immediate harden pin，
+  整组放弃自动映射并保留原 port 命令。collection iterator 在运行时报错
+  也按 batch failure 处理，只对该块 fallback。recursive duplicate signature
+  仅在 E2E 命令成功发射后才记录；首条等价 path 验证失败时，后续
+  duplicate 不得消费任何尚未生成的源约束。
 - `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
   pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
   此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
@@ -309,8 +325,8 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `get_cells` / `get_nets` metadata 查询的最大 pattern 数。大型 PT database 中
   若单块仍然较慢，可以降为 64 或 32；增大数值会减少调用次数，但可能重新放大
   单次 multi-pattern 查询延迟。
-- `STAGE2_METADATA_BATCH_ENABLED=false`：诊断开关。关闭后所有待查对象使用原有
-  逐对象 getter 和 `get_attribute direction` 路径，功能校验仍完整执行。
+- `STAGE2_METADATA_BATCH_ENABLED=false`：诊断开关。关闭后 direction 和 sparse
+  `is_clock_pin` 属性都使用逐对象 getter 路径，功能校验仍完整执行。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata chunk 成功/失败、返回对象数、总耗时、关闭分组、单对象查询、
   structural passthrough 命令/对象、避免及实际展开的 matrix pair、上限触发次数、
@@ -952,7 +968,7 @@ python3 regression_test/run_regression.py
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 63 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 77 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -963,6 +979,30 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.12 Sparse Matrix Correctness Hardening
+
+v0.9.12 在 v0.9.11 的 pre-expansion planner 前增加了更严格的对象身份门禁。
+只有不含 wildcard、变量、非数字 bracket selector 或动态 getter option 的
+原子精确 input pin，才能使用
+`is_clock_pin` 和 startpoint membership 证据剪枝；数字 bus bit 如 `data[3]` 仍是精确
+对象。例如 `[get_pins {u_src_*/CP}]` 即使在当前 design 中只
+匹配一个 pin，也不会把字面 selector 与 PT 返回的 concrete `full_name` 混为同一
+对象。`[get_pins -regexp CP]` 等 option-driven selector 和 compact bus selector
+同样保守走 review/原命令保留流程。PT fanin collection 成员无法通过
+`full_name` 或 `get_object_name` 解析时，整个 membership query 记为 unknown，
+不会把 opaque collection handle 当成不连通证据。
+
+另外，当原始 matrix 先发生 sparse prune，后续 top port 又映射到多个 harden
+boundary 并超出 `STAGE2_MAX_SEGMENT_PAIRS` 时，脚本记录
+`SPARSE_MATRIX_ROLLBACK ... original=preserved`，最终 SDC 保留原始 active 命令，不会
+输出只剩 retained pair 的 partial rewrite。
+
+recursive graph matcher 对起始 top segment 和中间 chain segment 的 top-port mapping group
+都使用同样的 command-level 消费规则。
+仅当该 port pair 映射出的所有 boundary segment 都已 merge 或被 PT 证明不连通
+时，才从 final SDC 移除原命令；部分匹配会记录
+`TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL ... mode=recursive`并保留原 active command。
 
 ## v0.9.11 Pre-expansion Sparse Matrix Pruning
 
@@ -976,6 +1016,10 @@ startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA dat
 
 - `-from` 自身不是 clock pin、`-to` 不是 harden input boundary，或 PT 查询状态为
   unknown 时保留 pair，不根据单端空集合猜测连通性。
+- wildcard selector、dynamic collection 和 compact bus record 不是可证明的单一 pin，
+  不参与 sparse prune。
+- collection getter、iterator 或 fanin 查询不可用时按 unknown 保留，不得因
+  诊断环境不完整中止 build 或提前剪枝。
 - 每个 endpoint 查询一次并复用 startpoint hash；planner 按 endpoint 流式扫描，
   不保存全部 endpoint fanin matrix。
 - `is_clock_pin` getter 按 `STAGE2_METADATA_BATCH_SIZE` 分块；失败块才逐对象 fallback。
