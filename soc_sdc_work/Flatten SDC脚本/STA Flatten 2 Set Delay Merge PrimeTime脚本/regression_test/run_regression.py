@@ -522,6 +522,11 @@ proc all_fanin {args} {
         raise AssertionError("Expected two skipped cross pairs:\n%s" % trace)
     if "INVALID_STARTPOINT" in trace:
         raise AssertionError("Disconnected matrix pairs must not become INVALID_STARTPOINT:\n%s" % trace)
+    assert_text_contains(trace, "SPARSE_MATRIX_PLAN")
+    assert_text_contains(trace, "product=4 pruned=2 retained=2")
+    report = read_file(result["report"])
+    if stat_value(report, "sparse_matrix_pairs_pruned") != 2:
+        raise AssertionError("Expected two pairs pruned before expansion:\n%s" % report)
     assert_not_contains(result["review"], "NO_HARDEN_SEGMENT_MATCHED")
     assert_not_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
     assert_contains(result["final"], "# STAGE2_CONSUMED CMD000001")
@@ -554,6 +559,301 @@ proc get_attribute {obj attr} {
     assert_text_contains(trace, "INVALID_STARTPOINT")
     assert_contains(result["final"], "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP]]")
     assert_contains(result["review"], "INVALID_STARTPOINT")
+
+
+def test_sparse_matrix_prune_can_be_disabled_for_legacy_diagnosis():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} { return [list u_src_reg/CP] }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} { return [list u_src_reg_1/CP] }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_matrix_prune_disabled_legacy",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-sparse_matrix_prune", "false"],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    trace = read_file(result["trace"])
+    assert_text_contains(trace, "action=EXPAND")
+    if "SPARSE_MATRIX_PLAN" in trace:
+        raise AssertionError("Disabled sparse pruning must use the legacy expansion path:\n%s" % trace)
+    if trace.count("NO_PT_CONNECTIVITY_PAIR") != 2:
+        raise AssertionError("Legacy diagnosis path must still prune two disconnected pairs later:\n%s" % trace)
+
+
+def test_sparse_matrix_clock_batch_failure_falls_back_without_loss():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_pins stage2_default_get_pins
+proc get_pins {args} {
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1} {
+        error "mock rejects multi-pattern get_pins"
+    }
+    return [stage2_default_get_pins {*}$args]
+}
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} { return [list u_src_reg/CP] }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} { return [list u_src_reg_1/CP] }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_matrix_clock_batch_fallback",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "SPARSE_MATRIX_CLOCK_BATCH_FALLBACK")
+    assert_contains(result["trace"], "product=4 pruned=2 retained=2")
+    if len(delay_command_lines(result["out_sdc"])) != 2:
+        raise AssertionError("Clock batch fallback changed sparse E2E output")
+
+
+def test_sparse_matrix_all_disconnected_uses_compact_command_bookkeeping():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} { return {} }
+'''
+    original = "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]"
+    result = run_case(
+        "sparse_matrix_all_disconnected",
+        original + "\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "product=4 pruned=4 retained=0")
+    assert_contains(result["final"], "# STAGE2_CONSUMED CMD000001")
+    assert_not_contains(result["final"], original)
+    assert_contains(result["removed"], "PT_DISCONNECTED_MATRIX_PAIRS")
+    assert_contains(result["removed"], "pruned=4 retained=0 product=4")
+    assert_contains(
+        os.path.join(result["summary"], "00_index.csv"),
+        '"top.csv","0","0","0","0","1","1","1/1","0"',
+    )
+
+
+def test_sparse_matrix_partial_rewrite_excludes_pruned_cross_pair():
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS { u_src_reg_1/CP in }
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} {
+        return true
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} { return [list u_src_reg/CP] }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_matrix_partial_rewrite",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h0/u_reg/D]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "product=4 pruned=1 retained=3")
+    final = read_file(result["final"])
+    assert_text_contains(final, "# STAGE2_REWRITTEN CMD000001")
+    assert_text_contains(final, "-from [get_pins {u_src_reg/CP}] -to [get_pins {u_h0/u_reg/D}]")
+    assert_text_contains(final, "-from [get_pins {u_src_reg_1/CP}] -to [get_pins {u_h0/u_reg/D}]")
+    if "-from [get_pins {u_src_reg_1/CP}] -to [get_pins {u_h0/cfg_i}]" in final:
+        raise AssertionError("PT-disconnected cross pair leaked back into final rewrite:\n%s" % final)
+
+
+def test_sparse_matrix_prunes_before_pair_limit_but_falls_back_if_retained_exceeds_limit():
+    diagonal_prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} { return true }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target in {u_h0/cfg_i u_h0/u_reg/D}} { return [list u_src_reg/CP] }
+    if {$target in {u_h1/cfg_i u_h1/u_reg/D}} { return [list u_src_reg_1/CP] }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_matrix_under_pair_limit",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-max_segment_pairs", "2"],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=diagonal_prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "product=4 pruned=2 retained=2")
+    assert_not_contains(result["review"], "MATRIX_EXPANSION_LIMIT")
+
+    fallback_prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg_1/CP in
+    u_h1/cfg_i in
+    u_h1/u_reg/D in
+}
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && $name in {u_src_reg/CP u_src_reg_1/CP}} { return true }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {$target eq "u_h0/cfg_i"} { return [list u_src_reg/CP u_src_reg_1/CP] }
+    if {$target eq "u_h1/cfg_i"} { return [list u_src_reg/CP] }
+    if {$target eq "u_h0/u_reg/D"} { return [list u_src_reg/CP] }
+    if {$target eq "u_h1/u_reg/D"} { return [list u_src_reg_1/CP] }
+    return {}
+}
+'''
+    fallback = run_case(
+        "sparse_matrix_retained_over_limit_fallback",
+        "set_max_delay 2.0 -from [list [get_pins u_src_reg/CP] [get_pins u_src_reg_1/CP]] -to [list [get_pins u_h0/cfg_i] [get_pins u_h1/cfg_i]]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=["-max_segment_pairs", "2"],
+        extra_hardens=[
+            ("h1", "u_h1", "harden1", "set_max_delay 6.0 -from [get_pins u_h1/cfg_i] -to [get_pins u_h1/u_reg/D]\n")
+        ],
+        prelude=fallback_prelude,
+    )
+    require_ok(fallback)
+    assert_contains(fallback["trace"], "SPARSE_MATRIX_FALLBACK")
+    assert_contains(fallback["review"], "MATRIX_EXPANSION_LIMIT")
+    assert_contains(fallback["final"], "set_max_delay 2.0 -from [list")
+
+
+def test_sparse_matrix_scale_200x200_materializes_only_connected_diagonal():
+    size = 200
+    from_expr = "[list %s]" % " ".join(
+        "[get_pins {u_src_%d/CP}]" % index for index in range(size)
+    )
+    to_expr = "[list %s]" % " ".join(
+        "[get_pins {u_h%d/cfg_i}]" % index for index in range(size)
+    )
+    extra_hardens = [
+        (
+            "h%d" % index,
+            "u_h%d" % index,
+            "harden%d" % index,
+            "set_max_delay 5.0 -from [get_pins u_h%d/cfg_i] -to [get_pins u_h%d/u_reg/D]\n"
+            % (index, index),
+        )
+        for index in range(1, size)
+    ]
+    prelude = r'''
+rename get_attribute stage2_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "is_clock_pin" && [regexp {^u_src_[0-9]+/CP$} $name]} {
+        return true
+    }
+    if {$attr eq "direction" &&
+        ([regexp {^u_src_[0-9]+/CP$} $name] ||
+         [regexp {^u_h[0-9]+/(cfg_i|u_reg/D)$} $name])} {
+        return in
+    }
+    return [stage2_default_get_attribute $obj $attr]
+}
+proc all_fanin {args} {
+    set target [lindex [lindex $args end] 0]
+    if {[regexp {^u_h([0-9]+)/(cfg_i|u_reg/D)$} $target -> index]} {
+        return [list u_src_${index}/CP]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "sparse_matrix_scale_200x200",
+        "set_max_delay 2.0 -from %s -to %s\n" % (from_expr, to_expr),
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=[
+            "-max_segment_pairs", "500",
+            "-generate_clock_group_review", "false",
+            "-write_path_summary", "false",
+        ],
+        extra_hardens=extra_hardens,
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(result["trace"], "product=40000 pruned=39800 retained=200")
+    assert_not_contains(result["review"], "MATRIX_EXPANSION_LIMIT")
+    generated = delay_command_lines(result["out_sdc"])
+    if len(generated) != size:
+        raise AssertionError("Expected %d connected E2E commands, got %d" % (size, len(generated)))
+    report = read_file(result["report"])
+    if stat_value(report, "sparse_matrix_pairs_retained") != size:
+        raise AssertionError("Sparse scale case retained more than the connected diagonal:\n%s" % report)
+    if stat_value(report, "sparse_matrix_pairs_pruned") != size * size - size:
+        raise AssertionError("Sparse scale case pruned count mismatch:\n%s" % report)
 
 
 def test_structural_passthrough_skips_getters_and_matrix_expansion():
@@ -2884,6 +3184,12 @@ def main():
         test_recursive_pt_proven_input_clock_pin_is_accepted,
         test_matrix_clock_pairs_skip_pt_disconnected_cross_pairs,
         test_matrix_pair_query_failure_does_not_silently_skip,
+        test_sparse_matrix_prune_can_be_disabled_for_legacy_diagnosis,
+        test_sparse_matrix_clock_batch_failure_falls_back_without_loss,
+        test_sparse_matrix_all_disconnected_uses_compact_command_bookkeeping,
+        test_sparse_matrix_partial_rewrite_excludes_pruned_cross_pair,
+        test_sparse_matrix_prunes_before_pair_limit_but_falls_back_if_retained_exceeds_limit,
+        test_sparse_matrix_scale_200x200_materializes_only_connected_diagonal,
         test_structural_passthrough_skips_getters_and_matrix_expansion,
         test_matrix_segment_pair_limit_and_inclusive_boundary,
         test_top_port_mapping_cannot_bypass_matrix_pair_limit,

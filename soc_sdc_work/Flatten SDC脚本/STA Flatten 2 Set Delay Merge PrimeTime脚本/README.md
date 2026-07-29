@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.10。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.11。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -88,6 +88,7 @@ set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+set ::STAGE2_SPARSE_MATRIX_PRUNE true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -149,6 +150,7 @@ set ::STAGE2_BATCH_OPEN_TO_QUERY true
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+set ::STAGE2_SPARSE_MATRIX_PRUNE true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
 set ::WRITE_PATH_SUMMARY true
@@ -192,6 +194,7 @@ set STAGE2_BATCH_OPEN_TO_QUERY true
 set STAGE2_METADATA_BATCH_ENABLED true
 set STAGE2_METADATA_BATCH_SIZE 128
 set STAGE2_MAX_SEGMENT_PAIRS 100000
+set STAGE2_SPARSE_MATRIX_PRUNE true
 ```
 
 这些默认值含义如下：
@@ -285,15 +288,23 @@ set STAGE2_MAX_SEGMENT_PAIRS 100000
   表达式，并且没有任何对象可能是当前 Stage 2 harden 的 immediate boundary pin
   时，整条命令直接记为一个 structural passthrough。原始 SDC 命令逐字保留，
   不查询 direction、不生成 pair segment，也不进入 consume/partial rewrite。
+- v0.9.11 将 clock-pin matrix 的 PT 连通性检查前移到笛卡尔积 materialization
+  之前。对每个 boundary `-to` 只查询一次 startpoint 集并建立 hash，流式扫描
+  `from` 后只为实际连通或 query 状态为 unknown 的 pair 创建 segment。PT 成功
+  返回但集合中不存在该 `from` 时才剪枝；命令缺失、对象不存在或查询失败都走
+  原流程。可用 `STAGE2_SPARSE_MATRIX_PRUNE=false` 切回 v0.9.10 诊断路径。
 - `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
-  `from x to` pair 数，对应 build option `-max_segment_pairs`。结构直通判定优先于
-  此上限；仍可能涉及 boundary 且乘积超过上限时，脚本不截断、不部分消费，而是
-  保留整条原约束并增加一条 `MATRIX_EXPANSION_LIMIT` review。top port 经 direct
+  pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
+  此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
+  仍超限，脚本不截断、不部分消费，而是保留整条原约束并增加一条
+  `MATRIX_EXPANSION_LIMIT` review。top port 经 direct
   connectivity 映射到多个 harden boundary 后，会按原始命令重新汇总映射后的总
   pair 数并再次判限，不能通过二次展开绕过该保护。
 - v0.9.10 对每条 delay 输出 `SEGMENT_PLAN`；实际多 pair 展开另有
   `SEGMENT_EXPAND_BEGIN`、有界 `SEGMENT_EXPAND_PROGRESS` 和
   `SEGMENT_EXPAND_END`，包含 from/to/product、完成数和 elapsed_ms。
+- v0.9.11 另输出 `SPARSE_MATRIX_PLAN product=N pruned=P retained=R`；最多记录前
+  20 个 `NO_PT_CONNECTIVITY_PAIR` 样本，避免大矩阵因诊断文本再次占用大量内存。
 - `STAGE2_METADATA_BATCH_SIZE=128`：控制一次 `get_pins` / `get_ports` /
   `get_cells` / `get_nets` metadata 查询的最大 pattern 数。大型 PT database 中
   若单块仍然较慢，可以降为 64 或 32；增大数值会减少调用次数，但可能重新放大
@@ -875,6 +886,7 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -metadata_batch_enabled true
 -metadata_batch_size 128
 -max_segment_pairs 100000
+-sparse_matrix_prune true
 -verbose_pt_query true
 -write_path_summary true
 -generate_clock_group_review true
@@ -940,7 +952,7 @@ python3 regression_test/run_regression.py
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
 
-当前共 57 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 63 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -951,6 +963,40 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.11 Pre-expansion Sparse Matrix Pruning
+
+对于需要跨 harden boundary 合并的 top matrix，v0.9.11 不再先创建完整
+`from x to` segment 集再检查连通性。仅对 `direction=in` 且 PT
+`is_clock_pin=true` 的 `-from` 使用已有安全判据：若一次成功的
+`all_fanin -flat -startpoints_only -to <boundary>` 查询没有返回该 clock pin，
+这一 pair 被 PT 证明不连通，可以在 materialization 前省略。
+
+实现遵守以下保守规则：
+
+- `-from` 自身不是 clock pin、`-to` 不是 harden input boundary，或 PT 查询状态为
+  unknown 时保留 pair，不根据单端空集合猜测连通性。
+- 每个 endpoint 查询一次并复用 startpoint hash；planner 按 endpoint 流式扫描，
+  不保存全部 endpoint fanin matrix。
+- `is_clock_pin` getter 按 `STAGE2_METADATA_BATCH_SIZE` 分块；失败块才逐对象 fallback。
+- 被证明不连通的 pair 使用 command-level compact bookkeeping，不逐 pair 保存
+  consumed segment。全部剪枝和部分剪枝都能正确参与 final SDC rewrite。
+- sparse retained pair 超过 `STAGE2_MAX_SEGMENT_PAIRS` 时放弃本次 sparse 结果，整条
+  原命令走 `MATRIX_EXPANSION_LIMIT`，不会发生 partial consume。
+
+`STAGE2_SPARSE_MATRIX_PRUNE` 默认开启。诊断时可以关闭：
+
+```tcl
+set ::STAGE2_SPARSE_MATRIX_PRUNE false
+```
+
+mock-Tcl `200 x 200` 对角连通压力回归中，原始 40,000 个组合里 PT 证明
+39,800 个交叉 pair 不连通，实际只 materialize 200 个 top segment，减少 99.5%。
+相同机器上的 `100 x 100` 对角连通 A/B mock 三次中位数，开启 sparse 为
+`0.2672s`，关闭后走先展开再剪枝为 `3.8468s`，耗时减少 93.1%，约 14.4x；
+两边都生成相同的 100 条 E2E。对象数和 mock 时间都不等同于真实 PrimeTime
+全流程的固定提升；真实耗时仍取决于 endpoint fanin 查询及 linked design 的
+timing graph 规模。
 
 ## v0.9.10 Structural Passthrough 与 Matrix Guard
 

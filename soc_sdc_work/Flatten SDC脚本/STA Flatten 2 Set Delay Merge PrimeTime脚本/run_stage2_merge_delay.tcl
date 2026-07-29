@@ -89,6 +89,11 @@ set ::MAX_ENUM_OBJECTS 64
 # this limit are preserved unchanged and reported for review.
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
 
+# Before materializing a top from x to matrix, use PT-proven startpoint
+# membership to omit disconnected clock-pin cross pairs. Query failures keep
+# the affected pairs on the legacy path. Disable only for diagnosis.
+set ::STAGE2_SPARSE_MATRIX_PRUNE true
+
 # Performance controls for open-to delay commands.  Bus compression is only
 # applied after PT proves that the wildcard selector resolves to exactly the
 # original member set.  Batch fanout queries fall back to one seed at a time
@@ -139,7 +144,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.10"
+    variable VERSION "v0.9.11"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -175,6 +180,7 @@ namespace eval stage2_delay {
     variable parsed_command_segments
     variable consumed_command_segments
     variable consumed_source_files
+    variable sparse_pruned_commands
     variable segment_index_top_to
     variable segment_index_chain_from
     variable segment_index_chain_owner
@@ -205,6 +211,7 @@ namespace eval stage2_delay {
         -max_endpoints 1000
         -max_enum_objects 64
         -max_segment_pairs 100000
+        -sparse_matrix_prune "true"
         -compact_bus "true"
         -compact_bus_min_members 4
         -batch_open_to_query "true"
@@ -294,6 +301,7 @@ proc stage2_delay::reset_state {} {
     variable parsed_command_segments
     variable consumed_command_segments
     variable consumed_source_files
+    variable sparse_pruned_commands
     variable segment_index_top_to
     variable segment_index_chain_from
     variable segment_index_chain_owner
@@ -354,6 +362,15 @@ proc stage2_delay::reset_state {} {
         matrix_expansion_limited 0
         matrix_pairs_expanded 0
         matrix_expand_elapsed_ms 0
+        sparse_matrix_commands 0
+        sparse_matrix_clock_batches 0
+        sparse_matrix_clock_batch_fallbacks 0
+        sparse_matrix_clock_records 0
+        sparse_matrix_endpoint_queries 0
+        sparse_matrix_query_unknown 0
+        sparse_matrix_pairs_pruned 0
+        sparse_matrix_pairs_retained 0
+        sparse_matrix_plan_elapsed_ms 0
         attribute_cache_hits 0
         owner_cache_hits 0
         boundary_cache_hits 0
@@ -394,6 +411,8 @@ proc stage2_delay::reset_state {} {
     array set consumed_command_segments {}
     array unset consumed_source_files
     array set consumed_source_files {}
+    array unset sparse_pruned_commands
+    array set sparse_pruned_commands {}
     array unset segment_index_top_to
     array set segment_index_top_to {}
     array unset segment_index_chain_from
@@ -1244,6 +1263,266 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
     ]
 }
 
+proc stage2_delay::record_identity_key {rec} {
+    array set r $rec
+    set key [list $r(object_class) $r(full_name)]
+    array unset r
+    return $key
+}
+
+proc stage2_delay::pt_startpoint_membership_index {endpoint} {
+    variable startpoint_cache_status
+    array set e $endpoint
+    set cache_key [list $e(object_class) $e(full_name)]
+    array unset e
+
+    set startpoints [pt_startpoints_to_boundary $endpoint]
+    if {![info exists startpoint_cache_status($cache_key)] ||
+        $startpoint_cache_status($cache_key) ni {startpoints_only fanin_fallback}} {
+        return [list status unknown members {}]
+    }
+
+    set members {}
+    foreach startpoint $startpoints {
+        dict set members [record_identity_key $startpoint] 1
+    }
+    return [list status connected_set members $members]
+}
+
+proc stage2_delay::pt_clock_pin_flags {records} {
+    variable options
+    variable object_attribute_cache
+    set pending {}
+    set clock_by_key {}
+    foreach rec $records {
+        array set r $rec
+        set record_key [record_identity_key $rec]
+        if {$r(object_class) ne "pin" || $r(direction) ne "in"} {
+            dict set clock_by_key $record_key false
+            array unset r
+            continue
+        }
+        set cache_key [list pin $r(full_name) is_clock_pin]
+        if {[info exists object_attribute_cache($cache_key)]} {
+            dict set clock_by_key $record_key [truthy $object_attribute_cache($cache_key)]
+        } else {
+            lappend pending $rec
+        }
+        array unset r
+    }
+
+    set batch_size $options(-metadata_batch_size)
+    set chunk_total [expr {([llength $pending] + $batch_size - 1) / $batch_size}]
+    set chunk_index 0
+    for {set start 0} {$start < [llength $pending]} {incr start $batch_size} {
+        incr chunk_index
+        set chunk [lrange $pending $start [expr {$start + $batch_size - 1}]]
+        performance_stat_add sparse_matrix_clock_batches
+        performance_stat_add sparse_matrix_clock_records [llength $chunk]
+        array set batch [pt_collection_for_records $chunk sparse-matrix-clock]
+        set batch_values {}
+        set batch_ok $batch(ok)
+        set batch_reason $batch(reason)
+        if {$batch_ok} {
+            if {[catch {
+                foreach_in_collection obj $batch(collection) {
+                    set name [collection_object_name $obj]
+                    set value [get_attribute $obj is_clock_pin]
+                    dict set batch_values [list pin $name] $value
+                }
+            } err]} {
+                set batch_ok false
+                set batch_reason "clock_attribute_failed:$err"
+            }
+        }
+        if {$batch_ok} {
+            foreach rec $chunk {
+                array set r $rec
+                set record_key [record_identity_key $rec]
+                set value [dict get $batch_values $record_key]
+                set object_attribute_cache([list pin $r(full_name) is_clock_pin]) $value
+                dict set clock_by_key $record_key [truthy $value]
+                array unset r
+            }
+        } else {
+            performance_stat_add sparse_matrix_clock_batch_fallbacks
+            trace_event SPARSE_MATRIX_CLOCK_BATCH_FALLBACK \
+                "chunk=$chunk_index/$chunk_total records=[llength $chunk] reason={$batch_reason} mode=individual"
+            foreach rec $chunk {
+                dict set clock_by_key [record_identity_key $rec] [pt_is_clock_pin_record $rec]
+            }
+        }
+        array unset batch
+    }
+
+    set flags {}
+    foreach rec $records {
+        set record_key [record_identity_key $rec]
+        lappend flags [expr {[dict exists $clock_by_key $record_key] && [dict get $clock_by_key $record_key]}]
+    }
+    return $flags
+}
+
+proc stage2_delay::sparse_matrix_expansion_plan {seg} {
+    variable options
+    array set s $seg
+    set not_applied [list applied false pruned_count 0 retained_count 0 kept_pair_indices {} samples {}]
+    if {![truthy $options(-sparse_matrix_prune)] || $s(status) ne "ok" ||
+        $s(source) ne "top" || $s(kind) ne "complete" ||
+        ([info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)])} {
+        array unset s
+        return $not_applied
+    }
+
+    set from_count [llength $s(from_records)]
+    set to_count [llength $s(to_records)]
+    set total [expr {$from_count * $to_count}]
+    if {$from_count == 0 || $to_count == 0 || $total <= 1} {
+        array unset s
+        return $not_applied
+    }
+
+    set start_ms [metadata_clock_milliseconds]
+    set has_boundary_endpoint false
+    foreach to_rec $s(to_records) {
+        if {[is_harden_boundary_input_record $to_rec]} {
+            set has_boundary_endpoint true
+            break
+        }
+    }
+    if {!$has_boundary_endpoint} {
+        array unset s
+        return $not_applied
+    }
+
+    set raw_clock_from_flags [pt_clock_pin_flags $s(from_records)]
+    set clock_from_flags {}
+    set from_keys {}
+    set has_clock_from false
+    set from_index 0
+    foreach from_rec $s(from_records) {
+        set eligible [expr {[lindex $raw_clock_from_flags $from_index] &&
+            ![is_harden_boundary_output_record $from_rec]}]
+        lappend clock_from_flags $eligible
+        lappend from_keys [record_identity_key $from_rec]
+        if {$eligible} {
+            set has_clock_from true
+        }
+        incr from_index
+    }
+    if {!$has_clock_from} {
+        array unset s
+        return $not_applied
+    }
+
+    set kept_pair_indices {}
+    set kept_count 0
+    set pruned_count 0
+    set samples {}
+    for {set to_index 0} {$to_index < $to_count} {incr to_index} {
+        set to_rec [lindex $s(to_records) $to_index]
+        set membership [list status not_applicable members {}]
+        if {[is_harden_boundary_input_record $to_rec]} {
+            performance_stat_add sparse_matrix_endpoint_queries
+            set membership [pt_startpoint_membership_index $to_rec]
+            array set m $membership
+            if {$m(status) eq "unknown"} {
+                performance_stat_add sparse_matrix_query_unknown
+            }
+            array unset m
+        }
+        array set endpoint_membership $membership
+        for {set from_index 0} {$from_index < $from_count} {incr from_index} {
+            set from_rec [lindex $s(from_records) $from_index]
+            set from_key [lindex $from_keys $from_index]
+            set clock_eligible [lindex $clock_from_flags $from_index]
+            set pair_index [expr {$from_index * $to_count + $to_index + 1}]
+            set prune false
+            if {$clock_eligible && $endpoint_membership(status) eq "connected_set" &&
+                ![dict exists $endpoint_membership(members) $from_key]} {
+                set prune true
+            }
+            if {$prune} {
+                incr pruned_count
+                if {[llength $samples] < 20} {
+                    lappend samples [list pair_index $pair_index from $from_rec to $to_rec]
+                }
+            } else {
+                incr kept_count
+                lappend kept_pair_indices $pair_index
+                if {$total > $options(-max_segment_pairs) && $kept_count > $options(-max_segment_pairs)} {
+                    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+                    if {$elapsed_ms < 0} { set elapsed_ms 0 }
+                    performance_stat_add sparse_matrix_plan_elapsed_ms $elapsed_ms
+                    trace_event SPARSE_MATRIX_FALLBACK \
+                        "source=$s(source) id=$s(original_id) product=$total retained_so_far=$kept_count limit=$options(-max_segment_pairs) reason=RETAINED_OVER_LIMIT original=preserved"
+                    array unset s
+                    return $not_applied
+                }
+            }
+        }
+        array unset endpoint_membership
+    }
+
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} { set elapsed_ms 0 }
+    performance_stat_add sparse_matrix_plan_elapsed_ms $elapsed_ms
+    if {$pruned_count == 0} {
+        array unset s
+        return $not_applied
+    }
+    set kept_pair_indices [lsort -integer $kept_pair_indices]
+
+    set result [list \
+        applied true \
+        pruned_count $pruned_count \
+        retained_count $kept_count \
+        kept_pair_indices $kept_pair_indices \
+        samples $samples \
+        elapsed_ms $elapsed_ms]
+    array unset s
+    return $result
+}
+
+proc stage2_delay::register_sparse_pruned_command {seg plan} {
+    variable sparse_pruned_commands
+    variable consumed_source_files
+    array set s $seg
+    array set p $plan
+    set command_key [source_command_key $s(source_file) $s(line_no) $s(original_text)]
+    if {[info exists sparse_pruned_commands($command_key)]} {
+        array unset p
+        array unset s
+        return
+    }
+
+    set sparse_pruned_commands($command_key) [list \
+        segment [array get s] \
+        pruned_count $p(pruned_count) \
+        retained_count $p(retained_count) \
+        original_total $s(matrix_pair_count)]
+    set consumed_source_files([source_file_key $s(source_file)]) 1
+    performance_stat_add sparse_matrix_commands
+    performance_stat_add sparse_matrix_pairs_pruned $p(pruned_count)
+    performance_stat_add sparse_matrix_pairs_retained $p(retained_count)
+    performance_stat_add matrix_pairs_avoided $p(pruned_count)
+
+    foreach sample $p(samples) {
+        array set item $sample
+        set from_name [record_full_name $item(from)]
+        set to_name [record_full_name $item(to)]
+        trace_event NO_PT_CONNECTIVITY_PAIR \
+            "original_id=$s(original_id) split=$item(pair_index)/$s(matrix_pair_count) from={$from_name} to={$to_name} action=skip_before_expansion"
+        add_report_item "NO_PT_CONNECTIVITY_PAIR original_id=$s(original_id) from=$from_name to=$to_name action=skip_before_expansion"
+        array unset item
+    }
+    trace_event SPARSE_MATRIX_PLAN \
+        "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) product=$s(matrix_pair_count) pruned=$p(pruned_count) retained=$p(retained_count) elapsed_ms=$p(elapsed_ms)"
+    add_report_item "SPARSE_MATRIX_PLAN source=$s(source) id=$s(original_id) product=$s(matrix_pair_count) pruned=$p(pruned_count) retained=$p(retained_count)"
+    array unset p
+    array unset s
+}
+
 proc stage2_delay::expand_segment {seg} {
     variable options
     array set s $seg
@@ -1275,6 +1554,48 @@ proc stage2_delay::expand_segment {seg} {
         array unset s
         return [list $result]
     }
+
+    array set sparse_plan [sparse_matrix_expansion_plan [array get s]]
+    if {$sparse_plan(applied)} {
+        set kept_pair_indices $sparse_plan(kept_pair_indices)
+        set retained_total $sparse_plan(retained_count)
+        set s(matrix_retained_pair_count) $retained_total
+        register_sparse_pruned_command [array get s] [array get sparse_plan]
+
+        trace_event SEGMENT_EXPAND_BEGIN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total retained=$retained_total mode=SPARSE"
+        set start_ms [metadata_clock_milliseconds]
+        set out {}
+        foreach pair_index $kept_pair_indices {
+            set zero_index [expr {$pair_index - 1}]
+            set from_index [expr {$zero_index / $to_count}]
+            set to_index [expr {$zero_index % $to_count}]
+            set from_rec [lindex $s(from_records) $from_index]
+            set to_rec [lindex $s(to_records) $to_index]
+            array set e [array get s]
+            set e(id) "$s(original_id).[format %03d $pair_index]"
+            set e(split_index) $pair_index
+            set e(split_total) $total
+            set e(from_records) [list $from_rec]
+            set e(to_records) [list $to_rec]
+            set e(kind) complete
+            set e(sparse_matrix_pruned) true
+            lappend out [array get e]
+            array unset e
+        }
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add matrix_pairs_expanded $retained_total
+        performance_stat_add matrix_expand_elapsed_ms $elapsed_ms
+        trace_event SEGMENT_EXPAND_END \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) expanded=$retained_total product=$total pruned=$sparse_plan(pruned_count) elapsed_ms=$elapsed_ms mode=SPARSE"
+        array unset sparse_plan
+        array unset s
+        return $out
+    }
+    array unset sparse_plan
 
     set from_choices $s(from_records)
     if {[llength $from_choices] == 0} {
@@ -4060,7 +4381,7 @@ proc stage2_delay::expected_record_names {records} {
     return [lsort -unique $names]
 }
 
-proc stage2_delay::pt_collection_for_records {records} {
+proc stage2_delay::pt_collection_for_records {records {label open-to}} {
     if {[llength $records] == 0} {
         return [list ok true collection {} reason ""]
     }
@@ -4084,7 +4405,7 @@ proc stage2_delay::pt_collection_for_records {records} {
     }
 
     set value {}
-    pt_trace "$getter -quiet <open-to batch patterns=[llength $patterns] logical_members=[logical_record_count $records]>"
+    pt_trace "$getter -quiet <$label batch patterns=[llength $patterns] logical_members=[logical_record_count $records]>"
     if {[catch {set value [$getter -quiet $patterns]} err]} {
         return [list ok false collection {} reason "batch_getter_failed:$err"]
     }
@@ -5165,6 +5486,11 @@ proc stage2_delay::performance_stats_summary {} {
         metadata_individual_queries structural_passthrough_commands
         structural_passthrough_objects matrix_pairs_avoided
         matrix_expansion_limited matrix_pairs_expanded matrix_expand_elapsed_ms
+        sparse_matrix_commands sparse_matrix_endpoint_queries
+        sparse_matrix_clock_batches sparse_matrix_clock_batch_fallbacks
+        sparse_matrix_clock_records
+        sparse_matrix_query_unknown sparse_matrix_pairs_pruned
+        sparse_matrix_pairs_retained sparse_matrix_plan_elapsed_ms
         attribute_cache_hits owner_cache_hits
         boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
@@ -5561,6 +5887,7 @@ proc stage2_delay::current_scope_name {} {
 
 proc stage2_delay::write_removed_sdc {path} {
     variable consumed_segments
+    variable sparse_pruned_commands
     set fout [open_text $path w]
     write_author_banner $fout "# "
     puts $fout "#"
@@ -5576,6 +5903,15 @@ proc stage2_delay::write_removed_sdc {path} {
         }
         puts $fout ""
         array unset s
+    }
+    foreach command_key [lsort [array names sparse_pruned_commands]] {
+        array set p $sparse_pruned_commands($command_key)
+        array set s $p(segment)
+        puts $fout "# PT_DISCONNECTED_MATRIX_PAIRS $s(source_file)|$s(original_id) pruned=$p(pruned_count) retained=$p(retained_count) product=$p(original_total)"
+        puts $fout "# ORIGINAL: [compact_spaces $s(original_text)]"
+        puts $fout ""
+        array unset s
+        array unset p
     }
     close $fout
 }
@@ -5705,6 +6041,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
     puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
     puts $fout "Max segment pairs               : $options(-max_segment_pairs)"
+    puts $fout "Sparse matrix pruning           : $options(-sparse_matrix_prune)"
     puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
     puts $fout "Stage2 performance statistics   : [performance_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
@@ -6013,6 +6350,7 @@ proc stage2_delay::segment_sheet {seg} {
 proc stage2_delay::build_max_delay_usage_stats {total_name used_name} {
     variable all_delay_segments
     variable consumed_segments
+    variable sparse_pruned_commands
     upvar 1 $total_name total_by_sheet
     upvar 1 $used_name used_by_sheet
 
@@ -6041,6 +6379,24 @@ proc stage2_delay::build_max_delay_usage_stats {total_name used_name} {
             }
         }
         array unset s
+    }
+    foreach command_key [array names sparse_pruned_commands] {
+        array set p $sparse_pruned_commands($command_key)
+        array set s $p(segment)
+        if {$s(type) eq "max"} {
+            set sheet [expr {$s(source) eq "harden" ? $s(harden_inst) : "top"}]
+            set key [list $sheet $s(source_file) $s(original_id)]
+            if {![info exists total_seen($key)]} {
+                set total_seen($key) 1
+                incr total_by_sheet($sheet)
+            }
+            if {![info exists used_seen($key)]} {
+                set used_seen($key) 1
+                incr used_by_sheet($sheet)
+            }
+        }
+        array unset s
+        array unset p
     }
 }
 
@@ -6207,10 +6563,12 @@ proc stage2_delay::remaining_sdc_text {path} {
     foreach item [lsort -decreasing -integer -command stage2_delay::command_start_compare [commands_with_offsets $text $commands]] {
         array set cmd $item
         set consumed_for_cmd [consumed_segments_for_command $path $cmd(line) $cmd(text)]
-        if {[llength $consumed_for_cmd] > 0} {
+        set sparse_pruned_info [sparse_pruned_info_for_command $path $cmd(line) $cmd(text)]
+        if {[llength $consumed_for_cmd] > 0 || $sparse_pruned_info ne ""} {
             set before [string range $remaining 0 [expr {$cmd(start) - 1}]]
             set after [string range $remaining $cmd(end) end]
-            set replacement [remaining_replacement_for_command $path $cmd(line) $cmd(text) $consumed_for_cmd]
+            set replacement [remaining_replacement_for_command \
+                $path $cmd(line) $cmd(text) $consumed_for_cmd $sparse_pruned_info]
             set remaining "${before}${replacement}${after}"
         }
         array unset cmd
@@ -6228,13 +6586,32 @@ proc stage2_delay::consumed_segments_for_command {path line_no original_text} {
     return {}
 }
 
-proc stage2_delay::remaining_replacement_for_command {path line_no original_text consumed_for_cmd} {
+proc stage2_delay::sparse_pruned_info_for_command {path line_no original_text} {
+    variable sparse_pruned_commands
+    set command_key [source_command_key $path $line_no $original_text]
+    if {[info exists sparse_pruned_commands($command_key)]} {
+        return $sparse_pruned_commands($command_key)
+    }
+    return ""
+}
+
+proc stage2_delay::remaining_replacement_for_command {path line_no original_text consumed_for_cmd {sparse_pruned_info ""}} {
     variable parsed_command_segments
-    array set first [lindex $consumed_for_cmd 0]
+    if {[llength $consumed_for_cmd] > 0} {
+        array set first [lindex $consumed_for_cmd 0]
+    } elseif {$sparse_pruned_info ne ""} {
+        array set sparse $sparse_pruned_info
+        array set first $sparse(segment)
+        array unset sparse
+    } else {
+        error "internal error: remaining replacement has no consumed or sparse-pruned segment"
+    }
     set command_key [source_command_key $path $line_no $original_text]
     if {[info exists parsed_command_segments($command_key)]} {
         performance_stat_add parsed_segment_reuse_hits
         set expanded $parsed_command_segments($command_key)
+    } elseif {$sparse_pruned_info ne ""} {
+        set expanded {}
     } else {
         set words [tokenize_words $original_text]
         set base [segment_from_words $words $first(source) $path $first(line_no) $first(original_id) $original_text $first(harden_inst)]
@@ -6526,6 +6903,7 @@ proc stage2_delay::run_from_user_settings {} {
     set max_endpoints [global_setting MAX_ENDPOINTS 1000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
     set max_segment_pairs [global_setting STAGE2_MAX_SEGMENT_PAIRS 100000]
+    set sparse_matrix_prune [global_setting STAGE2_SPARSE_MATRIX_PRUNE true]
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
@@ -6570,6 +6948,7 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting STAGE2_METADATA_BATCH_ENABLED $metadata_batch_enabled
     set_global_setting STAGE2_METADATA_BATCH_SIZE $metadata_batch_size
     set_global_setting STAGE2_MAX_SEGMENT_PAIRS $max_segment_pairs
+    set_global_setting STAGE2_SPARSE_MATRIX_PRUNE $sparse_matrix_prune
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
     set_global_setting STAGE2_TEXT_ENCODING $text_encoding
@@ -6595,6 +6974,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Batch open-to query : $batch_open_to_query"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
     puts "INFO: Max segment pairs   : $max_segment_pairs"
+    puts "INFO: Sparse matrix prune : $sparse_matrix_prune"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
     puts "INFO: Text encoding       : $text_encoding"
 
@@ -6626,6 +7006,7 @@ proc stage2_delay::run_from_user_settings {} {
         -max_endpoints $max_endpoints \
         -max_enum_objects $max_enum_objects \
         -max_segment_pairs $max_segment_pairs \
+        -sparse_matrix_prune $sparse_matrix_prune \
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
         -batch_open_to_query $batch_open_to_query \
