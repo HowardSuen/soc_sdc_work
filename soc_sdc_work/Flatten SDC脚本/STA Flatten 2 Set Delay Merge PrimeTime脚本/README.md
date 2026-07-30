@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.12。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.13。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -85,6 +85,9 @@ set ::MAX_CHAIN_DEPTH 6
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
+set ::STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
@@ -147,6 +150,9 @@ set ::MAX_CHAIN_DEPTH 6
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
+set ::STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
@@ -191,6 +197,9 @@ set MAX_ENUM_OBJECTS 64
 set STAGE2_COMPACT_BUS true
 set STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set STAGE2_BATCH_OPEN_TO_QUERY true
+set STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true
+set STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
+set STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set STAGE2_METADATA_BATCH_ENABLED true
 set STAGE2_METADATA_BATCH_SIZE 128
 set STAGE2_MAX_SEGMENT_PAIRS 100000
@@ -238,6 +247,17 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   class 组成 collection，每个 class 只执行一次 endpoint fanout；harden
   open_to 的 full fanout 也只执行一次。若当前 PT 版本不接受 multi-pattern
   getter、返回集合不完整或命令报错，脚本自动回退为逐 seed 查询，不丢原约束。
+- `STAGE2_BATCH_BOUNDARY_FANOUT_QUERY=true`：仅优化 harden boundary 的
+  `all_fanin` 空结果 fallback。脚本按 bus basename 分组，并以
+  `STAGE2_BOUNDARY_FANOUT_BATCH_SIZE=16` 对精确成员分块；只有整块 fanout
+  并集明确不含目标 endpoint 时才跳过这些 bit。正块仍逐 bit 查询，集合构造、
+  expected/actual 校验或 batch fanout 失败时只回退该块，因此不会丢失
+  bit-to-endpoint 归属。少于
+  `STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS=4` 的块保持原逐 pin 路径。
+- 该优化不使用 `bus[*]` 作为 connectivity 证据。分块 collection 由 harden
+  input 的具体 `full_name` 构造，并要求 PT 实际返回集合与预期集合完全相等；
+  missing bit、额外匹配、对象解析失败都不能触发负向剪枝。诊断时可设置
+  `STAGE2_BATCH_BOUNDARY_FANOUT_QUERY=false` 做逐 pin A/B。
 - bus 等价查询和 open_to endpoint 查询在一次 build 内缓存，避免最终 SDC
   残留重写时重复访问 PT。压缩数、节省成员数、batch 数、fallback 数和 endpoint
   数会写入 `integration_delay_merge.rpt` 的 `[SUMMARY]`。
@@ -309,6 +329,10 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   也按 batch failure 处理，只对该块 fallback。recursive duplicate signature
   仅在 E2E 命令成功发射后才记录；首条等价 path 验证失败时，后续
   duplicate 不得消费任何尚未生成的源约束。
+- v0.9.13 对 reverse `all_fanin` 未推导出 boundary 后的逐 pin `all_fanout`
+  fallback 增加精确 bus chunk 负向预筛。默认 chunk 为 16、最小成员数为 4；
+  负块直接跳过，正块和失败块继续原逐 pin 查询。每块输出 BEGIN/END、状态、
+  返回数及毫秒耗时，并统计跳过 pin 数、个别查询数与 fallback 数。
 - `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
   pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
   此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
@@ -329,6 +353,7 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `is_clock_pin` 属性都使用逐对象 getter 路径，功能校验仍完整执行。
 - `integration_delay_merge.rpt` 和 terminal 的 `Stage2 performance statistics`
   会记录 metadata chunk 成功/失败、返回对象数、总耗时、关闭分组、单对象查询、
+  boundary fanout chunk 的正/负/失败数、返回对象、跳过 pin、逐 pin 查询及耗时，
   structural passthrough 命令/对象、避免及实际展开的 matrix pair、上限触发次数、
   展开耗时、缓存命中、segment index lookup、final rewrite 命中、signature lookup
   与跳过文件数，便于定位大型设计中的实际热点。
@@ -967,8 +992,11 @@ python3 regression_test/run_regression.py
 - 128-clock 大集合完整性与稳定排序、generated/master clock metadata、特殊 clock 名、
   asynchronous/logically exclusive/physically exclusive 原始报告、PT `redirect` 捕获、
   optional attribute 全部不支持、0/1 clock 边界，以及关闭功能后的零 PT 查询
+- boundary fanout bus chunk 的 batch on/off 输出等价、全负块零逐 bit 查询、
+  正块保持 bit 归属、单块 `all_fanout` 失败及 expected/actual 集合不一致时仅该块
+  fallback，以及 batch size/minimum 参数校验
 
-当前共 77 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
+当前共 83 个 mock-Tcl 回归 case；同时包含生成 SDC 的静态 source 校验。
 这些 case 证明脚本解析、匹配、回退和输出行为稳定，但不能替代真实 PrimeTime
 linked design 下的 collection、timing path 和 exception 验证。
 
@@ -979,6 +1007,29 @@ E2E 约束，`top.csv` 与 harden CSV 各 2048 行；同一环境下耗时由 v0
 
 生产使用前仍必须在 PrimeTime linked design 中做验证，因为 boundary 推导、
 startpoint/endpoint 合法性和 ignored exception 检查都依赖真实 STA database。
+
+## v0.9.13 Boundary Fanout Bus Chunk Prefilter
+
+当 harden `open_from` 没有显式 boundary，Stage 2 仍优先使用一次非 flat
+`all_fanin -to <endpoint>` 与 harden input pins 求交。只有该结果为空时，才进入
+boundary fanout fallback。v0.9.13 在原逐 pin fallback 前增加有界负向预筛：
+
+- 只将同一 harden、direction 和 bus basename 的具体 input pin 放入同一组；
+  默认每块最多 16 个，少于 4 个的尾块不做 batch。
+- batch collection 由具体 `full_name` list 生成，并要求 PT 返回的唯一对象名集合
+  与 expected 集合完全相等，不使用 wildcard 推断成员。
+- `all_fanout -flat -from <chunk>` 返回的是各 bit fanout 的并集。只有目标 endpoint
+  明确不在并集中时，才能证明整块所有 bit 都不匹配并跳过逐 bit 查询。
+- union 命中不能证明具体 bit 归属，因此正块必须继续原逐 pin 查询。collection
+  构造、迭代、集合校验或 batch fanout 任一失败，也只让该块走原路径。
+- `BOUNDARY_FANOUT_BATCH_BEGIN/END` 记录 harden、endpoint、bus、chunk、成员数、
+  `POSITIVE/NEGATIVE/FALLBACK`、返回对象数和 `elapsed_ms`。报告统计可直接计算
+  实际跳过的 pin 数及局部查询收益。
+
+以 63-bit bus、16-bit chunk 为例：全负时逐 pin 查询由 63 次降为 4 次；只有
+一个 16-bit chunk 命中时约为 20 次；所有 chunk 都命中时最多 67 次。调用次数
+并不等于真实 PT wall time，真实收益仍取决于各 bit fanout cone 的重叠程度和
+该 fallback 在 Stage 2 总耗时中的占比。
 
 ## v0.9.12 Sparse Matrix Correctness Hardening
 

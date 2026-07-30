@@ -83,6 +83,72 @@ proc get_attribute {obj attr} {
 '''
 
 
+BOUNDARY_FANOUT_BATCH_PRELUDE = r'''
+if {![info exists ::BOUNDARY_CONNECTED_PINS]} {
+    set ::BOUNDARY_CONNECTED_PINS [list {u_h0/data[1]}]
+}
+if {![info exists ::BOUNDARY_FAIL_BATCH_CONTAINS]} {
+    set ::BOUNDARY_FAIL_BATCH_CONTAINS ""
+}
+if {![info exists ::BOUNDARY_MISMATCH_BATCH_CONTAINS]} {
+    set ::BOUNDARY_MISMATCH_BATCH_CONTAINS ""
+}
+set ::BOUNDARY_PINS {}
+set ::BOUNDARY_BATCH_CALLS 0
+set ::BOUNDARY_LEAF_CALLS 0
+foreach idx {0 1 2 3 4 5 6 7} {
+    set name [format {u_h0/data[%d]} $idx]
+    lappend ::BOUNDARY_PINS $name
+    set ::PT_MOCK_DIRECTIONS($name) in
+}
+set ::PT_MOCK_DIRECTIONS(u_h0/u_reg/D) in
+
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc get_pins {args} {
+    if {[lsearch -exact $args "-of_objects"] >= 0} {
+        return $::BOUNDARY_PINS
+    }
+    set patterns [lindex $args end]
+    if {[llength $patterns] > 1 &&
+        $::BOUNDARY_MISMATCH_BATCH_CONTAINS ne "" &&
+        [lsearch -exact $patterns $::BOUNDARY_MISMATCH_BATCH_CONTAINS] >= 0} {
+        return [concat $patterns [list {u_h0/data[99]}]]
+    }
+    return $patterns
+}
+
+proc filter_collection {coll expression} {
+    return $coll
+}
+
+proc all_fanin {args} {
+    return {}
+}
+
+proc all_fanout {args} {
+    set seeds [lindex $args end]
+    if {[llength $seeds] > 1} {
+        incr ::BOUNDARY_BATCH_CALLS
+        if {$::BOUNDARY_FAIL_BATCH_CONTAINS ne "" &&
+            [lsearch -exact $seeds $::BOUNDARY_FAIL_BATCH_CONTAINS] >= 0} {
+            error "mock boundary batch fanout failure"
+        }
+    } else {
+        incr ::BOUNDARY_LEAF_CALLS
+    }
+    foreach connected $::BOUNDARY_CONNECTED_PINS {
+        if {[lsearch -exact $seeds $connected] >= 0} {
+            return [list u_h0/decoy/D u_h0/u_reg/D]
+        }
+    }
+    return [list u_h0/decoy/D]
+}
+'''
+
+
 def write_file(path, text):
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
@@ -2371,6 +2437,249 @@ def test_max_segment_pairs_validation():
         assert_text_contains(result["stderr"], "-max_segment_pairs must be an integer >= 1")
 
 
+def run_boundary_fanout_batch_case(case_name, enabled=True, prelude_prefix=""):
+    return run_case(
+        case_name,
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins {u_h0/data[1]}]\n",
+        "set_max_delay 5.0 -to [get_pins u_h0/u_reg/D]\n",
+        extra_build_args=[
+            "-batch_boundary_fanout_query", "true" if enabled else "false",
+            "-boundary_fanout_batch_size", "4",
+            "-boundary_fanout_batch_min_members", "4",
+        ],
+        prelude=prelude_prefix + BOUNDARY_FANOUT_BATCH_PRELUDE,
+        post_build_tcl=(
+            'puts "BOUNDARY_FANOUT_CALLS batch=$::BOUNDARY_BATCH_CALLS '
+            'leaf=$::BOUNDARY_LEAF_CALLS"'
+        ),
+    )
+
+
+def test_boundary_fanout_batch_sparse_hit_matches_disabled_output():
+    enabled = run_boundary_fanout_batch_case("boundary_fanout_sparse_enabled", enabled=True)
+    disabled = run_boundary_fanout_batch_case("boundary_fanout_sparse_disabled", enabled=False)
+    require_ok(enabled)
+    require_ok(disabled)
+
+    if delay_command_lines(enabled["out_sdc"]) != delay_command_lines(disabled["out_sdc"]):
+        raise AssertionError("Boundary fanout batching changed generated delay commands")
+    if delay_command_lines(enabled["final"]) != delay_command_lines(disabled["final"]):
+        raise AssertionError("Boundary fanout batching changed final delay commands")
+    assert_contains(
+        enabled["out_sdc"],
+        "set_max_delay 7 -from [get_pins {u_src_reg/Q}] "
+        "-through [get_pins {u_h0/data[1]}] -to [get_pins {u_h0/u_reg/D}]",
+    )
+    assert_contains(enabled["review"], "Overall result    : PASS")
+    assert_contains(disabled["review"], "Overall result    : PASS")
+
+    enabled_report = read_file(enabled["report"])
+    disabled_report = read_file(disabled["report"])
+    if stat_value(enabled_report, "boundary_fanout_batch_queries") != 2:
+        raise AssertionError("Expected two boundary batch fanout queries")
+    if stat_value(enabled_report, "boundary_fanout_batch_positive") != 1:
+        raise AssertionError("Expected one positive boundary batch")
+    if stat_value(enabled_report, "boundary_fanout_batch_negative") != 1:
+        raise AssertionError("Expected one negative boundary batch")
+    if stat_value(enabled_report, "boundary_fanout_pins_skipped") != 4:
+        raise AssertionError("Expected four pins to be skipped by the negative batch")
+    if stat_value(enabled_report, "boundary_fanout_individual_queries") != 4:
+        raise AssertionError("Positive batch must still query all four bits individually")
+    if stat_value(disabled_report, "boundary_fanout_batch_queries") != 0:
+        raise AssertionError("Disabled boundary batching issued a batch query")
+    if stat_value(disabled_report, "boundary_fanout_individual_queries") != 8:
+        raise AssertionError("Disabled boundary batching did not preserve per-pin checks")
+    assert_text_contains(enabled["stdout"], "BOUNDARY_FANOUT_CALLS batch=2 leaf=4")
+    assert_text_contains(disabled["stdout"], "BOUNDARY_FANOUT_CALLS batch=0 leaf=8")
+    assert_contains(enabled["trace"], "BOUNDARY_FANOUT_BATCH_BEGIN")
+    assert_contains(enabled["trace"], "status=POSITIVE")
+    assert_contains(enabled["trace"], "status=NEGATIVE")
+    assert_contains(enabled["trace"], "elapsed_ms=")
+    validate_static_sdc(enabled["out_sdc"])
+    validate_static_sdc(disabled["out_sdc"])
+
+
+def test_boundary_fanout_batch_all_negative_skips_leaf_queries():
+    result = run_boundary_fanout_batch_case(
+        "boundary_fanout_all_negative",
+        prelude_prefix="set ::BOUNDARY_CONNECTED_PINS {}\n",
+    )
+    require_ok(result)
+    report = read_file(result["report"])
+    if stat_value(report, "boundary_fanout_batch_queries") != 2:
+        raise AssertionError("Expected two all-negative boundary batches")
+    if stat_value(report, "boundary_fanout_batch_negative") != 2:
+        raise AssertionError("Expected both boundary batches to be negative")
+    if stat_value(report, "boundary_fanout_pins_skipped") != 8:
+        raise AssertionError("All-negative batches did not skip every bus bit")
+    if stat_value(report, "boundary_fanout_individual_queries") != 0:
+        raise AssertionError("All-negative batches unexpectedly queried individual bits")
+    assert_text_contains(result["stdout"], "BOUNDARY_FANOUT_CALLS batch=2")
+    assert_contains(result["review"], "NO_TOP_SEGMENT_MATCHED")
+
+
+def test_boundary_fanout_failed_chunk_only_falls_back():
+    result = run_boundary_fanout_batch_case(
+        "boundary_fanout_failed_chunk",
+        prelude_prefix="set ::BOUNDARY_FAIL_BATCH_CONTAINS {u_h0/data[0]}\n",
+    )
+    require_ok(result)
+    report = read_file(result["report"])
+    if stat_value(report, "boundary_fanout_batch_queries") != 2:
+        raise AssertionError("Expected both boundary chunks to be attempted")
+    if stat_value(report, "boundary_fanout_batch_fallbacks") != 1:
+        raise AssertionError("Expected only the failed boundary chunk to fall back")
+    if stat_value(report, "boundary_fanout_batch_negative") != 1:
+        raise AssertionError("The unaffected boundary chunk was not retained as negative")
+    if stat_value(report, "boundary_fanout_pins_skipped") != 4:
+        raise AssertionError("The unaffected negative chunk was not skipped")
+    if stat_value(report, "boundary_fanout_individual_queries") != 4:
+        raise AssertionError("Only the failed boundary chunk should use per-pin fallback")
+    assert_text_contains(result["stdout"], "BOUNDARY_FANOUT_CALLS batch=2 leaf=4")
+    assert_contains(result["trace"], "status=FALLBACK")
+    assert_contains(result["trace"], "mock boundary batch fanout failure")
+    assert_contains(result["out_sdc"], "-through [get_pins {u_h0/data[1]}]")
+
+
+def test_boundary_fanout_collection_mismatch_falls_back_without_loss():
+    result = run_boundary_fanout_batch_case(
+        "boundary_fanout_collection_mismatch",
+        prelude_prefix="set ::BOUNDARY_MISMATCH_BATCH_CONTAINS {u_h0/data[0]}\n",
+    )
+    require_ok(result)
+    report = read_file(result["report"])
+    if stat_value(report, "boundary_fanout_batch_queries") != 1:
+        raise AssertionError("Mismatched collection must not reach all_fanout")
+    if stat_value(report, "boundary_fanout_batch_fallbacks") != 1:
+        raise AssertionError("Expected the mismatched collection chunk to fall back")
+    if stat_value(report, "boundary_fanout_individual_queries") != 4:
+        raise AssertionError("Collection mismatch did not fall back only its four members")
+    if stat_value(report, "boundary_fanout_pins_skipped") != 4:
+        raise AssertionError("Unaffected negative chunk was not skipped after mismatch")
+    assert_text_contains(result["stdout"], "BOUNDARY_FANOUT_CALLS batch=1 leaf=4")
+    assert_contains(result["trace"], "batch_set_mismatch")
+    assert_contains(result["out_sdc"], "-through [get_pins {u_h0/data[1]}]")
+
+
+def test_boundary_fanout_batch_option_validation():
+    invalid = (
+        (["-boundary_fanout_batch_size", "1"], "-boundary_fanout_batch_size must be an integer >= 2"),
+        (["-boundary_fanout_batch_min_members", "1"], "-boundary_fanout_batch_min_members must be an integer >= 2"),
+        (
+            [
+                "-boundary_fanout_batch_size", "4",
+                "-boundary_fanout_batch_min_members", "5",
+            ],
+            "-boundary_fanout_batch_min_members must be <= -boundary_fanout_batch_size",
+        ),
+    )
+    for index, (args, message) in enumerate(invalid):
+        result = run_case(
+            "boundary_fanout_invalid_%d" % index,
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+            "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+            extra_build_args=args,
+        )
+        if result["code"] == 0:
+            raise AssertionError("Invalid boundary fanout batch options were accepted: %r" % args)
+        assert_text_contains(result["stderr"], message)
+
+
+def test_boundary_fanout_exhaustive_membership_differential():
+    driver = os.path.join(WORK, "boundary_fanout_exhaustive.tcl")
+    write_file(
+        driver,
+        r'''
+set ::STAGE2_AUTO_RUN false
+source {%s}
+stage2_delay::reset_state
+rename stage2_delay::pt_trace stage2_delay::pt_trace_original
+rename stage2_delay::trace_event stage2_delay::trace_event_original
+proc stage2_delay::pt_trace {message} {}
+proc stage2_delay::trace_event {kind message} {}
+
+set ::BOUNDARY_PINS {}
+foreach idx {0 1 2 3 4 5 6 7} {
+    lappend ::BOUNDARY_PINS [format {u_h0/data[%%d]} $idx]
+}
+set ::CONNECTED {}
+
+proc sizeof_collection {coll} { return [llength $coll] }
+proc foreach_in_collection {var coll body} {
+    upvar 1 $var item
+    foreach item $coll { uplevel 1 $body }
+}
+proc get_cells {args} { return [list [lindex $args end]] }
+proc get_pins {args} {
+    if {[lsearch -exact $args -of_objects] >= 0} { return $::BOUNDARY_PINS }
+    return [lindex $args end]
+}
+proc filter_collection {coll expression} { return $coll }
+proc get_attribute {obj attr} {
+    if {$attr eq "full_name"} { return [lindex $obj 0] }
+    if {$attr eq "direction"} { return in }
+    return ""
+}
+proc all_fanout {args} {
+    set seeds [lindex $args end]
+    foreach seed $seeds {
+        if {[lsearch -exact $::CONNECTED $seed] >= 0} {
+            return [list u_h0/decoy/D u_h0/target/D]
+        }
+    }
+    return [list u_h0/decoy/D]
+}
+proc boundary_names {records} {
+    set names {}
+    foreach rec $records { lappend names [stage2_delay::record_full_name $rec] }
+    return [lsort $names]
+}
+
+set checked 0
+foreach config {{2 2} {3 2} {4 4} {5 3} {8 4} {16 4}} {
+    lassign $config batch_size min_members
+    set ::stage2_delay::options(-boundary_fanout_batch_size) $batch_size
+    set ::stage2_delay::options(-boundary_fanout_batch_min_members) $min_members
+    for {set mask 0} {$mask < 256} {incr mask} {
+        set ::CONNECTED {}
+        for {set idx 0} {$idx < 8} {incr idx} {
+            if {$mask & (1 << $idx)} {
+                lappend ::CONNECTED [format {u_h0/data[%%d]} $idx]
+            }
+        }
+        set expected [lsort $::CONNECTED]
+
+        set ::stage2_delay::options(-batch_boundary_fanout_query) true
+        set batched [boundary_names [stage2_delay::pt_boundary_inputs_by_fanout u_h0 u_h0/target/D]]
+        set ::stage2_delay::options(-batch_boundary_fanout_query) false
+        set legacy [boundary_names [stage2_delay::pt_boundary_inputs_by_fanout u_h0 u_h0/target/D]]
+
+        if {$batched ne $legacy || $batched ne $expected} {
+            error "boundary differential mismatch config=$config mask=$mask expected={$expected} batched={$batched} legacy={$legacy}"
+        }
+        incr checked
+    }
+}
+puts "BOUNDARY_EXHAUSTIVE cases=$checked"
+''' % TOOL.replace("\\", "/"),
+    )
+    proc = subprocess.Popen(
+        ["tclsh", driver],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=WORK,
+    )
+    stdout, stderr = proc.communicate()
+    output = stdout.decode("utf-8", "replace")
+    errors = stderr.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        raise AssertionError(
+            "Boundary fanout exhaustive differential failed\nstdout=%s\nstderr=%s"
+            % (output, errors)
+        )
+    assert_text_contains(output, "BOUNDARY_EXHAUSTIVE cases=1536")
+
+
 def test_startpoint_and_boundary_queries_are_cached():
     prelude = r'''
 set ::FANIN_QUERY_LOG [file join [pwd] fanin_query_calls.log]
@@ -4075,6 +4384,12 @@ def main():
         test_object_metadata_batch_can_be_disabled_without_skipping_queries,
         test_object_metadata_batch_size_validation,
         test_max_segment_pairs_validation,
+        test_boundary_fanout_batch_sparse_hit_matches_disabled_output,
+        test_boundary_fanout_batch_all_negative_skips_leaf_queries,
+        test_boundary_fanout_failed_chunk_only_falls_back,
+        test_boundary_fanout_collection_mismatch_falls_back_without_loss,
+        test_boundary_fanout_batch_option_validation,
+        test_boundary_fanout_exhaustive_membership_differential,
         test_startpoint_and_boundary_queries_are_cached,
         test_missing_path_fanout_queries_are_cached,
         test_final_rewrite_reuses_parsed_segments_and_skips_untouched_sdc,

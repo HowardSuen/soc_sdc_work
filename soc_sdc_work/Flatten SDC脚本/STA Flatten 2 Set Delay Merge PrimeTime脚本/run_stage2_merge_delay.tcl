@@ -102,6 +102,15 @@ set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 
+# When reverse all_fanin cannot identify a harden boundary input, the legacy
+# fallback checks every harden input pin with all_fanout. Group exact members
+# of the same bus into bounded chunks first. A chunk whose fanout union does
+# not contain the endpoint is safely skipped; positive or failed chunks still
+# use the original per-pin checks, preserving bit-to-endpoint attribution.
+set ::STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
+
 # Direction metadata queries are grouped by object class and split into bounded
 # chunks before calling get_pins/get_ports/get_cells/get_nets. Disable batching
 # only for diagnosis; disabled mode still queries every object's direction.
@@ -144,7 +153,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.12"
+    variable VERSION "v0.9.13"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -215,6 +224,9 @@ namespace eval stage2_delay {
         -compact_bus "true"
         -compact_bus_min_members 4
         -batch_open_to_query "true"
+        -batch_boundary_fanout_query "true"
+        -boundary_fanout_batch_size 16
+        -boundary_fanout_batch_min_members 4
         -metadata_batch_enabled "true"
         -metadata_batch_size 128
         -check_units "true"
@@ -374,6 +386,16 @@ proc stage2_delay::reset_state {} {
         attribute_cache_hits 0
         owner_cache_hits 0
         boundary_cache_hits 0
+        boundary_fanout_batch_queries 0
+        boundary_fanout_batch_records 0
+        boundary_fanout_batch_negative 0
+        boundary_fanout_batch_positive 0
+        boundary_fanout_batch_fallbacks 0
+        boundary_fanout_batch_returned_objects 0
+        boundary_fanout_batch_elapsed_ms 0
+        boundary_fanout_pins_skipped 0
+        boundary_fanout_individual_queries 0
+        boundary_fanout_individual_elapsed_ms 0
         startpoint_cache_hits 0
         missing_harden_cache_hits 0
         missing_top_cache_hits 0
@@ -562,6 +584,15 @@ proc stage2_delay::validate_options {} {
     }
     if {![string is integer -strict $options(-compact_bus_min_members)] || $options(-compact_bus_min_members) < 2} {
         error "-compact_bus_min_members must be an integer >= 2"
+    }
+    if {![string is integer -strict $options(-boundary_fanout_batch_size)] || $options(-boundary_fanout_batch_size) < 2} {
+        error "-boundary_fanout_batch_size must be an integer >= 2"
+    }
+    if {![string is integer -strict $options(-boundary_fanout_batch_min_members)] || $options(-boundary_fanout_batch_min_members) < 2} {
+        error "-boundary_fanout_batch_min_members must be an integer >= 2"
+    }
+    if {$options(-boundary_fanout_batch_min_members) > $options(-boundary_fanout_batch_size)} {
+        error "-boundary_fanout_batch_min_members must be <= -boundary_fanout_batch_size"
     }
     if {![string is integer -strict $options(-metadata_batch_size)] || $options(-metadata_batch_size) < 1} {
         error "-metadata_batch_size must be an integer >= 1"
@@ -3094,6 +3125,7 @@ proc stage2_delay::pt_boundary_inputs_by_fanin {harden_inst endpoint} {
 }
 
 proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
+    variable options
     if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands get_cells] eq ""} {
         pt_trace "fanout boundary inference skip harden={$harden_inst} endpoint={$endpoint} missing_command"
         return {}
@@ -3111,17 +3143,24 @@ proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
             pt_trace "filter_collection <harden_pins:{$harden_inst}> {direction == in}"
             set hin [filter_collection $hpins "direction == in"]
             pt_trace "filter_collection result harden={$harden_inst} input_count=[sizeof_collection $hin]"
+
+            array set skipped_names {}
+            if {[truthy $options(-batch_boundary_fanout_query)]} {
+                pt_boundary_fanout_prefilter $hin $harden_inst $ep_name skipped_names
+            }
+
             set out {}
             foreach_in_collection pin $hin {
                 set name [get_attribute $pin full_name]
-                pt_trace "all_fanout -flat -from {$name}"
-                set fanout [all_fanout -flat -from $pin]
-                pt_trace "all_fanout result from={$name} count=[sizeof_collection $fanout]"
-                if {[collection_contains_name $fanout $ep_name]} {
+                if {[info exists skipped_names($name)]} {
+                    continue
+                }
+                if {[pt_boundary_input_reaches_endpoint $pin $name $ep_name]} {
                     pt_trace "fanout boundary matched harden={$harden_inst} endpoint={$endpoint} boundary={$name}"
                     lappend out [object_record pin $name [get_attribute $pin direction] $harden_inst]
                 }
             }
+            array unset skipped_names
             set value $out
         }
     } err]} {
@@ -3130,6 +3169,161 @@ proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
     }
     pt_trace "fanout boundary inference summary harden={$harden_inst} endpoint={$endpoint} boundary_count=[llength $value]"
     return $value
+}
+
+proc stage2_delay::pt_boundary_fanout_prefilter {hin harden_inst endpoint skipped_array_name} {
+    variable options
+    upvar 1 $skipped_array_name skipped_names
+
+    array set bus_records {}
+    array set bus_bases {}
+    set bus_order {}
+    foreach_in_collection pin $hin {
+        set name [get_attribute $pin full_name]
+        set rec [object_record pin $name in $harden_inst]
+        set info [bus_member_info $rec]
+        if {[llength $info] == 0} {
+            continue
+        }
+        array set b $info
+        set key [list $b(object_class) $b(direction) $b(owner_harden_inst) $b(base)]
+        if {![info exists bus_records($key)]} {
+            set bus_records($key) {}
+            set bus_bases($key) $b(base)
+            lappend bus_order $key
+        }
+        lappend bus_records($key) $rec
+        array unset b
+    }
+
+    foreach key $bus_order {
+        set members $bus_records($key)
+        if {[llength $members] < $options(-boundary_fanout_batch_min_members)} {
+            continue
+        }
+
+        set chunks {}
+        set batch_size $options(-boundary_fanout_batch_size)
+        for {set start 0} {$start < [llength $members]} {incr start $batch_size} {
+            set chunk [lrange $members $start [expr {$start + $batch_size - 1}]]
+            if {[llength $chunk] >= $options(-boundary_fanout_batch_min_members)} {
+                lappend chunks $chunk
+            }
+        }
+
+        set chunk_total [llength $chunks]
+        set chunk_index 0
+        foreach chunk $chunks {
+            incr chunk_index
+            pt_boundary_fanout_prefilter_chunk \
+                $chunk $harden_inst $endpoint $bus_bases($key) \
+                $chunk_index $chunk_total skipped_names
+        }
+    }
+
+    array unset bus_records
+    array unset bus_bases
+}
+
+proc stage2_delay::pt_boundary_fanout_prefilter_chunk {records harden_inst endpoint bus_base chunk_index chunk_total skipped_array_name} {
+    upvar 1 $skipped_array_name skipped_names
+
+    set record_count [llength $records]
+    set start_ms [metadata_clock_milliseconds]
+    performance_stat_add boundary_fanout_batch_records $record_count
+    trace_event BOUNDARY_FANOUT_BATCH_BEGIN \
+        "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total records=$record_count"
+
+    set batch_result {}
+    if {[catch {set batch_result [pt_collection_for_records $records boundary-fanout]} err]} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $err]
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=0 elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    array set batch $batch_result
+    if {!$batch(ok)} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $batch(reason)]
+        array unset batch
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=0 elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    set start $batch(collection)
+    array unset batch
+    set returned_count 0
+    set matched 0
+    if {[catch {
+        performance_stat_add boundary_fanout_batch_queries
+        pt_trace "all_fanout -flat -from <boundary-fanout bus={$bus_base} chunk=$chunk_index/$chunk_total records=$record_count>"
+        set fanout [all_fanout -flat -from $start]
+        set returned_count [sizeof_collection $fanout]
+        set matched [collection_contains_name $fanout $endpoint]
+    } err]} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_returned_objects $returned_count
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $err]
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=$returned_count elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add boundary_fanout_batch_returned_objects $returned_count
+    performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+    if {$matched} {
+        performance_stat_add boundary_fanout_batch_positive
+        set status POSITIVE
+    } else {
+        foreach rec $records {
+            array set r $rec
+            set skipped_names($r(full_name)) 1
+            array unset r
+        }
+        performance_stat_add boundary_fanout_batch_negative
+        performance_stat_add boundary_fanout_pins_skipped $record_count
+        set status NEGATIVE
+    }
+    trace_event BOUNDARY_FANOUT_BATCH_END \
+        "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=$status records=$record_count returned=$returned_count elapsed_ms=$elapsed_ms"
+}
+
+proc stage2_delay::pt_boundary_input_reaches_endpoint {pin name endpoint} {
+    set start_ms [metadata_clock_milliseconds]
+    performance_stat_add boundary_fanout_individual_queries
+    pt_trace "all_fanout -flat -from {$name}"
+    set fanout [all_fanout -flat -from $pin]
+    set returned_count [sizeof_collection $fanout]
+    set matched [collection_contains_name $fanout $endpoint]
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add boundary_fanout_individual_elapsed_ms $elapsed_ms
+    pt_trace "all_fanout result from={$name} count=$returned_count elapsed_ms=$elapsed_ms"
+    return $matched
 }
 
 proc stage2_delay::collection_contains_name {coll name} {
@@ -5587,7 +5781,13 @@ proc stage2_delay::performance_stats_summary {} {
         sparse_matrix_query_unknown sparse_matrix_pairs_pruned
         sparse_matrix_pairs_retained sparse_matrix_plan_elapsed_ms
         attribute_cache_hits owner_cache_hits
-        boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
+        boundary_cache_hits boundary_fanout_batch_queries
+        boundary_fanout_batch_records boundary_fanout_batch_negative
+        boundary_fanout_batch_positive boundary_fanout_batch_fallbacks
+        boundary_fanout_batch_returned_objects boundary_fanout_batch_elapsed_ms
+        boundary_fanout_pins_skipped boundary_fanout_individual_queries
+        boundary_fanout_individual_elapsed_ms
+        startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
         final_rewrite_skipped_files parsed_segment_reuse_hits
         final_rewrite_signature_lookups
@@ -6133,6 +6333,9 @@ proc stage2_delay::write_report {path} {
     puts $fout "Bus compression                 : $options(-compact_bus)"
     puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
+    puts $fout "Batch boundary fanout query     : $options(-batch_boundary_fanout_query)"
+    puts $fout "Boundary fanout batch size      : $options(-boundary_fanout_batch_size)"
+    puts $fout "Boundary fanout minimum members : $options(-boundary_fanout_batch_min_members)"
     puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
     puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
     puts $fout "Max segment pairs               : $options(-max_segment_pairs)"
@@ -6997,6 +7200,9 @@ proc stage2_delay::run_from_user_settings {} {
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
+    set batch_boundary_fanout_query [global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true]
+    set boundary_fanout_batch_size [global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16]
+    set boundary_fanout_batch_min_members [global_setting STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4]
     set metadata_batch_enabled [global_setting STAGE2_METADATA_BATCH_ENABLED true]
     set metadata_batch_size [global_setting STAGE2_METADATA_BATCH_SIZE 128]
     set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY true]
@@ -7035,6 +7241,9 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting STAGE2_COMPACT_BUS $compact_bus
     set_global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS $compact_bus_min_members
     set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
+    set_global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY $batch_boundary_fanout_query
+    set_global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE $boundary_fanout_batch_size
+    set_global_setting STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS $boundary_fanout_batch_min_members
     set_global_setting STAGE2_METADATA_BATCH_ENABLED $metadata_batch_enabled
     set_global_setting STAGE2_METADATA_BATCH_SIZE $metadata_batch_size
     set_global_setting STAGE2_MAX_SEGMENT_PAIRS $max_segment_pairs
@@ -7062,6 +7271,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Recursive mode      : $recursive_chain_mode"
     puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
     puts "INFO: Batch open-to query : $batch_open_to_query"
+    puts "INFO: Boundary fanout     : $batch_boundary_fanout_query (size=$boundary_fanout_batch_size min=$boundary_fanout_batch_min_members)"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
     puts "INFO: Max segment pairs   : $max_segment_pairs"
     puts "INFO: Sparse matrix prune : $sparse_matrix_prune"
@@ -7100,6 +7310,9 @@ proc stage2_delay::run_from_user_settings {} {
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
         -batch_open_to_query $batch_open_to_query \
+        -batch_boundary_fanout_query $batch_boundary_fanout_query \
+        -boundary_fanout_batch_size $boundary_fanout_batch_size \
+        -boundary_fanout_batch_min_members $boundary_fanout_batch_min_members \
         -metadata_batch_enabled $metadata_batch_enabled \
         -metadata_batch_size $metadata_batch_size
 
