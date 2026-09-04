@@ -9,6 +9,7 @@ parsing, matching, reporting, and static SDC emission deterministic.
 from __future__ import print_function
 
 import contextlib
+import csv
 import importlib.util
 import io
 import os
@@ -342,6 +343,93 @@ def test_release_identity_is_reconstructed_without_plaintext_constant():
     identity_lines = stdout.decode("utf-8", "replace").strip().splitlines()
     if identity_lines != [expected, expected, "  Author  : %s" % tamper_message]:
         raise AssertionError("Unexpected Tcl identity guard output: %s" % identity_lines)
+
+
+def test_report_accepts_large_csv_field():
+    case_dir = os.path.join(WORK, "report_large_csv_field")
+    summary_dir = os.path.join(case_dir, "delay_path_summary")
+    os.makedirs(summary_dir)
+
+    with open(os.path.join(summary_dir, "00_index.csv"), "w", newline="") as fout:
+        writer = csv.writer(fout, lineterminator="\n")
+        writer.writerow(
+            [
+                "script",
+                "version",
+                "author",
+                "sheet",
+                "file",
+                "max_delay_total",
+                "max_delay_used",
+                "min_delay_total",
+                "min_delay_used",
+            ]
+        )
+        writer.writerow(
+            [
+                "run_stage2_merge_delay.tcl",
+                "v0.9.13",
+                "Howard",
+                "top",
+                "top.csv",
+                "1",
+                "1",
+                "0",
+                "0",
+            ]
+        )
+
+    large_command = "set_max_delay 1.0 " + ("x" * 131073)
+    with open(os.path.join(summary_dir, "top.csv"), "w", newline="") as fout:
+        writer = csv.writer(fout, lineterminator="\n")
+        writer.writerow(
+            [
+                "e2e_id",
+                "cmd_id",
+                "source",
+                "source_inst",
+                "stage_1_sdc_delay",
+                "stage_1_from",
+                "stage_1_to",
+                "command",
+            ]
+        )
+        writer.writerow(
+            [
+                "E2E-LARGE",
+                "CMD-LARGE",
+                "top",
+                "top",
+                "1.0",
+                "u_src/Q",
+                "u_dst/D",
+                large_command,
+            ]
+        )
+
+    out_xlsx = os.path.join(case_dir, "large_field.xlsx")
+    proc = subprocess.Popen(
+        [sys.executable, REPORT_TOOL, summary_dir, "-o", out_xlsx],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=case_dir,
+    )
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise AssertionError(
+            "large CSV field report failed\nstdout=%s\nstderr=%s"
+            % (stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"))
+        )
+    assert_exists(out_xlsx)
+
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(out_xlsx, read_only=True)
+    if workbook.sheetnames != ["top"]:
+        raise AssertionError("Unexpected workbook sheets: %s" % workbook.sheetnames)
+    if workbook["top"]["A3"].value != "E2E-LARGE":
+        raise AssertionError("Large CSV row was not preserved in report")
+    workbook.close()
 
 
 def test_complete_complete_merge():
@@ -2878,6 +2966,7 @@ def main():
     os.makedirs(WORK)
     tests = [
         test_release_identity_is_reconstructed_without_plaintext_constant,
+        test_report_accepts_large_csv_field,
         test_complete_complete_merge,
         test_live_trace_records_invalid_startpoint_object,
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
