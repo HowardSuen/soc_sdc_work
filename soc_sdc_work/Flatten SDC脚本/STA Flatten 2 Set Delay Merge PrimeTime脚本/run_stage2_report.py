@@ -20,7 +20,7 @@ except ImportError as exc:
     )
 
 
-VERSION = "v0.1.7"
+VERSION = "v0.1.8"
 TOOL_NAME = "run_stage2_report.py"
 STAGE_NAME = "STA Flatten 2 Set Delay Merge PrimeTime Report"
 
@@ -116,7 +116,26 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+def configure_csv_field_size_limit():
+    """Allow generated reports to contain long serialized path fields.
+
+    Python's csv module defaults to a 128 KiB field limit, which is smaller
+    than some legitimate Stage 2 path-summary fields.  Use the largest limit
+    supported by the running Python build, falling back for platforms where
+    ``sys.maxsize`` does not fit the csv module's integer type.
+    """
+    limit = sys.maxsize
+    while limit > 0:
+        try:
+            csv.field_size_limit(limit)
+            return limit
+        except OverflowError:
+            limit //= 2
+    raise RuntimeError("Unable to configure CSV field size limit")
+
+
 def read_csv_dicts(path):
+    configure_csv_field_size_limit()
     with open(path, "r", newline="") as fin:
         return list(csv.DictReader(fin))
 
