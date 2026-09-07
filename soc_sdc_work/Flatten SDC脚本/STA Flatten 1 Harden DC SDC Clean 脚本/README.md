@@ -17,6 +17,30 @@ python3 run_stage1_clean_sdc.py \
 
 脚本只依赖 Python 标准库，按 Python 3.6 语法约束实现。
 
+## 批处理入口
+
+准备 CSV，表头固定为 `MODULE_NAME,INST_NAME,SDC_PATH`：
+
+```csv
+MODULE_NAME,INST_NAME,SDC_PATH
+ucie_uaxi_top,u_ucie_uaxi_top,input/ucie_uaxi_top.sdc
+b1,u_b/u_b1,./input/b1.sdc
+```
+
+`SDC_PATH` 支持绝对路径；相对路径以 CSV 文件所在目录为基准：
+
+```bash
+python3 run_stage1_clean_sdc.py \
+  -i modules.csv
+```
+
+批处理输出根目录默认为启动命令时的当前工作目录，也就是 `pwd`。每个
+`INST_NAME` 生成独立目录；多级实例路径中的 `/` 在目录名中转换为 `__`，例如
+`u_b/u_b1` 生成 `./u_b__u_b1/`。目录内包含 clean、removed、unsupported、
+modified details 和 report。所有转换状态非 `INVALID_OUTPUT` 的 `*_clean.sdc`
+会复制到 `./result/`，批次汇总写入 `./batch_report.csv`。长选项
+`--batch-file` 仍可替代 `-i` 使用。
+
 ## 输出
 
 - `<output_soc_sdc>`：SoC STA 可 source 的 clean SDC；若转换为 `INVALID_OUTPUT`，主 SDC body 会被抑制。需要人工复核但仍可 source 的 `REVIEW_REQUIRED` 约束会放在 header 后、普通约束前的醒目 `REVIEW_REQUIRED COMMANDS BEGIN/END` 区块中。
@@ -27,7 +51,8 @@ python3 run_stage1_clean_sdc.py \
 
 ## 默认 policy
 
-- `create_clock` on `get_ports`：REMOVE。
+- `create_clock` on `get_ports`：REMOVE。目标写成安全的
+  `[list [get_ports A] [get_ports B]]` 时同样 REMOVE，并追踪列表中每个隐式 clock 名。
 - `create_clock` on internal object：MODIFY，并强制 clock rename，格式为 `<instance_prefix>_<old_clock_name>`。
 - `create_generated_clock` / `create_generate_clock`：MODIFY，并强制 clock rename，格式为 `<instance_prefix>_<old_clock_name>`。
 - 保留的 `create_clock` / `create_generated_clock` 不再因为最终主 SDC 中暂时没有其它 `get_clocks` 引用而删除；是否与 SoC 顶层 clock 重复由 report 和 STA post-check review。
@@ -122,6 +147,8 @@ python3 regression_test/run_regression.py
 当前 regression 覆盖：
 
 - port primary clock 删除。
+- `[list [get_ports ...] ...]` 形式的多 port primary clock 删除和全部 clock name 追踪。
+- CSV 批处理、按 instance 独立输出及公共 `result/` clean SDC 汇总。
 - internal/generated clock 改名和 hierarchy mapping。
 - 未被其它保留约束引用的 internal/virtual/generated clock definition 仍保留。
 - `get_clocks` rename 追随。

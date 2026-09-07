@@ -2,7 +2,7 @@
 """
 Convert a harden DC flattened SDC into a SoC-callable harden-internal SDC.
 
-This implementation follows the v2.3.1 rule document:
+This implementation follows the v2.3.1 rule document plus approved Stage1 upgrades:
   * command normalization is a stateful Tcl-like scanner
   * clock definitions are scanned before command classification
   * kept clock definitions are renamed with the harden instance prefix
@@ -19,11 +19,12 @@ import argparse
 import csv
 import os
 import re
+import shutil
 import sys
 from collections import OrderedDict, defaultdict
 
 
-PROCESS_VERSION = "v2.3.1"
+PROCESS_VERSION = "v2.3.2"
 TOOL_NAME = "run_stage1_clean_sdc.py"
 STAGE_NAME = "STA Flatten 1 Harden DC SDC Clean"
 AUTHOR = "Howard"
@@ -272,6 +273,7 @@ class ClockDecision(object):
         command_id,
         command_name,
         old_name,
+        old_names,
         new_name,
         action,
         reason,
@@ -282,6 +284,7 @@ class ClockDecision(object):
         self.command_id = command_id
         self.command_name = command_name
         self.old_name = old_name
+        self.old_names = list(old_names or ([old_name] if old_name else []))
         self.new_name = new_name
         self.action = action
         self.reason = reason
@@ -889,11 +892,16 @@ def parse_clock_definition(command):
 
     target_text = positional[-1] if positional else ""
     target_kind = classify_target_kind(target_text)
+    old_names = []
     if not old_name:
-        old_name = infer_clock_name_from_target(target_text, command.command_id)
+        old_names = infer_clock_names_from_target(target_text)
+        old_name = old_names[0] if old_names else infer_clock_name_from_target(target_text, command.command_id)
+    if not old_names:
+        old_names = [old_name] if old_name else []
     return {
         "command_name": command_name,
         "old_name": old_name,
+        "old_names": old_names,
         "target_text": target_text,
         "target_kind": target_kind,
         "has_name_option": has_name_option,
@@ -915,10 +923,73 @@ def classify_target_kind(target_text):
         return "internal"
     if cmd == "get_clocks":
         return "clock"
+    if cmd in SAFE_COLLECTION_WRAPPER_COMMANDS:
+        child_kinds = []
+        for token in tokens[1:]:
+            child_kind = classify_target_kind(token.text)
+            if child_kind == "unknown":
+                return "unknown"
+            child_kinds.append(child_kind)
+        if child_kinds and len(set(child_kinds)) == 1:
+            return child_kinds[0]
     return "unknown"
 
 
+def infer_clock_names_from_target(target_text):
+    """Return explicit object names from a safe clock target collection."""
+    inner = bracket_command_inner(target_text.strip()) if target_text else None
+    if inner is None:
+        return []
+    tokens = tokenize_tcl_words(inner)
+    if not tokens:
+        return []
+
+    command_name = tokens[0].text
+    if command_name in SAFE_COLLECTION_WRAPPER_COMMANDS:
+        names = []
+        for token in tokens[1:]:
+            child_names = infer_clock_names_from_target(token.text)
+            if not child_names:
+                return []
+            names.extend(child_names)
+        return unique_in_order(names)
+
+    if command_name not in OBJECT_GET_COMMANDS:
+        return []
+
+    names = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index].text
+        if token.startswith("-"):
+            index += 1
+            if token in GET_OPTIONS_WITH_VALUE and index < len(tokens):
+                index += 1
+            continue
+        if is_variable_reference(token):
+            return []
+        for value in word_elements(token):
+            name = unwrap_word(value)
+            if name:
+                names.append(name)
+        index += 1
+    return unique_in_order(names)
+
+
+def unique_in_order(values):
+    result = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
 def infer_clock_name_from_target(target_text, command_id):
+    names = infer_clock_names_from_target(target_text)
+    if names:
+        return names[0]
     if not target_text:
         return "virtual_clock_%06d" % command_id
     inner = bracket_command_inner(target_text.strip())
@@ -977,6 +1048,7 @@ def run_pass1(commands, config):
             command_id=command.command_id,
             command_name=command_name,
             old_name=old_name,
+            old_names=parsed["old_names"],
             new_name=new_name,
             action=action,
             reason=reason,
@@ -990,12 +1062,10 @@ def run_pass1(commands, config):
             data.rename_map[old_name] = new_name
             data.kept_clock_defs.append(decision)
         elif action == "remove":
-            if old_name:
-                data.removed_clock_names.add(old_name)
+            data.removed_clock_names.update(parsed["old_names"])
             data.removed_clock_defs.append(decision)
         else:
-            if old_name:
-                data.removed_clock_names.add(old_name)
+            data.removed_clock_names.update(parsed["old_names"])
             data.unsupported_clock_defs.append(decision)
 
     return data
@@ -2076,7 +2146,8 @@ def write_report(config, commands, results, pass1, unit_state, violations, statu
     ])
     if pass1.removed_clock_defs:
         for decision in pass1.removed_clock_defs:
-            lines.append("%s : %s (%s)" % (decision.old_name, decision.reason, decision.command_name))
+            clock_names = ", ".join(decision.old_names) if decision.old_names else decision.old_name
+            lines.append("%s : %s (%s)" % (clock_names, decision.reason, decision.command_name))
     else:
         lines.append("<none>")
     lines.append("")
@@ -2233,13 +2304,15 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Convert harden DC flattened SDC to SoC-callable harden-internal SDC.",
     )
-    parser.add_argument("--in", dest="infile", required=True, help="input DC flattened SDC")
-    parser.add_argument("--out", required=True, help="output clean SoC-callable SDC")
-    parser.add_argument("--removed-out", required=True, help="removed command review SDC")
-    parser.add_argument("--unsupported-out", required=True, help="unsupported command review SDC")
-    parser.add_argument("--modified-details", required=True, help="full MODIFY before/after details")
-    parser.add_argument("--report", required=True, help="conversion report")
-    parser.add_argument("--inst", required=True, help="SoC harden instance path")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--in", dest="infile", help="input DC flattened SDC")
+    mode_group.add_argument("-i", "--batch-file", help="CSV containing MODULE_NAME,INST_NAME,SDC_PATH")
+    parser.add_argument("--out", help="output clean SoC-callable SDC")
+    parser.add_argument("--removed-out", help="removed command review SDC")
+    parser.add_argument("--unsupported-out", help="unsupported command review SDC")
+    parser.add_argument("--modified-details", help="full MODIFY before/after details")
+    parser.add_argument("--report", help="conversion report")
+    parser.add_argument("--inst", help="SoC harden instance path")
     parser.add_argument("--expect-units", default=DEFAULT_EXPECT_UNITS, help="expected units, e.g. time=ns,capacitance=pF")
 
     parser.set_defaults(keep_generated_clock=True)
@@ -2275,12 +2348,7 @@ def build_arg_parser():
     return parser
 
 
-def main(argv=None):
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    config = Config(args)
-    print_author_banner()
-
+def run_single_config(config, print_outputs=True):
     with open(config.input_path, "r") as fin:
         raw_text = fin.read()
 
@@ -2299,7 +2367,7 @@ def main(argv=None):
         print("ERROR: input appears to be a Stage1-generated file: %s" % config.input_path, file=sys.stderr)
         print("Matched Stage1 marker: %s" % processed_signature, file=sys.stderr)
         print("Use the Stage2 flatten SDC as --in, or use --force-reprocess only if intentional.", file=sys.stderr)
-        return 2
+        return 2, "INVALID_OUTPUT"
 
     raw_text = strip_full_line_comments(raw_text)
 
@@ -2316,20 +2384,181 @@ def main(argv=None):
             normalization_error=exc,
         )
         print("ERROR: structural command boundary failure; see report: %s" % config.report_path, file=sys.stderr)
-        return 2
+        return 2, "INVALID_OUTPUT"
 
     pass1 = run_pass1(commands, config)
     results, unit_state = run_pass2(commands, config, pass1)
     violations = run_pass3(results, config, pass1, unit_state)
     status = write_all_outputs(config, commands, results, pass1, unit_state, violations)
-    print("Conversion status: %s" % status)
-    print("Output SDC       : %s" % config.output_path)
-    print("Removed SDC      : %s" % config.removed_path)
-    print("Unsupported SDC  : %s" % config.unsupported_path)
-    print("Report           : %s" % config.report_path)
+    if print_outputs:
+        print("Conversion status: %s" % status)
+        print("Output SDC       : %s" % config.output_path)
+        print("Removed SDC      : %s" % config.removed_path)
+        print("Unsupported SDC  : %s" % config.unsupported_path)
+        print("Report           : %s" % config.report_path)
     if status == "INVALID_OUTPUT":
+        return 2, status
+    return 0, status
+
+
+def validate_single_mode(parser, args):
+    required = [
+        ("--out", args.out),
+        ("--removed-out", args.removed_out),
+        ("--unsupported-out", args.unsupported_out),
+        ("--modified-details", args.modified_details),
+        ("--report", args.report),
+        ("--inst", args.inst),
+    ]
+    missing = [name for name, value in required if not value]
+    if missing:
+        parser.error("single-file mode requires %s" % ", ".join(missing))
+
+
+def validate_batch_mode(parser, args):
+    single_only = [args.out, args.removed_out, args.unsupported_out, args.modified_details, args.report, args.inst]
+    if any(single_only):
+        parser.error("--out/--removed-out/--unsupported-out/--modified-details/--report/--inst are single-file options")
+
+
+def safe_batch_instance_name(inst_name):
+    stripped = inst_name.strip().strip("/")
+    parts = stripped.split("/") if stripped else []
+    if not parts or any(part in set(["", ".", ".."]) for part in parts):
+        raise ValueError("invalid INST_NAME: %s" % inst_name)
+    safe_parts = []
+    for part in parts:
+        safe_part = re.sub(r"[^A-Za-z0-9_.-]+", "_", part).strip(".")
+        if not safe_part:
+            raise ValueError("INST_NAME has no usable directory component: %s" % inst_name)
+        safe_parts.append(safe_part)
+    return "__".join(safe_parts)
+
+
+def read_batch_manifest(path):
+    rows = []
+    seen_output_names = set()
+    manifest_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, "r", encoding="utf-8-sig", newline="") as fin:
+        reader = csv.DictReader(fin)
+        fieldnames = set(reader.fieldnames or [])
+        required = set(["MODULE_NAME", "INST_NAME", "SDC_PATH"])
+        if not required.issubset(fieldnames):
+            raise ValueError("batch CSV must contain MODULE_NAME,INST_NAME,SDC_PATH headers")
+        for line_no, row in enumerate(reader, 2):
+            module_name = (row.get("MODULE_NAME") or "").strip()
+            inst_name = (row.get("INST_NAME") or "").strip().strip("/")
+            sdc_path = (row.get("SDC_PATH") or "").strip()
+            if not module_name and not inst_name and not sdc_path:
+                continue
+            if not module_name or not inst_name or not sdc_path:
+                raise ValueError("batch CSV line %d requires MODULE_NAME, INST_NAME and SDC_PATH" % line_no)
+            if module_name in set([".", ".."]) or "/" in module_name or "\\" in module_name:
+                raise ValueError("batch CSV line %d has invalid MODULE_NAME: %s" % (line_no, module_name))
+            output_name = safe_batch_instance_name(inst_name)
+            if output_name == "result":
+                raise ValueError("batch CSV line %d INST_NAME maps to reserved output directory: result" % line_no)
+            if output_name in seen_output_names:
+                raise ValueError("batch CSV line %d duplicates output instance name: %s" % (line_no, inst_name))
+            seen_output_names.add(output_name)
+            input_path = os.path.expanduser(os.path.expandvars(sdc_path))
+            if not os.path.isabs(input_path):
+                input_path = os.path.join(manifest_dir, input_path)
+            input_path = os.path.abspath(input_path)
+            if not os.path.isfile(input_path):
+                raise ValueError("batch CSV line %d input SDC not found: %s" % (line_no, input_path))
+            rows.append({
+                "module_name": module_name,
+                "inst_name": inst_name,
+                "output_name": output_name,
+                "input_path": input_path,
+            })
+    if not rows:
+        raise ValueError("batch CSV contains no data rows")
+    return rows
+
+
+def write_batch_report(path, report_rows):
+    ensure_parent(path)
+    with open(path, "w", newline="") as fout:
+        writer = csv.DictWriter(
+            fout,
+            fieldnames=["MODULE_NAME", "INST_NAME", "INPUT_SDC", "OUTPUT_DIR", "CLEAN_SDC", "STATUS"],
+        )
+        writer.writeheader()
+        for row in report_rows:
+            writer.writerow(row)
+
+
+def run_batch(args):
+    batch_file = os.path.abspath(args.batch_file)
+    output_root = os.getcwd()
+    rows = read_batch_manifest(batch_file)
+    result_dir = os.path.join(output_root, "result")
+    if not os.path.isdir(result_dir):
+        os.makedirs(result_dir)
+
+    report_rows = []
+    failed = 0
+    for index, row in enumerate(rows, 1):
+        output_name = row["output_name"]
+        instance_dir = os.path.join(output_root, output_name)
+        clean_path = os.path.join(instance_dir, output_name + "_clean.sdc")
+        row_args = argparse.Namespace(**vars(args))
+        row_args.infile = row["input_path"]
+        row_args.out = clean_path
+        row_args.removed_out = os.path.join(instance_dir, output_name + "_removed.sdc")
+        row_args.unsupported_out = os.path.join(instance_dir, output_name + "_unsupported.sdc")
+        row_args.modified_details = os.path.join(instance_dir, output_name + "_modified_details.txt")
+        row_args.report = os.path.join(instance_dir, output_name + "_report.txt")
+        row_args.inst = row["inst_name"]
+
+        print("[BATCH %d/%d] MODULE_NAME=%s INST_NAME=%s" % (
+            index, len(rows), row["module_name"], row["inst_name"],
+        ))
+        code, status = run_single_config(Config(row_args), print_outputs=False)
+        result_copy = os.path.join(result_dir, output_name + "_clean.sdc")
+        if code == 0:
+            shutil.copy2(clean_path, result_copy)
+        else:
+            failed += 1
+            if os.path.isfile(result_copy):
+                os.remove(result_copy)
+        print("[BATCH %d/%d] status=%s clean=%s" % (index, len(rows), status, clean_path))
+        report_rows.append({
+            "MODULE_NAME": row["module_name"],
+            "INST_NAME": row["inst_name"],
+            "INPUT_SDC": row["input_path"],
+            "OUTPUT_DIR": instance_dir,
+            "CLEAN_SDC": result_copy if code == 0 else "",
+            "STATUS": status,
+        })
+
+    batch_report = os.path.join(output_root, "batch_report.csv")
+    write_batch_report(batch_report, report_rows)
+    print("Batch summary      : total=%d passed=%d failed=%d" % (len(rows), len(rows) - failed, failed))
+    print("Batch result dir   : %s" % result_dir)
+    print("Batch report       : %s" % batch_report)
+    return 2 if failed else 0
+
+
+def main(argv=None):
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.batch_file:
+        validate_batch_mode(parser, args)
+    else:
+        validate_single_mode(parser, args)
+    print_author_banner()
+
+    try:
+        if args.batch_file:
+            return run_batch(args)
+        code, unused_status = run_single_config(Config(args))
+        return code
+    except (IOError, OSError, ValueError) as exc:
+        print("ERROR: %s" % exc, file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":

@@ -71,6 +71,35 @@ def run_tool(case_name, input_text, extra_args=None):
     }
 
 
+def run_batch_tool(case_name, manifest_text, input_sdcs, extra_args=None):
+    case_dir = os.path.join(WORK, case_name)
+    if os.path.isdir(case_dir):
+        shutil.rmtree(case_dir)
+    input_dir = os.path.join(case_dir, "input")
+    output_dir = case_dir
+    os.makedirs(input_dir)
+    manifest_path = os.path.join(case_dir, "modules.csv")
+    write_file(manifest_path, manifest_text)
+    for filename, text in input_sdcs.items():
+        write_file(os.path.join(input_dir, filename), text)
+    cmd = [
+        sys.executable,
+        TOOL,
+        "-i", manifest_path,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=case_dir)
+    stdout, stderr = proc.communicate()
+    return {
+        "code": proc.returncode,
+        "stdout": stdout.decode("utf-8", "replace"),
+        "stderr": stderr.decode("utf-8", "replace"),
+        "case_dir": case_dir,
+        "output_dir": output_dir,
+    }
+
+
 def assert_contains(path, needle):
     text = read_file(path)
     if needle not in text:
@@ -175,6 +204,51 @@ set_min_pulse_width 0.5 [get_clocks clk]
         raise AssertionError("clock_mapping failed")
     assert_contains(result["out"], "[get_clocks soc_core_clk]")
     assert_not_contains(result["out"], "[get_clocks clk]")
+
+
+def test_create_clock_list_of_ports_removed():
+    sdc = """\
+create_clock [list [get_ports xpa_clk] [get_ports xpa_clk_pre]] -period 0.54 -waveform {0 0.27}
+set_min_pulse_width 0.1 [get_clocks xpa_clk]
+set_min_pulse_width 0.1 [get_clocks xpa_clk_pre]
+"""
+    result = run_tool("create_clock_list_of_ports", sdc)
+    if result["code"] != 0:
+        raise AssertionError("create_clock list-of-ports should be safely removed\nstdout=%s\nstderr=%s" % (
+            result["stdout"], result["stderr"],
+        ))
+    assert_contains(result["removed"], "create_clock_on_block_port")
+    assert_contains(result["removed"], "dangling_clock_reference_related:xpa_clk")
+    assert_contains(result["removed"], "dangling_clock_reference_related:xpa_clk_pre")
+    assert_contains(result["report"], "xpa_clk, xpa_clk_pre : create_clock_on_block_port")
+    assert_not_contains(result["unsupported"], "unsupported_clock_definition_target")
+    assert_command_lines_not_contains(result["out"], "create_clock [list")
+
+
+def test_batch_mode_outputs_by_instance():
+    manifest = (
+        "MODULE_NAME,INST_NAME,SDC_PATH\n"
+        "mod_a,u_a,input/mod_a.sdc\n"
+        "mod_b,u_sub/u_b,input/mod_b.sdc\n"
+    )
+    input_sdcs = {
+        "mod_a.sdc": "set_false_path -from [get_pins src/Q] -to [get_pins dst/D]\n",
+        "mod_b.sdc": "set_multicycle_path 2 -from [get_pins src/Q] -to [get_pins dst/D]\n",
+    }
+    result = run_batch_tool("batch_mode", manifest, input_sdcs)
+    if result["code"] != 0:
+        raise AssertionError("batch mode failed\nstdout=%s\nstderr=%s" % (result["stdout"], result["stderr"]))
+    output_dir = result["output_dir"]
+    clean_a = os.path.join(output_dir, "u_a", "u_a_clean.sdc")
+    clean_b = os.path.join(output_dir, "u_sub__u_b", "u_sub__u_b_clean.sdc")
+    result_a = os.path.join(output_dir, "result", "u_a_clean.sdc")
+    result_b = os.path.join(output_dir, "result", "u_sub__u_b_clean.sdc")
+    for path in [clean_a, clean_b, result_a, result_b, os.path.join(output_dir, "batch_report.csv")]:
+        if not os.path.isfile(path):
+            raise AssertionError("Expected batch output file: %s" % path)
+    assert_contains(clean_a, "[get_pins u_a/src/Q]")
+    assert_contains(clean_b, "[get_pins u_sub/u_b/src/Q]")
+    assert_contains(os.path.join(output_dir, "batch_report.csv"), "mod_b,u_sub/u_b")
 
 
 def test_list_wrapper_mapping():
@@ -366,6 +440,8 @@ def main():
         test_clean_mapping,
         test_dangling_reference_removed,
         test_clock_mapping_allows_removed_port_clock,
+        test_create_clock_list_of_ports_removed,
+        test_batch_mode_outputs_by_instance,
         test_list_wrapper_mapping,
         test_boundary_multicycle_path_mapped,
         test_boundary_delay_mapping,
