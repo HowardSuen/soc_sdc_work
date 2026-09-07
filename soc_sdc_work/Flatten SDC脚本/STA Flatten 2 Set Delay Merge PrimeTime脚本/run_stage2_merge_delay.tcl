@@ -85,9 +85,19 @@ set ::MAX_CHAIN_DEPTH 6
 set ::MAX_ENDPOINTS 1000
 set ::MAX_ENUM_OBJECTS 64
 
+# Maximum number of PT-proven launch startpoints materialized for one exact
+# -from [get_clocks ...] delay command.  Clock objects are expanded only by
+# filtering startpoints that reach the command's explicit endpoint(s).
+set ::MAX_CLOCK_STARTPOINTS 1000
+
 # Maximum from x to pairs materialized for one delay command. Commands above
 # this limit are preserved unchanged and reported for review.
 set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+
+# Before materializing a top from x to matrix, use PT-proven startpoint
+# membership to omit disconnected clock-pin cross pairs. Query failures keep
+# the affected pairs on the legacy path. Disable only for diagnosis.
+set ::STAGE2_SPARSE_MATRIX_PRUNE true
 
 # Performance controls for open-to delay commands.  Bus compression is only
 # applied after PT proves that the wildcard selector resolves to exactly the
@@ -96,6 +106,15 @@ set ::STAGE2_MAX_SEGMENT_PAIRS 100000
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
+
+# When reverse all_fanin cannot identify a harden boundary input, the legacy
+# fallback checks every harden input pin with all_fanout. Group exact members
+# of the same bus into bounded chunks first. A chunk whose fanout union does
+# not contain the endpoint is safely skipped; positive or failed chunks still
+# use the original per-pin checks, preserving bit-to-endpoint attribution.
+set ::STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
+set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 
 # Direction metadata queries are grouped by object class and split into bounded
 # chunks before calling get_pins/get_ports/get_cells/get_nets. Disable batching
@@ -139,7 +158,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.10"
+    variable VERSION "v0.9.14"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -170,11 +189,14 @@ namespace eval stage2_delay {
     variable owner_harden_cache
     variable startpoint_cache
     variable startpoint_cache_status
+    variable clock_startpoint_cache
+    variable clock_startpoint_cache_status
     variable missing_harden_target_cache
     variable missing_top_target_cache
     variable parsed_command_segments
     variable consumed_command_segments
     variable consumed_source_files
+    variable sparse_pruned_commands
     variable segment_index_top_to
     variable segment_index_chain_from
     variable segment_index_chain_owner
@@ -204,10 +226,15 @@ namespace eval stage2_delay {
         -max_chain_depth 6
         -max_endpoints 1000
         -max_enum_objects 64
+        -max_clock_startpoints 1000
         -max_segment_pairs 100000
+        -sparse_matrix_prune "true"
         -compact_bus "true"
         -compact_bus_min_members 4
         -batch_open_to_query "true"
+        -batch_boundary_fanout_query "true"
+        -boundary_fanout_batch_size 16
+        -boundary_fanout_batch_min_members 4
         -metadata_batch_enabled "true"
         -metadata_batch_size 128
         -check_units "true"
@@ -294,6 +321,7 @@ proc stage2_delay::reset_state {} {
     variable parsed_command_segments
     variable consumed_command_segments
     variable consumed_source_files
+    variable sparse_pruned_commands
     variable segment_index_top_to
     variable segment_index_chain_from
     variable segment_index_chain_owner
@@ -354,9 +382,28 @@ proc stage2_delay::reset_state {} {
         matrix_expansion_limited 0
         matrix_pairs_expanded 0
         matrix_expand_elapsed_ms 0
+        sparse_matrix_commands 0
+        sparse_matrix_clock_batches 0
+        sparse_matrix_clock_batch_fallbacks 0
+        sparse_matrix_clock_records 0
+        sparse_matrix_endpoint_queries 0
+        sparse_matrix_query_unknown 0
+        sparse_matrix_pairs_pruned 0
+        sparse_matrix_pairs_retained 0
+        sparse_matrix_plan_elapsed_ms 0
         attribute_cache_hits 0
         owner_cache_hits 0
         boundary_cache_hits 0
+        boundary_fanout_batch_queries 0
+        boundary_fanout_batch_records 0
+        boundary_fanout_batch_negative 0
+        boundary_fanout_batch_positive 0
+        boundary_fanout_batch_fallbacks 0
+        boundary_fanout_batch_returned_objects 0
+        boundary_fanout_batch_elapsed_ms 0
+        boundary_fanout_pins_skipped 0
+        boundary_fanout_individual_queries 0
+        boundary_fanout_individual_elapsed_ms 0
         startpoint_cache_hits 0
         missing_harden_cache_hits 0
         missing_top_cache_hits 0
@@ -365,6 +412,11 @@ proc stage2_delay::reset_state {} {
         final_rewrite_skipped_files 0
         parsed_segment_reuse_hits 0
         final_rewrite_signature_lookups 0
+        clock_startpoint_queries 0
+        clock_startpoint_records_examined 0
+        clock_startpoint_records_matched 0
+        clock_startpoint_query_unknown 0
+        clock_startpoint_expansion_limited 0
     }
     set command_seq 0
     set e2e_seq 0
@@ -384,6 +436,10 @@ proc stage2_delay::reset_state {} {
     array set startpoint_cache {}
     array unset startpoint_cache_status
     array set startpoint_cache_status {}
+    array unset clock_startpoint_cache
+    array set clock_startpoint_cache {}
+    array unset clock_startpoint_cache_status
+    array set clock_startpoint_cache_status {}
     array unset missing_harden_target_cache
     array set missing_harden_target_cache {}
     array unset missing_top_target_cache
@@ -394,6 +450,8 @@ proc stage2_delay::reset_state {} {
     array set consumed_command_segments {}
     array unset consumed_source_files
     array set consumed_source_files {}
+    array unset sparse_pruned_commands
+    array set sparse_pruned_commands {}
     array unset segment_index_top_to
     array set segment_index_top_to {}
     array unset segment_index_chain_from
@@ -544,11 +602,23 @@ proc stage2_delay::validate_options {} {
     if {![string is integer -strict $options(-compact_bus_min_members)] || $options(-compact_bus_min_members) < 2} {
         error "-compact_bus_min_members must be an integer >= 2"
     }
+    if {![string is integer -strict $options(-boundary_fanout_batch_size)] || $options(-boundary_fanout_batch_size) < 2} {
+        error "-boundary_fanout_batch_size must be an integer >= 2"
+    }
+    if {![string is integer -strict $options(-boundary_fanout_batch_min_members)] || $options(-boundary_fanout_batch_min_members) < 2} {
+        error "-boundary_fanout_batch_min_members must be an integer >= 2"
+    }
+    if {$options(-boundary_fanout_batch_min_members) > $options(-boundary_fanout_batch_size)} {
+        error "-boundary_fanout_batch_min_members must be <= -boundary_fanout_batch_size"
+    }
     if {![string is integer -strict $options(-metadata_batch_size)] || $options(-metadata_batch_size) < 1} {
         error "-metadata_batch_size must be an integer >= 1"
     }
     if {![string is integer -strict $options(-max_segment_pairs)] || $options(-max_segment_pairs) < 1} {
         error "-max_segment_pairs must be an integer >= 1"
+    }
+    if {![string is integer -strict $options(-max_clock_startpoints)] || $options(-max_clock_startpoints) < 1} {
+        error "-max_clock_startpoints must be an integer >= 1"
     }
 }
 
@@ -1124,6 +1194,8 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
     set structural_passthrough_reason ""
     set open_to_inferred false
     set open_to_seed_records {}
+    set clock_from_expanded false
+    set clock_expansion_reason ""
     if {$structural_passthrough} {
         set from_records $raw_from_records
         set to_records $raw_to_records
@@ -1199,6 +1271,28 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
             }
         }
     }
+
+    # A clock in -from denotes a PT clock domain, not its source port.  Once
+    # explicit endpoints are available, resolve that domain to the bounded set
+    # of PT startpoints that actually reach those endpoints.  Do not use the
+    # source port as a replacement: that would change clock-to-Q path semantics.
+    if {$source eq "top" && $from_expr ne "" && $to_expr ne "" &&
+        [clock_expression_is_exact $from_expr $raw_from_records]} {
+        array set clock_plan [expand_clock_from_startpoints $raw_from_records $to_records $cmd_id]
+        if {$clock_plan(status) eq "resolved"} {
+            set from_records [hydrate_object_records $clock_plan(records)]
+            set clock_from_expanded true
+            trace_event CLOCK_FROM_EXPANDED \
+                "source=$source id=$cmd_id file={$file} line=$line clocks=$clock_plan(clock_count) endpoints=[llength $to_records] startpoints=[llength $from_records]"
+            add_report_item "CLOCK_FROM_EXPANDED source=$source id=$cmd_id clocks=$clock_plan(clock_count) endpoints=[llength $to_records] startpoints=[llength $from_records]"
+        } else {
+            set clock_expansion_reason $clock_plan(reason)
+            trace_event CLOCK_FROM_EXPANSION_REVIEW \
+                "source=$source id=$cmd_id file={$file} line=$line reason=$clock_expansion_reason original=preserved"
+            add_report_item "CLOCK_FROM_EXPANSION_REVIEW source=$source id=$cmd_id reason=$clock_expansion_reason original=preserved"
+        }
+        array unset clock_plan
+    }
     if {$delay eq "" || ![string is double -strict $delay]} {
         set status "review"
         set reason "NON_NUMERIC_DELAY"
@@ -1233,6 +1327,8 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         split_index 1 \
         split_total 1 \
         harden_inst $harden_inst \
+        clock_from_expanded $clock_from_expanded \
+        clock_expansion_reason $clock_expansion_reason \
         class "" \
         boundary_pins {} \
         open_to_inferred $open_to_inferred \
@@ -1242,6 +1338,301 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         status $status \
         failure_reason $reason \
     ]
+}
+
+proc stage2_delay::record_identity_key {rec} {
+    array set r $rec
+    set key [list $r(object_class) $r(full_name)]
+    array unset r
+    return $key
+}
+
+proc stage2_delay::pt_startpoint_membership_index {endpoint} {
+    variable startpoint_cache_status
+    array set e $endpoint
+    set cache_key [list $e(object_class) $e(full_name)]
+    array unset e
+
+    set startpoints [pt_startpoints_to_boundary $endpoint]
+    if {![info exists startpoint_cache_status($cache_key)] ||
+        $startpoint_cache_status($cache_key) ni {startpoints_only fanin_fallback}} {
+        return [list status unknown members {}]
+    }
+
+    set members {}
+    foreach startpoint $startpoints {
+        dict set members [record_identity_key $startpoint] 1
+    }
+    return [list status connected_set members $members]
+}
+
+proc stage2_delay::pt_clock_pin_flags {records} {
+    variable options
+    variable object_attribute_cache
+    set pending {}
+    set clock_by_key {}
+    foreach rec $records {
+        array set r $rec
+        set record_key [record_identity_key $rec]
+        if {$r(object_class) ne "pin" || $r(direction) ne "in" ||
+            ![structural_exact_pin_name $r(full_name)]} {
+            dict set clock_by_key $record_key false
+            array unset r
+            continue
+        }
+        set cache_key [list pin $r(full_name) is_clock_pin]
+        if {[info exists object_attribute_cache($cache_key)]} {
+            dict set clock_by_key $record_key [truthy $object_attribute_cache($cache_key)]
+        } else {
+            lappend pending $rec
+        }
+        array unset r
+    }
+
+    if {![truthy $options(-metadata_batch_enabled)]} {
+        if {[llength $pending] > 0} {
+            performance_stat_add metadata_batch_disabled_groups
+            performance_stat_add sparse_matrix_clock_records [llength $pending]
+            trace_event SPARSE_MATRIX_CLOCK_BATCH_DISABLED \
+                "records=[llength $pending] mode=individual"
+        }
+        foreach rec $pending {
+            dict set clock_by_key [record_identity_key $rec] [pt_is_clock_pin_record $rec]
+        }
+    } else {
+        set batch_size $options(-metadata_batch_size)
+        set chunk_total [expr {([llength $pending] + $batch_size - 1) / $batch_size}]
+        set chunk_index 0
+        for {set start 0} {$start < [llength $pending]} {incr start $batch_size} {
+            incr chunk_index
+            set chunk [lrange $pending $start [expr {$start + $batch_size - 1}]]
+            performance_stat_add sparse_matrix_clock_batches
+            performance_stat_add sparse_matrix_clock_records [llength $chunk]
+            array set batch [pt_collection_for_records $chunk sparse-matrix-clock]
+            set batch_values {}
+            set batch_ok $batch(ok)
+            set batch_reason $batch(reason)
+            if {$batch_ok} {
+                if {[catch {
+                    foreach_in_collection obj $batch(collection) {
+                        set name [collection_object_name $obj]
+                        set value [get_attribute $obj is_clock_pin]
+                        dict set batch_values [list pin $name] $value
+                    }
+                } err]} {
+                    set batch_ok false
+                    set batch_reason "clock_attribute_failed:$err"
+                }
+            }
+            if {$batch_ok} {
+                foreach rec $chunk {
+                    array set r $rec
+                    set record_key [record_identity_key $rec]
+                    set value [dict get $batch_values $record_key]
+                    set object_attribute_cache([list pin $r(full_name) is_clock_pin]) $value
+                    dict set clock_by_key $record_key [truthy $value]
+                    array unset r
+                }
+            } else {
+                performance_stat_add sparse_matrix_clock_batch_fallbacks
+                trace_event SPARSE_MATRIX_CLOCK_BATCH_FALLBACK \
+                    "chunk=$chunk_index/$chunk_total records=[llength $chunk] reason={$batch_reason} mode=individual"
+                foreach rec $chunk {
+                    dict set clock_by_key [record_identity_key $rec] [pt_is_clock_pin_record $rec]
+                }
+            }
+            array unset batch
+        }
+    }
+
+    set flags {}
+    foreach rec $records {
+        set record_key [record_identity_key $rec]
+        lappend flags [expr {[dict exists $clock_by_key $record_key] && [dict get $clock_by_key $record_key]}]
+    }
+    return $flags
+}
+
+proc stage2_delay::sparse_matrix_expansion_plan {seg} {
+    variable options
+    array set s $seg
+    set not_applied [list applied false pruned_count 0 retained_count 0 kept_pair_indices {} samples {}]
+    if {![truthy $options(-sparse_matrix_prune)] || $s(status) ne "ok" ||
+        $s(source) ne "top" || $s(kind) ne "complete" ||
+        ([info exists s(structural_passthrough)] && [truthy $s(structural_passthrough)])} {
+        array unset s
+        return $not_applied
+    }
+    set clock_expanded false
+    if {[info exists s(clock_from_expanded)] && [truthy $s(clock_from_expanded)]} {
+        set clock_expanded true
+    }
+    if {![info exists s(from_expr)] ||
+        (![structural_exact_pin_expression $s(from_expr)] && !$clock_expanded)} {
+        array unset s
+        return $not_applied
+    }
+
+    set from_count [llength $s(from_records)]
+    set to_count [llength $s(to_records)]
+    set total [expr {$from_count * $to_count}]
+    if {$from_count == 0 || $to_count == 0 || $total <= 1} {
+        array unset s
+        return $not_applied
+    }
+
+    set start_ms [metadata_clock_milliseconds]
+    set has_boundary_endpoint false
+    foreach to_rec $s(to_records) {
+        if {[is_harden_boundary_input_record $to_rec]} {
+            set has_boundary_endpoint true
+            break
+        }
+    }
+    if {!$has_boundary_endpoint} {
+        array unset s
+        return $not_applied
+    }
+
+    set raw_clock_from_flags [pt_clock_pin_flags $s(from_records)]
+    set clock_from_flags {}
+    set from_keys {}
+    set has_clock_from false
+    set from_index 0
+    foreach from_rec $s(from_records) {
+        set eligible [expr {[lindex $raw_clock_from_flags $from_index] &&
+            ![is_harden_boundary_output_record $from_rec]}]
+        lappend clock_from_flags $eligible
+        lappend from_keys [record_identity_key $from_rec]
+        if {$eligible} {
+            set has_clock_from true
+        }
+        incr from_index
+    }
+    if {!$has_clock_from} {
+        array unset s
+        return $not_applied
+    }
+
+    set kept_pair_indices {}
+    set kept_count 0
+    set pruned_count 0
+    set samples {}
+    for {set to_index 0} {$to_index < $to_count} {incr to_index} {
+        set to_rec [lindex $s(to_records) $to_index]
+        set membership [list status not_applicable members {}]
+        if {[is_harden_boundary_input_record $to_rec]} {
+            performance_stat_add sparse_matrix_endpoint_queries
+            set membership [pt_startpoint_membership_index $to_rec]
+            array set m $membership
+            if {$m(status) eq "unknown"} {
+                performance_stat_add sparse_matrix_query_unknown
+            }
+            array unset m
+        }
+        array set endpoint_membership $membership
+        for {set from_index 0} {$from_index < $from_count} {incr from_index} {
+            set from_rec [lindex $s(from_records) $from_index]
+            set from_key [lindex $from_keys $from_index]
+            set clock_eligible [lindex $clock_from_flags $from_index]
+            set pair_index [expr {$from_index * $to_count + $to_index + 1}]
+            set prune false
+            if {$clock_eligible && $endpoint_membership(status) eq "connected_set" &&
+                ![dict exists $endpoint_membership(members) $from_key]} {
+                set prune true
+            }
+            if {$prune} {
+                incr pruned_count
+                if {[llength $samples] < 20} {
+                    lappend samples [list pair_index $pair_index from $from_rec to $to_rec]
+                }
+            } else {
+                incr kept_count
+                lappend kept_pair_indices $pair_index
+                if {$total > $options(-max_segment_pairs) && $kept_count > $options(-max_segment_pairs)} {
+                    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+                    if {$elapsed_ms < 0} { set elapsed_ms 0 }
+                    performance_stat_add sparse_matrix_plan_elapsed_ms $elapsed_ms
+                    trace_event SPARSE_MATRIX_FALLBACK \
+                        "source=$s(source) id=$s(original_id) product=$total retained_so_far=$kept_count limit=$options(-max_segment_pairs) reason=RETAINED_OVER_LIMIT original=preserved"
+                    array unset s
+                    return $not_applied
+                }
+            }
+        }
+        array unset endpoint_membership
+    }
+
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} { set elapsed_ms 0 }
+    performance_stat_add sparse_matrix_plan_elapsed_ms $elapsed_ms
+    if {$pruned_count == 0} {
+        array unset s
+        return $not_applied
+    }
+    set kept_pair_indices [lsort -integer $kept_pair_indices]
+
+    set result [list \
+        applied true \
+        pruned_count $pruned_count \
+        retained_count $kept_count \
+        kept_pair_indices $kept_pair_indices \
+        samples $samples \
+        elapsed_ms $elapsed_ms]
+    array unset s
+    return $result
+}
+
+proc stage2_delay::register_sparse_pruned_command {seg plan} {
+    variable sparse_pruned_commands
+    variable consumed_source_files
+    array set s $seg
+    array set p $plan
+    set command_key [source_command_key $s(source_file) $s(line_no) $s(original_text)]
+    if {[info exists sparse_pruned_commands($command_key)]} {
+        array unset p
+        array unset s
+        return
+    }
+
+    set sparse_pruned_commands($command_key) [list \
+        segment [array get s] \
+        pruned_count $p(pruned_count) \
+        retained_count $p(retained_count) \
+        original_total $s(matrix_pair_count)]
+    set consumed_source_files([source_file_key $s(source_file)]) 1
+    performance_stat_add sparse_matrix_commands
+    performance_stat_add sparse_matrix_pairs_pruned $p(pruned_count)
+    performance_stat_add sparse_matrix_pairs_retained $p(retained_count)
+    performance_stat_add matrix_pairs_avoided $p(pruned_count)
+
+    foreach sample $p(samples) {
+        array set item $sample
+        set from_name [record_full_name $item(from)]
+        set to_name [record_full_name $item(to)]
+        trace_event NO_PT_CONNECTIVITY_PAIR \
+            "original_id=$s(original_id) split=$item(pair_index)/$s(matrix_pair_count) from={$from_name} to={$to_name} action=skip_before_expansion"
+        add_report_item "NO_PT_CONNECTIVITY_PAIR original_id=$s(original_id) from=$from_name to=$to_name action=skip_before_expansion"
+        array unset item
+    }
+    trace_event SPARSE_MATRIX_PLAN \
+        "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) product=$s(matrix_pair_count) pruned=$p(pruned_count) retained=$p(retained_count) elapsed_ms=$p(elapsed_ms)"
+    add_report_item "SPARSE_MATRIX_PLAN source=$s(source) id=$s(original_id) product=$s(matrix_pair_count) pruned=$p(pruned_count) retained=$p(retained_count)"
+    array unset p
+    array unset s
+}
+
+proc stage2_delay::rollback_sparse_pruned_command {seg reason} {
+    variable sparse_pruned_commands
+    array set s $seg
+    set command_key [source_command_key $s(source_file) $s(line_no) $s(original_text)]
+    if {[info exists sparse_pruned_commands($command_key)]} {
+        unset sparse_pruned_commands($command_key)
+        trace_event SPARSE_MATRIX_ROLLBACK \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) reason=$reason original=preserved"
+        add_report_item "SPARSE_MATRIX_ROLLBACK source=$s(source) id=$s(original_id) reason=$reason original=preserved"
+    }
+    array unset s
 }
 
 proc stage2_delay::expand_segment {seg} {
@@ -1275,6 +1666,48 @@ proc stage2_delay::expand_segment {seg} {
         array unset s
         return [list $result]
     }
+
+    array set sparse_plan [sparse_matrix_expansion_plan [array get s]]
+    if {$sparse_plan(applied)} {
+        set kept_pair_indices $sparse_plan(kept_pair_indices)
+        set retained_total $sparse_plan(retained_count)
+        set s(matrix_retained_pair_count) $retained_total
+        register_sparse_pruned_command [array get s] [array get sparse_plan]
+
+        trace_event SEGMENT_EXPAND_BEGIN \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) from=$from_count to=$to_count product=$total retained=$retained_total mode=SPARSE"
+        set start_ms [metadata_clock_milliseconds]
+        set out {}
+        foreach pair_index $kept_pair_indices {
+            set zero_index [expr {$pair_index - 1}]
+            set from_index [expr {$zero_index / $to_count}]
+            set to_index [expr {$zero_index % $to_count}]
+            set from_rec [lindex $s(from_records) $from_index]
+            set to_rec [lindex $s(to_records) $to_index]
+            array set e [array get s]
+            set e(id) "$s(original_id).[format %03d $pair_index]"
+            set e(split_index) $pair_index
+            set e(split_total) $total
+            set e(from_records) [list $from_rec]
+            set e(to_records) [list $to_rec]
+            set e(kind) complete
+            set e(sparse_matrix_pruned) true
+            lappend out [array get e]
+            array unset e
+        }
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add matrix_pairs_expanded $retained_total
+        performance_stat_add matrix_expand_elapsed_ms $elapsed_ms
+        trace_event SEGMENT_EXPAND_END \
+            "source=$s(source) id=$s(original_id) file={$s(source_file)} line=$s(line_no) expanded=$retained_total product=$total pruned=$sparse_plan(pruned_count) elapsed_ms=$elapsed_ms mode=SPARSE"
+        array unset sparse_plan
+        array unset s
+        return $out
+    }
+    array unset sparse_plan
 
     set from_choices $s(from_records)
     if {[llength $from_choices] == 0} {
@@ -1463,13 +1896,8 @@ proc stage2_delay::parse_object_expr_records {expr} {
         while {$idx < [llength $words]} {
             set word [lindex $words $idx]
             if {[string match "-*" $word]} {
-                incr idx
-                if {$word in {-filter -of_objects -of -regexp -exact -hierarchical -hier -quiet -nocase}} {
-                    if {$idx < [llength $words] && ![string match "-*" [lindex $words $idx]] && $word in {-filter -of_objects -of}} {
-                        incr idx
-                    } else {
-                        incr idx -1
-                    }
+                if {$word ni {-quiet -exact}} {
+                    return [list [object_record unknown $expr "" ""]]
                 }
             } else {
                 foreach obj [split_object_list $word] {
@@ -1480,6 +1908,9 @@ proc stage2_delay::parse_object_expr_records {expr} {
         }
         set out {}
         foreach obj $objects {
+            if {$cmd ne "get_clocks" && ![structural_exact_pin_name $obj]} {
+                return [list [object_record unknown $expr "" ""]]
+            }
             lappend out [object_record_from_get $cmd $obj]
         }
         return $out
@@ -2109,6 +2540,7 @@ proc stage2_delay::map_top_port_boundary_command_segments {segments} {
 
     if {$has_port_mapping && $mapped_total > $options(-max_segment_pairs)} {
         array set s [lindex $segments 0]
+        rollback_sparse_pruned_command [array get s] TOP_PORT_MATRIX_EXPANSION_LIMIT
         set from_count $s(matrix_from_count)
         set effective_from_count [expr {$from_count > 0 ? $from_count : 1}]
         set mapped_to_count [expr {$mapped_total / $effective_from_count}]
@@ -2162,6 +2594,13 @@ proc stage2_delay::top_port_input_boundaries_for_segment {seg} {
     }
 
     set connected [pt_harden_pins_connected_to_port $to(full_name)]
+    set unknown_boundaries [filter_harden_boundary_unknown_direction_records $connected]
+    if {[llength $unknown_boundaries] > 0} {
+        pt_trace "top port connectivity mapping skip port={$to(full_name)} unknown_direction_pins=[llength $unknown_boundaries]"
+        array unset to
+        array unset s
+        return {}
+    }
     set result [filter_harden_boundary_input_records $connected]
     array unset to
     array unset s
@@ -2293,7 +2732,7 @@ proc stage2_delay::pt_harden_pins_connected_to_port {port_name} {
     return $value
 }
 
-proc stage2_delay::collection_object_name {obj} {
+proc stage2_delay::collection_object_name {obj {strict false}} {
     if {[info commands get_attribute] ne ""} {
         if {![catch {set name [get_attribute $obj full_name]}] && $name ne ""} {
             return $name
@@ -2303,6 +2742,9 @@ proc stage2_delay::collection_object_name {obj} {
         if {![catch {set name [get_object_name $obj]}] && $name ne ""} {
             return $name
         }
+    }
+    if {[truthy $strict]} {
+        error "unable to resolve collection object full_name"
     }
     return $obj
 }
@@ -2387,7 +2829,7 @@ proc stage2_delay::top_passthrough_reason {seg} {
             }
             set input_boundaries [filter_harden_boundary_input_records $connected]
             set unknown_boundaries [filter_harden_boundary_unknown_direction_records $connected]
-            if {$to(object_class) eq "port" && [llength $unknown_boundaries] > 0 && [llength $input_boundaries] == 0} {
+            if {$to(object_class) eq "port" && [llength $unknown_boundaries] > 0} {
                 set reason "TOP_PORT_CONNECTED_TO_HARDEN_BOUNDARY_WITH_UNKNOWN_DIRECTION map_mode=$options(-top_port_boundary_map_mode) to=[record_debug [array get to]] connected=[records_debug_list $connected]"
             } elseif {$to(object_class) eq "port" && [llength $connected] > 0 && [llength $input_boundaries] == 0} {
                 set reason "TOP_PORT_CONNECTED_TO_NON_INPUT_HARDEN_BOUNDARY map_mode=$options(-top_port_boundary_map_mode) to=[record_debug [array get to]] connected=[records_debug_list $connected]"
@@ -2734,6 +3176,7 @@ proc stage2_delay::pt_boundary_inputs_by_fanin {harden_inst endpoint} {
 }
 
 proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
+    variable options
     if {[info commands all_fanout] eq "" || [info commands get_pins] eq "" || [info commands get_cells] eq ""} {
         pt_trace "fanout boundary inference skip harden={$harden_inst} endpoint={$endpoint} missing_command"
         return {}
@@ -2751,17 +3194,24 @@ proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
             pt_trace "filter_collection <harden_pins:{$harden_inst}> {direction == in}"
             set hin [filter_collection $hpins "direction == in"]
             pt_trace "filter_collection result harden={$harden_inst} input_count=[sizeof_collection $hin]"
+
+            array set skipped_names {}
+            if {[truthy $options(-batch_boundary_fanout_query)]} {
+                pt_boundary_fanout_prefilter $hin $harden_inst $ep_name skipped_names
+            }
+
             set out {}
             foreach_in_collection pin $hin {
                 set name [get_attribute $pin full_name]
-                pt_trace "all_fanout -flat -from {$name}"
-                set fanout [all_fanout -flat -from $pin]
-                pt_trace "all_fanout result from={$name} count=[sizeof_collection $fanout]"
-                if {[collection_contains_name $fanout $ep_name]} {
+                if {[info exists skipped_names($name)]} {
+                    continue
+                }
+                if {[pt_boundary_input_reaches_endpoint $pin $name $ep_name]} {
                     pt_trace "fanout boundary matched harden={$harden_inst} endpoint={$endpoint} boundary={$name}"
                     lappend out [object_record pin $name [get_attribute $pin direction] $harden_inst]
                 }
             }
+            array unset skipped_names
             set value $out
         }
     } err]} {
@@ -2770,6 +3220,161 @@ proc stage2_delay::pt_boundary_inputs_by_fanout {harden_inst endpoint} {
     }
     pt_trace "fanout boundary inference summary harden={$harden_inst} endpoint={$endpoint} boundary_count=[llength $value]"
     return $value
+}
+
+proc stage2_delay::pt_boundary_fanout_prefilter {hin harden_inst endpoint skipped_array_name} {
+    variable options
+    upvar 1 $skipped_array_name skipped_names
+
+    array set bus_records {}
+    array set bus_bases {}
+    set bus_order {}
+    foreach_in_collection pin $hin {
+        set name [get_attribute $pin full_name]
+        set rec [object_record pin $name in $harden_inst]
+        set info [bus_member_info $rec]
+        if {[llength $info] == 0} {
+            continue
+        }
+        array set b $info
+        set key [list $b(object_class) $b(direction) $b(owner_harden_inst) $b(base)]
+        if {![info exists bus_records($key)]} {
+            set bus_records($key) {}
+            set bus_bases($key) $b(base)
+            lappend bus_order $key
+        }
+        lappend bus_records($key) $rec
+        array unset b
+    }
+
+    foreach key $bus_order {
+        set members $bus_records($key)
+        if {[llength $members] < $options(-boundary_fanout_batch_min_members)} {
+            continue
+        }
+
+        set chunks {}
+        set batch_size $options(-boundary_fanout_batch_size)
+        for {set start 0} {$start < [llength $members]} {incr start $batch_size} {
+            set chunk [lrange $members $start [expr {$start + $batch_size - 1}]]
+            if {[llength $chunk] >= $options(-boundary_fanout_batch_min_members)} {
+                lappend chunks $chunk
+            }
+        }
+
+        set chunk_total [llength $chunks]
+        set chunk_index 0
+        foreach chunk $chunks {
+            incr chunk_index
+            pt_boundary_fanout_prefilter_chunk \
+                $chunk $harden_inst $endpoint $bus_bases($key) \
+                $chunk_index $chunk_total skipped_names
+        }
+    }
+
+    array unset bus_records
+    array unset bus_bases
+}
+
+proc stage2_delay::pt_boundary_fanout_prefilter_chunk {records harden_inst endpoint bus_base chunk_index chunk_total skipped_array_name} {
+    upvar 1 $skipped_array_name skipped_names
+
+    set record_count [llength $records]
+    set start_ms [metadata_clock_milliseconds]
+    performance_stat_add boundary_fanout_batch_records $record_count
+    trace_event BOUNDARY_FANOUT_BATCH_BEGIN \
+        "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total records=$record_count"
+
+    set batch_result {}
+    if {[catch {set batch_result [pt_collection_for_records $records boundary-fanout]} err]} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $err]
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=0 elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    array set batch $batch_result
+    if {!$batch(ok)} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $batch(reason)]
+        array unset batch
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=0 elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    set start $batch(collection)
+    array unset batch
+    set returned_count 0
+    set matched 0
+    if {[catch {
+        performance_stat_add boundary_fanout_batch_queries
+        pt_trace "all_fanout -flat -from <boundary-fanout bus={$bus_base} chunk=$chunk_index/$chunk_total records=$record_count>"
+        set fanout [all_fanout -flat -from $start]
+        set returned_count [sizeof_collection $fanout]
+        set matched [collection_contains_name $fanout $endpoint]
+    } err]} {
+        set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+        if {$elapsed_ms < 0} {
+            set elapsed_ms 0
+        }
+        performance_stat_add boundary_fanout_batch_fallbacks
+        performance_stat_add boundary_fanout_batch_returned_objects $returned_count
+        performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+        set reason [string map [list "\n" " " "\r" " "] $err]
+        trace_event BOUNDARY_FANOUT_BATCH_END \
+            "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=FALLBACK records=$record_count returned=$returned_count elapsed_ms=$elapsed_ms reason={$reason}"
+        return
+    }
+
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add boundary_fanout_batch_returned_objects $returned_count
+    performance_stat_add boundary_fanout_batch_elapsed_ms $elapsed_ms
+    if {$matched} {
+        performance_stat_add boundary_fanout_batch_positive
+        set status POSITIVE
+    } else {
+        foreach rec $records {
+            array set r $rec
+            set skipped_names($r(full_name)) 1
+            array unset r
+        }
+        performance_stat_add boundary_fanout_batch_negative
+        performance_stat_add boundary_fanout_pins_skipped $record_count
+        set status NEGATIVE
+    }
+    trace_event BOUNDARY_FANOUT_BATCH_END \
+        "harden={$harden_inst} endpoint={$endpoint} bus={$bus_base} chunk=$chunk_index/$chunk_total status=$status records=$record_count returned=$returned_count elapsed_ms=$elapsed_ms"
+}
+
+proc stage2_delay::pt_boundary_input_reaches_endpoint {pin name endpoint} {
+    set start_ms [metadata_clock_milliseconds]
+    performance_stat_add boundary_fanout_individual_queries
+    pt_trace "all_fanout -flat -from {$name}"
+    set fanout [all_fanout -flat -from $pin]
+    set returned_count [sizeof_collection $fanout]
+    set matched [collection_contains_name $fanout $endpoint]
+    set elapsed_ms [expr {[metadata_clock_milliseconds] - $start_ms}]
+    if {$elapsed_ms < 0} {
+        set elapsed_ms 0
+    }
+    performance_stat_add boundary_fanout_individual_elapsed_ms $elapsed_ms
+    pt_trace "all_fanout result from={$name} count=$returned_count elapsed_ms=$elapsed_ms"
+    return $matched
 }
 
 proc stage2_delay::collection_contains_name {coll name} {
@@ -3183,7 +3788,8 @@ proc stage2_delay::records_are_same_object {left right} {
 proc stage2_delay::pt_is_clock_pin_record {rec} {
     array set r $rec
     set result 0
-    if {$r(object_class) eq "pin" && $r(direction) eq "in"} {
+    if {$r(object_class) eq "pin" && $r(direction) eq "in" &&
+        [structural_exact_pin_name $r(full_name)]} {
         set result [truthy [pt_get_attr_by_name $r(object_class) $r(full_name) is_clock_pin]]
     }
     array unset r
@@ -3213,7 +3819,10 @@ proc stage2_delay::matrix_top_pair_has_no_pt_connectivity {tseg} {
     array set t $tseg
     set result 0
     if {$t(source) eq "top" && $t(kind) eq "complete" && $t(split_total) > 1 &&
-        [llength $t(from_records)] == 1 && [llength $t(to_records)] == 1} {
+        [llength $t(from_records)] == 1 && [llength $t(to_records)] == 1 &&
+        [info exists t(from_expr)] &&
+        ([structural_exact_pin_expression $t(from_expr)] ||
+         ([info exists t(clock_from_expanded)] && [truthy $t(clock_from_expanded)]))} {
         set from_rec [lindex $t(from_records) 0]
         set to_rec [lindex $t(to_records) 0]
         if {[pt_is_clock_pin_record $from_rec]} {
@@ -3246,11 +3855,28 @@ proc stage2_delay::match_delay_graph_segments {} {
     array set emitted {}
     set queue {}
 
+    array set mapped_group_total {}
+    array set mapped_group_rep {}
+    foreach tseg [concat $top_segments $chain_top_segments] {
+        array set t $tseg
+        if {[info exists t(top_port_map_group)]} {
+            if {[info exists t(top_port_map_total)]} {
+                set mapped_group_total($t(top_port_map_group)) $t(top_port_map_total)
+            } else {
+                incr mapped_group_total($t(top_port_map_group))
+            }
+            if {![info exists mapped_group_rep($t(top_port_map_group))]} {
+                set mapped_group_rep($t(top_port_map_group)) [array get t]
+            }
+        }
+        array unset t
+    }
+
     foreach tseg $top_segments {
         array set t $tseg
         if {[matrix_top_pair_has_no_pt_connectivity [array get t]]} {
             record_matrix_no_pt_connectivity_pair [array get t]
-            consume_segment [array get t]
+            consume_graph_top_segment [array get t]
             set used_top($t(id)) 1
             array unset t
             continue
@@ -3309,9 +3935,9 @@ proc stage2_delay::match_delay_graph_segments {} {
         if {[validate_endpoint_record $end_rec]} {
             set emitted_sig "TERMINAL:$psig"
             if {![info exists emitted($emitted_sig)]} {
-                set emitted($emitted_sig) 1
                 set generated [emit_graph_terminal_cmd [array get p]]
                 if {$generated ne ""} {
+                    set emitted($emitted_sig) 1
                     mark_path_used [array get p] used_top used_harden
                     add_report_item "RECURSIVE_MERGED_TERMINAL path=[path_id_string [array get p]] endpoint=[record_full_name $end_rec] total=$p(delay)"
                 }
@@ -3376,9 +4002,9 @@ proc stage2_delay::match_delay_graph_segments {} {
                             consume_graph_path [array get p]
                             continue
                         }
-                        set emitted($emitted_sig) 1
                         set generated [emit_graph_delay_cmd [array get p] $missing_hseg $end_rec]
                         if {$generated ne ""} {
+                            set emitted($emitted_sig) 1
                             mark_path_used [array get p] used_top used_harden
                             add_report_item "RECURSIVE_MERGED_MISSING_SDC path=[path_id_string [array get p]] + [summary_steps_path_id [list [segment_summary_step $missing_hseg]]] boundary=[record_full_name $end_rec] assumed_delay=0 total=$p(delay)"
                         }
@@ -3402,9 +4028,9 @@ proc stage2_delay::match_delay_graph_segments {} {
                     array unset h
                     continue
                 }
-                set emitted($emitted_sig) 1
                 set generated [emit_graph_delay_cmd [array get p] [array get h] $end_rec]
                 if {$generated ne ""} {
+                    set emitted($emitted_sig) 1
                     mark_path_used [array get p] used_top used_harden
                     set used_harden($h(id)) 1
                     consume_segment [array get h]
@@ -3443,6 +4069,27 @@ proc stage2_delay::match_delay_graph_segments {} {
             add_review "" [array get h] "NO_TOP_SEGMENT_MATCHED" "no top or recursive delay path matched harden boundary"
         }
         array unset h
+    }
+
+    array set mapped_group_used_count {}
+    foreach tseg [concat $top_segments $chain_top_segments] {
+        array set t $tseg
+        if {[info exists t(top_port_map_group)] && [info exists used_top($t(id))]} {
+            incr mapped_group_used_count($t(top_port_map_group))
+        }
+        array unset t
+    }
+    foreach group [array names mapped_group_total] {
+        set used_count 0
+        if {[info exists mapped_group_used_count($group)]} {
+            set used_count $mapped_group_used_count($group)
+        }
+        if {$used_count == $mapped_group_total($group)} {
+            consume_segment $mapped_group_rep($group)
+            add_report_item "TOP_PORT_BOUNDARY_MAP_CONSUMED group=$group matched=$used_count total=$mapped_group_total($group) mode=recursive"
+        } elseif {$used_count > 0} {
+            add_report_item "TOP_PORT_BOUNDARY_MAP_KEEP_ORIGINAL group=$group matched=$used_count total=$mapped_group_total($group) mode=recursive"
+        }
     }
 }
 
@@ -4060,7 +4707,7 @@ proc stage2_delay::expected_record_names {records} {
     return [lsort -unique $names]
 }
 
-proc stage2_delay::pt_collection_for_records {records} {
+proc stage2_delay::pt_collection_for_records {records {label open-to}} {
     if {[llength $records] == 0} {
         return [list ok true collection {} reason ""]
     }
@@ -4068,8 +4715,9 @@ proc stage2_delay::pt_collection_for_records {records} {
     set object_class $first(object_class)
     array unset first
     set getter [pt_getter_for_class $object_class]
-    if {$getter eq "" || [info commands $getter] eq ""} {
-        return [list ok false collection {} reason "missing_getter:$getter"]
+    if {$getter eq "" || [info commands $getter] eq "" ||
+        [info commands foreach_in_collection] eq ""} {
+        return [list ok false collection {} reason "missing_collection_command:$getter"]
     }
 
     set patterns {}
@@ -4084,12 +4732,14 @@ proc stage2_delay::pt_collection_for_records {records} {
     }
 
     set value {}
-    pt_trace "$getter -quiet <open-to batch patterns=[llength $patterns] logical_members=[logical_record_count $records]>"
+    pt_trace "$getter -quiet <$label batch patterns=[llength $patterns] logical_members=[logical_record_count $records]>"
     if {[catch {set value [$getter -quiet $patterns]} err]} {
         return [list ok false collection {} reason "batch_getter_failed:$err"]
     }
     set expected [expected_record_names $records]
-    set actual [pt_collection_names $value]
+    if {[catch {set actual [pt_collection_names $value]} err]} {
+        return [list ok false collection {} reason "batch_collection_iteration_failed:$err"]
+    }
     if {$actual ne $expected} {
         return [list ok false collection {} reason "batch_set_mismatch:expected=[llength $expected],actual=[llength $actual]"]
     }
@@ -4212,6 +4862,214 @@ proc stage2_delay::pt_startpoints_to_boundary {boundary} {
     return $value
 }
 
+proc stage2_delay::clock_expression_is_exact {expr records} {
+    set expr [string trim $expr]
+    if {[llength $records] == 0} {
+        return 0
+    }
+    foreach rec $records {
+        array set r $rec
+        if {$r(object_class) ne "clock" || $r(full_name) eq "" ||
+            ![structural_exact_pin_name $r(full_name)]} {
+            array unset r
+            return 0
+        }
+        array unset r
+    }
+    set len [string length $expr]
+    if {$len < 2 || [scan [string index $expr 0] %c] != 91 ||
+        [scan [string index $expr end] %c] != 93} {
+        return 0
+    }
+    set words [tokenize_words [string range $expr 1 end-1]]
+    if {[llength $words] == 0} {
+        return 0
+    }
+    set command [lindex $words 0]
+    if {$command eq "list"} {
+        if {[llength $words] < 2} {
+            return 0
+        }
+        foreach item [lrange $words 1 end] {
+            set item_records [parse_object_expr_records $item]
+            if {![clock_expression_is_exact $item $item_records]} {
+                return 0
+            }
+        }
+        return 1
+    }
+    if {$command ne "get_clocks"} {
+        return 0
+    }
+    foreach word [lrange $words 1 end] {
+        if {$word in {-quiet -exact}} {
+            continue
+        }
+        if {[string match "-*" $word] || ![structural_exact_pin_name [strip_braces $word]]} {
+            return 0
+        }
+    }
+    return 1
+}
+
+proc stage2_delay::pt_clock_names_for_startpoint {rec} {
+    array set r $rec
+    set class $r(object_class)
+    set name $r(full_name)
+    array unset r
+    if {$class ni {pin port}} {
+        return [list status unknown names {} reason unsupported_startpoint_class]
+    }
+    set getter [pt_getter_for_class $class]
+    if {$getter eq "" || [info commands $getter] eq "" ||
+        [info commands get_attribute] eq "" ||
+        [info commands sizeof_collection] eq "" ||
+        [info commands foreach_in_collection] eq ""} {
+        return [list status unknown names {} reason missing_clock_attribute_command]
+    }
+    if {[catch {set objects [$getter -quiet $name]} err]} {
+        return [list status unknown names {} reason "startpoint_getter_failed:$err"]
+    }
+    if {[catch {set object_count [sizeof_collection $objects]} err] || $object_count != 1} {
+        return [list status unknown names {} reason startpoint_object_not_unique]
+    }
+    if {[catch {set clocks [get_attribute $objects clocks]} err]} {
+        return [list status unknown names {} reason "clock_attribute_failed:$err"]
+    }
+    # A valid timing startpoint can be an unclocked primary input.  PT returns
+    # an empty `clocks` value for such an object; that is known non-membership,
+    # not a query failure.  Getter errors above remain unknown and abort the
+    # clock rewrite conservatively.
+    if {$clocks eq ""} {
+        return [list status known names {} reason ""]
+    }
+    set names {}
+    if {[catch {
+        foreach_in_collection clock_obj $clocks {
+            set clock_name [collection_object_name $clock_obj true]
+            if {$clock_name ne ""} {
+                lappend names $clock_name
+            }
+        }
+    } err]} {
+        return [list status unknown names {} reason "clock_collection_iteration_failed:$err"]
+    }
+    if {[llength $names] == 0} {
+        return [list status known names {} reason ""]
+    }
+    return [list status known names [lsort -unique $names] reason ""]
+}
+
+proc stage2_delay::expand_clock_from_startpoints {clock_records endpoints cmd_id} {
+    variable options
+    variable clock_startpoint_cache
+    variable clock_startpoint_cache_status
+
+    set result [list status review records {} reason CLOCK_FROM_QUERY_UNAVAILABLE clock_count 0]
+    if {[llength $clock_records] == 0 || [llength $endpoints] == 0} {
+        return $result
+    }
+    foreach required {get_clocks get_attribute sizeof_collection foreach_in_collection} {
+        if {[info commands $required] eq ""} {
+            return $result
+        }
+    }
+
+    set clock_names {}
+    foreach rec $clock_records {
+        array set r $rec
+        set requested $r(full_name)
+        array unset r
+        if {[catch {set clock_objects [get_clocks -quiet $requested]} err]} {
+            return [list status review records {} reason "CLOCK_SELECTOR_QUERY_FAILED:$err" clock_count 0]
+        }
+        if {[catch {set clock_count [sizeof_collection $clock_objects]} err] || $clock_count != 1} {
+            return [list status review records {} reason CLOCK_SELECTOR_NOT_UNIQUE clock_count 0]
+        }
+        set resolved_name ""
+        if {[catch {
+            foreach_in_collection clock_obj $clock_objects {
+                set resolved_name [collection_object_name $clock_obj true]
+            }
+        } err] || $resolved_name eq "" || $resolved_name ne $requested} {
+            return [list status review records {} reason CLOCK_SELECTOR_NAME_MISMATCH clock_count 0]
+        }
+        lappend clock_names $resolved_name
+    }
+    set clock_names [lsort -unique $clock_names]
+    set matched {}
+    set examined 0
+    foreach endpoint $endpoints {
+        variable performance_stats
+        performance_stat_add clock_startpoint_queries
+        array set e $endpoint
+        set cache_key [list $e(object_class) $e(full_name)]
+        set startpoints [pt_startpoints_to_boundary $endpoint]
+        set query_status unknown
+        if {[info exists clock_startpoint_cache_status($cache_key)]} {
+            set query_status $clock_startpoint_cache_status($cache_key)
+            set startpoints $clock_startpoint_cache($cache_key)
+        } else {
+            if {[info exists ::stage2_delay::startpoint_cache_status($cache_key)]} {
+                set query_status $::stage2_delay::startpoint_cache_status($cache_key)
+            }
+            set clock_startpoint_cache($cache_key) $startpoints
+            set clock_startpoint_cache_status($cache_key) $query_status
+        }
+        array unset e
+        # Clock-domain conversion requires PT's actual timing startpoints.
+        # The legacy full-fanin fallback can contain arbitrary internal pins
+        # and therefore is not valid evidence for rewriting a clock selector.
+        if {$query_status ne "startpoints_only"} {
+            performance_stat_add clock_startpoint_query_unknown
+            set reason CLOCK_STARTPOINT_QUERY_UNKNOWN
+            if {$query_status eq "fanin_fallback"} {
+                set reason CLOCK_STARTPOINTS_ONLY_UNAVAILABLE
+            }
+            return [list status review records {} reason $reason clock_count [llength $clock_names]]
+        }
+        foreach startpoint $startpoints {
+            incr examined
+            performance_stat_add clock_startpoint_records_examined
+            set clock_info [pt_clock_names_for_startpoint $startpoint]
+            array set ci $clock_info
+            if {$ci(status) eq "unknown"} {
+                array unset ci
+                performance_stat_add clock_startpoint_query_unknown
+                return [list status review records {} reason CLOCK_STARTPOINT_CLOCK_ATTRIBUTE_UNKNOWN clock_count [llength $clock_names]]
+            }
+            set belongs 0
+            foreach clock_name $ci(names) {
+                if {[lsearch -exact $clock_names $clock_name] >= 0} {
+                    set belongs 1
+                    break
+                }
+            }
+            if {$belongs} {
+                set key [record_identity_key $startpoint]
+                if {![dict exists $matched $key]} {
+                    dict set matched $key $startpoint
+                    performance_stat_add clock_startpoint_records_matched
+                    if {[dict size $matched] > $options(-max_clock_startpoints)} {
+                        array unset ci
+                        performance_stat_add clock_startpoint_expansion_limited
+                        return [list status review records {} reason CLOCK_STARTPOINT_LIMIT clock_count [llength $clock_names]]
+                    }
+                }
+            }
+            array unset ci
+        }
+    }
+    if {[dict size $matched] == 0} {
+        return [list status review records {} reason CLOCK_NO_MATCHING_STARTPOINT clock_count [llength $clock_names]]
+    }
+    set records {}
+    foreach key [lsort [dict keys $matched]] {
+        lappend records [dict get $matched $key]
+    }
+    return [list status resolved records $records reason "" clock_count [llength $clock_names]]
+}
+
 proc stage2_delay::mark_pt_startpoint_record {rec} {
     array set r $rec
     set r(pt_startpoint) true
@@ -4229,7 +5087,7 @@ proc stage2_delay::mark_pt_endpoint_record {rec} {
 }
 
 proc stage2_delay::pt_object_record_from_collection {obj} {
-    set name [collection_object_name $obj]
+    set name [collection_object_name $obj true]
     set direction ""
     catch {set direction [get_attribute $obj direction]}
     set class ""
@@ -4487,12 +5345,21 @@ proc stage2_delay::add_missing_sdc_report_for_segment {seg total} {
 proc stage2_delay::consume_graph_path {path} {
     array set p $path
     foreach seg $p(top_segments) {
-        consume_segment $seg
+        consume_graph_top_segment $seg
     }
     foreach seg $p(harden_segments) {
         consume_segment $seg
     }
     array unset p
+}
+
+proc stage2_delay::consume_graph_top_segment {seg} {
+    array set s $seg
+    set mapped [info exists s(top_port_map_group)]
+    array unset s
+    if {!$mapped} {
+        consume_segment $seg
+    }
 }
 
 proc stage2_delay::mark_path_used {path used_top_name used_harden_name} {
@@ -4555,7 +5422,11 @@ proc stage2_delay::match_top_to_harden_segments {} {
     foreach tseg $top_segments {
         array set t $tseg
         if {[info exists t(top_port_map_group)]} {
-            incr mapped_group_total($t(top_port_map_group))
+            if {[info exists t(top_port_map_total)]} {
+                set mapped_group_total($t(top_port_map_group)) $t(top_port_map_total)
+            } else {
+                incr mapped_group_total($t(top_port_map_group))
+            }
             if {![info exists mapped_group_rep($t(top_port_map_group))]} {
                 set mapped_group_rep($t(top_port_map_group)) [array get t]
             }
@@ -4586,7 +5457,7 @@ proc stage2_delay::match_top_to_harden_segments {} {
                 }
                 if {[matrix_top_pair_has_no_pt_connectivity [array get t]]} {
                     record_matrix_no_pt_connectivity_pair [array get t]
-                    consume_segment [array get t]
+                    consume_graph_top_segment [array get t]
                     set matched_top($t(id)) 1
                     set matched_top_segment($t(id)) [array get t]
                     array unset t
@@ -5165,11 +6036,25 @@ proc stage2_delay::performance_stats_summary {} {
         metadata_individual_queries structural_passthrough_commands
         structural_passthrough_objects matrix_pairs_avoided
         matrix_expansion_limited matrix_pairs_expanded matrix_expand_elapsed_ms
+        sparse_matrix_commands sparse_matrix_endpoint_queries
+        sparse_matrix_clock_batches sparse_matrix_clock_batch_fallbacks
+        sparse_matrix_clock_records
+        sparse_matrix_query_unknown sparse_matrix_pairs_pruned
+        sparse_matrix_pairs_retained sparse_matrix_plan_elapsed_ms
         attribute_cache_hits owner_cache_hits
-        boundary_cache_hits startpoint_cache_hits missing_harden_cache_hits
+        boundary_cache_hits boundary_fanout_batch_queries
+        boundary_fanout_batch_records boundary_fanout_batch_negative
+        boundary_fanout_batch_positive boundary_fanout_batch_fallbacks
+        boundary_fanout_batch_returned_objects boundary_fanout_batch_elapsed_ms
+        boundary_fanout_pins_skipped boundary_fanout_individual_queries
+        boundary_fanout_individual_elapsed_ms
+        startpoint_cache_hits missing_harden_cache_hits
         missing_top_cache_hits segment_index_lookups final_rewrite_index_hits
         final_rewrite_skipped_files parsed_segment_reuse_hits
         final_rewrite_signature_lookups
+        clock_startpoint_queries clock_startpoint_records_examined
+        clock_startpoint_records_matched clock_startpoint_query_unknown
+        clock_startpoint_expansion_limited
     }
     set parts {}
     foreach name $names {
@@ -5561,6 +6446,7 @@ proc stage2_delay::current_scope_name {} {
 
 proc stage2_delay::write_removed_sdc {path} {
     variable consumed_segments
+    variable sparse_pruned_commands
     set fout [open_text $path w]
     write_author_banner $fout "# "
     puts $fout "#"
@@ -5576,6 +6462,15 @@ proc stage2_delay::write_removed_sdc {path} {
         }
         puts $fout ""
         array unset s
+    }
+    foreach command_key [lsort [array names sparse_pruned_commands]] {
+        array set p $sparse_pruned_commands($command_key)
+        array set s $p(segment)
+        puts $fout "# PT_DISCONNECTED_MATRIX_PAIRS $s(source_file)|$s(original_id) pruned=$p(pruned_count) retained=$p(retained_count) product=$p(original_total)"
+        puts $fout "# ORIGINAL: [compact_spaces $s(original_text)]"
+        puts $fout ""
+        array unset s
+        array unset p
     }
     close $fout
 }
@@ -5702,9 +6597,14 @@ proc stage2_delay::write_report {path} {
     puts $fout "Bus compression                 : $options(-compact_bus)"
     puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
+    puts $fout "Batch boundary fanout query     : $options(-batch_boundary_fanout_query)"
+    puts $fout "Boundary fanout batch size      : $options(-boundary_fanout_batch_size)"
+    puts $fout "Boundary fanout minimum members : $options(-boundary_fanout_batch_min_members)"
     puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
     puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
     puts $fout "Max segment pairs               : $options(-max_segment_pairs)"
+    puts $fout "Max clock startpoints           : $options(-max_clock_startpoints)"
+    puts $fout "Sparse matrix pruning           : $options(-sparse_matrix_prune)"
     puts $fout "Open-to optimization statistics : [open_to_stats_summary]"
     puts $fout "Stage2 performance statistics   : [performance_stats_summary]"
     puts $fout "Current PT design               : [current_scope_name]"
@@ -6012,7 +6912,8 @@ proc stage2_delay::segment_sheet {seg} {
 
 proc stage2_delay::build_max_delay_usage_stats {total_name used_name} {
     variable all_delay_segments
-    variable consumed_segments
+    variable path_summary_items
+    variable sparse_pruned_commands
     upvar 1 $total_name total_by_sheet
     upvar 1 $used_name used_by_sheet
 
@@ -6030,17 +6931,30 @@ proc stage2_delay::build_max_delay_usage_stats {total_name used_name} {
         }
         array unset s
     }
-    foreach seg $consumed_segments {
-        array set s $seg
+    foreach command_key [array names sparse_pruned_commands] {
+        array set p $sparse_pruned_commands($command_key)
+        array set s $p(segment)
         if {$s(type) eq "max"} {
             set sheet [expr {$s(source) eq "harden" ? $s(harden_inst) : "top"}]
             set key [list $sheet $s(source_file) $s(original_id)]
-            if {[info exists total_seen($key)] && ![info exists used_seen($key)]} {
-                set used_seen($key) 1
-                incr used_by_sheet($sheet)
+            if {![info exists total_seen($key)]} {
+                set total_seen($key) 1
+                incr total_by_sheet($sheet)
             }
         }
         array unset s
+        array unset p
+    }
+    foreach item $path_summary_items {
+        array set r $item
+        if {$r(delay_type) eq "max" && $r(merge_status) in {MERGED RESIDUAL}} {
+            set key [list $r(sheet) $r(source_file) $r(original_id)]
+            if {[info exists total_seen($key)] && ![info exists used_seen($key)]} {
+                set used_seen($key) 1
+                incr used_by_sheet($r(sheet))
+            }
+        }
+        array unset r
     }
 }
 
@@ -6207,10 +7121,12 @@ proc stage2_delay::remaining_sdc_text {path} {
     foreach item [lsort -decreasing -integer -command stage2_delay::command_start_compare [commands_with_offsets $text $commands]] {
         array set cmd $item
         set consumed_for_cmd [consumed_segments_for_command $path $cmd(line) $cmd(text)]
-        if {[llength $consumed_for_cmd] > 0} {
+        set sparse_pruned_info [sparse_pruned_info_for_command $path $cmd(line) $cmd(text)]
+        if {[llength $consumed_for_cmd] > 0 || $sparse_pruned_info ne ""} {
             set before [string range $remaining 0 [expr {$cmd(start) - 1}]]
             set after [string range $remaining $cmd(end) end]
-            set replacement [remaining_replacement_for_command $path $cmd(line) $cmd(text) $consumed_for_cmd]
+            set replacement [remaining_replacement_for_command \
+                $path $cmd(line) $cmd(text) $consumed_for_cmd $sparse_pruned_info]
             set remaining "${before}${replacement}${after}"
         }
         array unset cmd
@@ -6228,13 +7144,32 @@ proc stage2_delay::consumed_segments_for_command {path line_no original_text} {
     return {}
 }
 
-proc stage2_delay::remaining_replacement_for_command {path line_no original_text consumed_for_cmd} {
+proc stage2_delay::sparse_pruned_info_for_command {path line_no original_text} {
+    variable sparse_pruned_commands
+    set command_key [source_command_key $path $line_no $original_text]
+    if {[info exists sparse_pruned_commands($command_key)]} {
+        return $sparse_pruned_commands($command_key)
+    }
+    return ""
+}
+
+proc stage2_delay::remaining_replacement_for_command {path line_no original_text consumed_for_cmd {sparse_pruned_info ""}} {
     variable parsed_command_segments
-    array set first [lindex $consumed_for_cmd 0]
+    if {[llength $consumed_for_cmd] > 0} {
+        array set first [lindex $consumed_for_cmd 0]
+    } elseif {$sparse_pruned_info ne ""} {
+        array set sparse $sparse_pruned_info
+        array set first $sparse(segment)
+        array unset sparse
+    } else {
+        error "internal error: remaining replacement has no consumed or sparse-pruned segment"
+    }
     set command_key [source_command_key $path $line_no $original_text]
     if {[info exists parsed_command_segments($command_key)]} {
         performance_stat_add parsed_segment_reuse_hits
         set expanded $parsed_command_segments($command_key)
+    } elseif {$sparse_pruned_info ne ""} {
+        set expanded {}
     } else {
         set words [tokenize_words $original_text]
         set base [segment_from_words $words $first(source) $path $first(line_no) $first(original_id) $original_text $first(harden_inst)]
@@ -6525,10 +7460,15 @@ proc stage2_delay::run_from_user_settings {} {
     set max_chain_depth [global_setting MAX_CHAIN_DEPTH 6]
     set max_endpoints [global_setting MAX_ENDPOINTS 1000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
+    set max_clock_startpoints [global_setting MAX_CLOCK_STARTPOINTS 1000]
     set max_segment_pairs [global_setting STAGE2_MAX_SEGMENT_PAIRS 100000]
+    set sparse_matrix_prune [global_setting STAGE2_SPARSE_MATRIX_PRUNE true]
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
+    set batch_boundary_fanout_query [global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true]
+    set boundary_fanout_batch_size [global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16]
+    set boundary_fanout_batch_min_members [global_setting STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4]
     set metadata_batch_enabled [global_setting STAGE2_METADATA_BATCH_ENABLED true]
     set metadata_batch_size [global_setting STAGE2_METADATA_BATCH_SIZE 128]
     set verbose_pt_query [global_setting STAGE2_VERBOSE_PT_QUERY true]
@@ -6567,9 +7507,13 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting STAGE2_COMPACT_BUS $compact_bus
     set_global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS $compact_bus_min_members
     set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
+    set_global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY $batch_boundary_fanout_query
+    set_global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE $boundary_fanout_batch_size
+    set_global_setting STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS $boundary_fanout_batch_min_members
     set_global_setting STAGE2_METADATA_BATCH_ENABLED $metadata_batch_enabled
     set_global_setting STAGE2_METADATA_BATCH_SIZE $metadata_batch_size
     set_global_setting STAGE2_MAX_SEGMENT_PAIRS $max_segment_pairs
+    set_global_setting STAGE2_SPARSE_MATRIX_PRUNE $sparse_matrix_prune
     set_global_setting STAGE2_VERBOSE_PT_QUERY $verbose_pt_query
     set_global_setting WRITE_PATH_SUMMARY $write_path_summary
     set_global_setting STAGE2_TEXT_ENCODING $text_encoding
@@ -6593,8 +7537,11 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Recursive mode      : $recursive_chain_mode"
     puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
     puts "INFO: Batch open-to query : $batch_open_to_query"
+    puts "INFO: Boundary fanout     : $batch_boundary_fanout_query (size=$boundary_fanout_batch_size min=$boundary_fanout_batch_min_members)"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
     puts "INFO: Max segment pairs   : $max_segment_pairs"
+    puts "INFO: Max clock starts    : $max_clock_startpoints"
+    puts "INFO: Sparse matrix prune : $sparse_matrix_prune"
     puts "INFO: Verbose PT query    : $verbose_pt_query"
     puts "INFO: Text encoding       : $text_encoding"
 
@@ -6626,9 +7573,14 @@ proc stage2_delay::run_from_user_settings {} {
         -max_endpoints $max_endpoints \
         -max_enum_objects $max_enum_objects \
         -max_segment_pairs $max_segment_pairs \
+        -max_clock_startpoints $max_clock_startpoints \
+        -sparse_matrix_prune $sparse_matrix_prune \
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
         -batch_open_to_query $batch_open_to_query \
+        -batch_boundary_fanout_query $batch_boundary_fanout_query \
+        -boundary_fanout_batch_size $boundary_fanout_batch_size \
+        -boundary_fanout_batch_min_members $boundary_fanout_batch_min_members \
         -metadata_batch_enabled $metadata_batch_enabled \
         -metadata_batch_size $metadata_batch_size
 
