@@ -309,6 +309,33 @@ set_false_path -from [get_ports rst_n] -to [get_pins u_sync/D]
     assert_contains(result["removed"], "boundary_exception_owned_by_30")
 
 
+def test_boundary_delay_through_mapping():
+    sdc = """\
+set_max_delay 1.112 -through [get_ports tdt_dm_dtu_itr_done_hdsk] -to [get_pins x_ct_dtu_top/x_ct_dtu_cdc/x_ct_dtu_tdt_dm_itr_done_extend/x_com_sync_level21level/u_cdc/SYNC_RSTVAL_EQO_SYNC_CELL_INST_0__u_clear_dff3/u1_sync/D] -ignore_clock_latency
+set_min_delay 0 -through [get_ports tdt_dm_dtu_itr_done_hdsk] -to [get_pins x_ct_dtu_top/x_ct_dtu_cdc/x_ct_dtu_tdt_dm_itr_done_extend/x_com_sync_level21level/u_cdc/SYNC_RSTVAL_EQO_SYNC_CELL_INST_0__u_clear_dff3/u1_sync/D] -ignore_clock_latency
+set_max_delay 5 -from [get_ports pad_yy_scan_rst_b]
+set_min_delay 0 -to [get_ports pad_yy_scan_rst_b]
+"""
+    result = run_tool("boundary_delay_through_mapping", sdc)
+    if result["code"] != 0:
+        raise AssertionError("boundary through delay mapping failed\nstdout=%s\nstderr=%s\nreport=%s" % (
+            result["stdout"], result["stderr"], read_file(result["report"]),
+        ))
+    assert_contains(result["out"], "# !!! REVIEW_REQUIRED COMMANDS BEGIN !!!")
+    assert_contains(result["out"], "set_max_delay 1.112 -through [get_pins u_soc/u_avfs/u_awm3_0/tdt_dm_dtu_itr_done_hdsk]")
+    assert_contains(result["out"], "set_min_delay 0 -through [get_pins u_soc/u_avfs/u_awm3_0/tdt_dm_dtu_itr_done_hdsk]")
+    assert_contains(result["out"], "boundary_through_mapped_keep_path")
+    assert_command_lines_not_contains(result["out"], "get_ports")
+    assert_contains(result["out"], "set_max_delay 5 -from [get_pins u_soc/u_avfs/u_awm3_0/pad_yy_scan_rst_b]")
+    assert_contains(result["out"], "set_min_delay 0 -to [get_pins u_soc/u_avfs/u_awm3_0/pad_yy_scan_rst_b]")
+    assert_contains(result["out"], "boundary_from_open_end_mapped_keep_path")
+    assert_contains(result["out"], "boundary_to_open_end_mapped_keep_path")
+    assert_contains(result["modified"], "boundary_through_mapped_keep_path")
+    assert_contains(result["modified"], "boundary_from_open_end_mapped_keep_path")
+    assert_contains(result["modified"], "boundary_to_open_end_mapped_keep_path")
+    assert_not_contains(result["removed"], "set_max_delay 5 -from [get_ports pad_yy_scan_rst_b]")
+
+
 def test_oversize_shallow_mapping():
     sdc = """\
 # set_multicycle_path 9 -from [get_pins should_not_parse/Q] -to [get_pins should_not_parse/D]
@@ -445,6 +472,7 @@ def main():
         test_list_wrapper_mapping,
         test_boundary_multicycle_path_mapped,
         test_boundary_delay_mapping,
+        test_boundary_delay_through_mapping,
         test_oversize_shallow_mapping,
         test_review_block_after_clock_definitions,
         test_virtual_create_clock_renamed,

@@ -15,7 +15,7 @@ Stage1 的职责：
 
 Stage1 输出的 clean harden SDC 与 SoC SDC 01~30 规则共同组成全片 STA 约束。
 
-当前脚本版本：`v2.3.2`，兼容 Python 3.6，仅依赖 Python 标准库。
+当前脚本版本：`v2.3.4`，兼容 Python 3.6，仅依赖 Python 标准库。
 
 ## 2. 输入和 instance 规则
 
@@ -256,21 +256,33 @@ refclk -> u_b_u_b1_refclk
 
 ### 10.1 `set_max_delay` / `set_min_delay`
 
-以下标准 endpoint 组合会保留整条 path：
+以下标准 endpoint/path 组合会保留整条 path：
 
 - `-from get_ports -to get_pins`
 - `-from get_pins -to get_ports`
 - `-from get_ports -to get_ports`
+- `-through get_ports -to get_pins`
+- `-from get_pins -through get_ports -to get_pins`
+- `-from get_ports`（省略 `-to` 的 open-end path）
+- `-to get_ports`（省略 `-from` 的 open-end path）
 
 处理方式：
 
 1. `get_ports` 改为 `get_pins <inst>/<port>`。
 2. internal object 同步增加 `<inst>/`。
 3. 完整命令进入主 SDC 顶部 `REVIEW_REQUIRED` 区块。
-4. 不删除 `-from` 或 `-to`，保留原 path 结构。
+4. 不删除 `-from`、`-to` 或 `-through`，保留原 path 结构；省略另一端时保留 open-end 语义。
 
-如果命令含 boundary `get_ports`，但缺少完整 `-from/-to`，或 endpoint 组合无法被
-脚本识别，则进入 boundary delay REMOVE 路径，交给 10/20/30 或 SoC 级复核。
+只要 `get_ports` 位于显式 `-from`、`-to` 或 `-through` path 选择器中，命令就按
+boundary path 保留并映射；`-from`、`-to` 不要求成对出现。省略 `-to` 的
+`set_max_delay -from [get_ports P]` 表示从该 harden port 到所有匹配下游路径的
+delay requirement；省略 `-from` 的对应形式表示所有匹配上游路径到该 port 的
+requirement。两类命令都进入 `REVIEW_REQUIRED`，由 STA 结合 netlist 确认 port
+方向、实际覆盖路径以及是否与 SoC 顶层约束重复。
+
+只有没有显式 path 选择器，或 path 选择器无法安全映射时，才进入 boundary delay
+REMOVE/UNSUPPORTED 路径，交给 10/20/30 或 SoC 级复核。`-through` 中的
+`get_ports` 也不再要求同时存在内部 `-from/-to` 对象。
 
 ### 10.2 `set_multicycle_path`
 
@@ -403,7 +415,7 @@ shallow mapping：
 
 ## 19. 当前实现注意项
 
-以下内容是当前 `v2.3.2` 实现行为，不应在评审时忽略：
+以下内容是当前 `v2.3.4` 实现行为，不应在评审时忽略：
 
 1. `set_clock_latency` 已有 reason 和 `--keep-kept-clock-source-latency` 相关代码，
    但当前没有加入固定 REMOVE command set。因此它实际进入 `unsupported.sdc`，

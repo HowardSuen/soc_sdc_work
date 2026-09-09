@@ -24,7 +24,7 @@ import sys
 from collections import OrderedDict, defaultdict
 
 
-PROCESS_VERSION = "v2.3.2"
+PROCESS_VERSION = "v2.3.4"
 TOOL_NAME = "run_stage1_clean_sdc.py"
 STAGE_NAME = "STA Flatten 1 Harden DC SDC Clean"
 AUTHOR = "Howard"
@@ -1599,17 +1599,14 @@ def classify_modify_command(command, config, pass1, reason):
 def map_boundary_delay(command, config, pass1):
     text = command.normalized_text
     tokens = tokenize_tcl_words(text)
-    endpoint_options = {}
+    path_options = defaultdict(list)
     index = 1
     while index < len(tokens):
         option = tokens[index].text
-        if option in set(["-from", "-to"]):
+        if option in set(["-from", "-to", "-through"]):
             if index + 1 >= len(tokens):
                 return None
-            endpoint_options[option] = {
-                "option": tokens[index],
-                "value": tokens[index + 1],
-            }
+            path_options[option].append(tokens[index + 1])
             index += 2
             continue
         if option.startswith("-"):
@@ -1617,23 +1614,40 @@ def map_boundary_delay(command, config, pass1):
             continue
         index += 1
 
-    if "-from" not in endpoint_options or "-to" not in endpoint_options:
+    if not path_options:
         return None
 
-    from_value = endpoint_options["-from"]["value"].text
-    to_value = endpoint_options["-to"]["value"].text
-    from_boundary = contains_get_ports(from_value)
-    to_boundary = contains_get_ports(to_value)
-    from_internal = contains_internal_object_access(from_value)
-    to_internal = contains_internal_object_access(to_value)
+    from_values = [token.text for token in path_options.get("-from", [])]
+    to_values = [token.text for token in path_options.get("-to", [])]
+    through_values = [token.text for token in path_options.get("-through", [])]
+    from_boundary = any(contains_get_ports(value) for value in from_values)
+    to_boundary = any(contains_get_ports(value) for value in to_values)
+    through_boundary = any(contains_get_ports(value) for value in through_values)
+    from_internal = any(contains_internal_object_access(value) for value in from_values)
+    to_internal = any(contains_internal_object_access(value) for value in to_values)
 
-    if from_boundary and to_boundary:
+    if through_boundary:
+        reason = "boundary_through_mapped_keep_path"
+        side = "through"
+    elif from_boundary and "-to" not in path_options:
+        reason = "boundary_from_open_end_mapped_keep_path"
+        side = "from (open end)"
+    elif to_boundary and "-from" not in path_options:
+        reason = "boundary_to_open_end_mapped_keep_path"
+        side = "to (open end)"
+    elif from_boundary and to_boundary:
         reason = "boundary_from_to_mapped_keep_path"
         side = "from/to"
     elif from_boundary and to_internal:
         reason = "boundary_from_mapped_keep_path"
         side = "from"
     elif to_boundary and from_internal:
+        reason = "boundary_to_mapped_keep_path"
+        side = "to"
+    elif from_boundary:
+        reason = "boundary_from_mapped_keep_path"
+        side = "from"
+    elif to_boundary:
         reason = "boundary_to_mapped_keep_path"
         side = "to"
     else:

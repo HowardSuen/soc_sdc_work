@@ -58,7 +58,7 @@ modified details 和 report。所有转换状态非 `INVALID_OUTPUT` 的 `*_clea
 - 保留的 `create_clock` / `create_generated_clock` 不再因为最终主 SDC 中暂时没有其它 `get_clocks` 引用而删除；是否与 SoC 顶层 clock 重复由 report 和 STA post-check review。
 - `get_ports <name>`：映射为 `get_pins <inst>/<name>`。
 - 裸 `get_ports`、`get_ports *`、危险 `all_*`：不进入主 SDC。
-- `set_max_delay` / `set_min_delay` 涉及 harden boundary `get_ports`：保留整条 path 约束，将 boundary `get_ports` 映射为 SoC scope 下的 `get_pins <inst>/<port>`，内部对象同步上升 hierarchy，并放入 `REVIEW_REQUIRED` 区块；`-from get_ports -to get_ports` 两端都映射后保留。
+- `set_max_delay` / `set_min_delay` 只要显式 `-from`、`-to` 或 `-through` 路径选择器涉及 harden boundary `get_ports`，就保留整条 path 约束，将 boundary `get_ports` 映射为 SoC scope 下的 `get_pins <inst>/<port>`，内部对象同步上升 hierarchy，并放入 `REVIEW_REQUIRED` 区块。`-from` 或 `-to` 可以单独出现，省略另一端表示 open-end path，不因缺少另一端而删除。`-from get_ports -to get_ports` 两端都映射后保留；`-through get_ports -to get_pins`、`-from get_pins -through get_ports -to get_pins` 等形式也保留并映射。
 - `set_multicycle_path` 涉及 harden boundary `get_ports`：保留并映射为 `get_pins <inst>/<port>`，其它内部对象同步上升 hierarchy，同时放入 `REVIEW_REQUIRED` 区块确认 timing exception 语义。
 - `set_false_path` / `set_case_analysis` 只要直接涉及 harden boundary `get_ports`：不进入 cleaned harden SDC，转交 scenario pre、30 或 SoC 级 review。
 - `set_input_delay` / `set_output_delay`、clock group、clock budget、RC/SPEF/derate、global library/report constraint：REMOVE。
@@ -158,6 +158,7 @@ python3 regression_test/run_regression.py
 - command boundary structural failure fatal。
 - 主 SDC 顶部 `REVIEW_REQUIRED` 醒目区块。
 - boundary `get_ports` 的 `set_max_delay` / `set_min_delay` 映射并进入 `REVIEW_REQUIRED`，包含 `-from get_ports -to get_ports`。
+- boundary `get_ports` 出现在 `-through` 中的 `set_max_delay` / `set_min_delay` 映射并进入 `REVIEW_REQUIRED`；只有没有显式 path 选择器，或 path 选择器无法安全映射时，才按原 boundary ownership 规则移除或进入 `unsupported.sdc`。
 - boundary `get_ports` 的 `set_multicycle_path` 映射并进入 `REVIEW_REQUIRED`。
 - boundary `get_ports` 的 `set_false_path` / `set_case_analysis` 从 cleaned harden SDC 移除。
 - 整行注释预处理与超长命令 shallow mapping。
