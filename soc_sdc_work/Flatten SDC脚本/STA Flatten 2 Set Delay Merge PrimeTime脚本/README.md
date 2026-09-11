@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.14。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.15。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -90,7 +90,7 @@ set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
 set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
-set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+set ::STAGE2_MAX_SEGMENT_PAIRS 500000
 set ::STAGE2_SPARSE_MATRIX_PRUNE true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
@@ -155,7 +155,7 @@ set ::STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
 set ::STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set ::STAGE2_METADATA_BATCH_ENABLED true
 set ::STAGE2_METADATA_BATCH_SIZE 128
-set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+set ::STAGE2_MAX_SEGMENT_PAIRS 500000
 set ::STAGE2_SPARSE_MATRIX_PRUNE true
 set ::STAGE2_VERBOSE_PT_QUERY true
 set ::STAGE2_TRACE_FILE [file join $::OUT_DIR stage2_live.log]
@@ -192,7 +192,7 @@ set STAGE2_TRACE_FILE [file join $OUT_DIR stage2_live.log]
 set WRITE_PATH_SUMMARY true
 set OUT_SUMMARY_DIR [file join $OUT_DIR delay_path_summary]
 set STAGE2_TEXT_ENCODING utf-8
-set MAX_ENDPOINTS 1000
+set MAX_ENDPOINTS 10000
 set MAX_ENUM_OBJECTS 64
 set STAGE2_COMPACT_BUS true
 set STAGE2_COMPACT_BUS_MIN_MEMBERS 4
@@ -202,7 +202,7 @@ set STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16
 set STAGE2_BOUNDARY_FANOUT_BATCH_MIN_MEMBERS 4
 set STAGE2_METADATA_BATCH_ENABLED true
 set STAGE2_METADATA_BATCH_SIZE 128
-set STAGE2_MAX_SEGMENT_PAIRS 100000
+set STAGE2_MAX_SEGMENT_PAIRS 500000
 set STAGE2_SPARSE_MATRIX_PRUNE true
 ```
 
@@ -340,7 +340,12 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `all_fanin -startpoints_only` 不可用、属性不可读、无匹配对象或超过
   `MAX_CLOCK_STARTPOINTS` 时保留原始约束并进入 `CLOCK_OR_UNKNOWN_OBJECT` review；
   普通 full-fanin fallback 不作为 timing startpoint 的转换依据。
-- `STAGE2_MAX_SEGMENT_PAIRS=100000`：控制单条 delay 命令最多 materialize 的
+- v0.9.15 针对 vendor harden SDC 中常见的大范围 `open_to` 和 from x to
+  矩阵，提高默认安全上限：`MAX_ENDPOINTS=10000`、
+  `STAGE2_MAX_SEGMENT_PAIRS=500000`。上限仍然是硬限制；脚本不会截断或静默
+  丢弃超限约束，仍会保留原命令并进入 review。若 PT 内存或运行时间压力较大，
+  可在本次 run 的顶部设置区或 `stage2_delay::build` 参数中临时调回较小值。
+- `STAGE2_MAX_SEGMENT_PAIRS=500000`：控制单条 delay 命令最多 materialize 的
   pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
   此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
   仍超限，脚本不截断、不部分消费，而是保留整条原约束并增加一条
@@ -940,12 +945,12 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -batch_open_to_query true
 -metadata_batch_enabled true
 -metadata_batch_size 128
--max_segment_pairs 100000
+-max_segment_pairs 500000
 -sparse_matrix_prune true
 -verbose_pt_query true
 -write_path_summary true
 -generate_clock_group_review true
--max_endpoints 1000
+-max_endpoints 10000
 -max_enum_objects 64
 -max_clock_startpoints 1000
 ```

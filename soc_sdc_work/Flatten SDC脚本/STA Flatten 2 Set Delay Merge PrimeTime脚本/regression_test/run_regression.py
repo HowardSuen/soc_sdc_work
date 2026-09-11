@@ -498,6 +498,18 @@ def test_report_accepts_large_csv_field():
     workbook.close()
 
 
+def test_default_vendor_safety_limits_are_reported():
+    result = run_case(
+        "default_vendor_safety_limits",
+        "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n",
+        "set_max_delay 5.0 -from [get_pins u_h0/cfg_i] -to [get_pins u_h0/u_reg/D]\n",
+    )
+    require_ok(result)
+    assert_contains(result["report"], "Max endpoints                  : 10000")
+    assert_contains(result["report"], "Max segment pairs               : 500000")
+    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.15")
+
+
 def test_complete_complete_merge():
     result = run_case(
         "complete_complete",
@@ -4645,6 +4657,7 @@ def main():
     tests = [
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_report_accepts_large_csv_field,
+        test_default_vendor_safety_limits_are_reported,
         test_complete_complete_merge,
         test_live_trace_records_invalid_startpoint_object,
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,

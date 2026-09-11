@@ -82,7 +82,10 @@ set ::RECURSIVE_CHAIN_MODE auto
 set ::MAX_CHAIN_DEPTH 6
 
 # Safety limits.
-set ::MAX_ENDPOINTS 1000
+# Vendor harden SDCs may intentionally use broad open-to constraints.  Keep
+# the expansion bounded, but use a higher default so legitimate vendor
+# endpoint sets are not rejected before they can be reviewed in PT.
+set ::MAX_ENDPOINTS 10000
 set ::MAX_ENUM_OBJECTS 64
 
 # Maximum number of PT-proven launch startpoints materialized for one exact
@@ -92,7 +95,10 @@ set ::MAX_CLOCK_STARTPOINTS 1000
 
 # Maximum from x to pairs materialized for one delay command. Commands above
 # this limit are preserved unchanged and reported for review.
-set ::STAGE2_MAX_SEGMENT_PAIRS 100000
+# Vendor SDCs can contain large from x to matrices.  This remains a hard
+# safety bound; split the source constraint or override it explicitly if a
+# real run still exceeds it.
+set ::STAGE2_MAX_SEGMENT_PAIRS 500000
 
 # Before materializing a top from x to matrix, use PT-proven startpoint
 # membership to omit disconnected clock-pin cross pairs. Query failures keep
@@ -158,7 +164,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.14"
+    variable VERSION "v0.9.15"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -224,10 +230,10 @@ namespace eval stage2_delay {
         -top_port_boundary_map_mode "connectivity"
         -recursive_chain_mode "auto"
         -max_chain_depth 6
-        -max_endpoints 1000
+        -max_endpoints 10000
         -max_enum_objects 64
         -max_clock_startpoints 1000
-        -max_segment_pairs 100000
+        -max_segment_pairs 500000
         -sparse_matrix_prune "true"
         -compact_bus "true"
         -compact_bus_min_members 4
@@ -6602,6 +6608,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Boundary fanout minimum members : $options(-boundary_fanout_batch_min_members)"
     puts $fout "Metadata batch enabled          : $options(-metadata_batch_enabled)"
     puts $fout "Metadata batch size             : $options(-metadata_batch_size)"
+    puts $fout "Max endpoints                  : $options(-max_endpoints)"
     puts $fout "Max segment pairs               : $options(-max_segment_pairs)"
     puts $fout "Max clock startpoints           : $options(-max_clock_startpoints)"
     puts $fout "Sparse matrix pruning           : $options(-sparse_matrix_prune)"
@@ -7458,10 +7465,10 @@ proc stage2_delay::run_from_user_settings {} {
     set top_port_boundary_map_mode [global_setting TOP_PORT_BOUNDARY_MAP_MODE connectivity]
     set recursive_chain_mode [global_setting RECURSIVE_CHAIN_MODE auto]
     set max_chain_depth [global_setting MAX_CHAIN_DEPTH 6]
-    set max_endpoints [global_setting MAX_ENDPOINTS 1000]
+    set max_endpoints [global_setting MAX_ENDPOINTS 10000]
     set max_enum_objects [global_setting MAX_ENUM_OBJECTS 64]
     set max_clock_startpoints [global_setting MAX_CLOCK_STARTPOINTS 1000]
-    set max_segment_pairs [global_setting STAGE2_MAX_SEGMENT_PAIRS 100000]
+    set max_segment_pairs [global_setting STAGE2_MAX_SEGMENT_PAIRS 500000]
     set sparse_matrix_prune [global_setting STAGE2_SPARSE_MATRIX_PRUNE true]
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
@@ -7539,6 +7546,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Batch open-to query : $batch_open_to_query"
     puts "INFO: Boundary fanout     : $batch_boundary_fanout_query (size=$boundary_fanout_batch_size min=$boundary_fanout_batch_min_members)"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
+    puts "INFO: Max endpoints      : $max_endpoints"
     puts "INFO: Max segment pairs   : $max_segment_pairs"
     puts "INFO: Max clock starts    : $max_clock_startpoints"
     puts "INFO: Sparse matrix prune : $sparse_matrix_prune"
