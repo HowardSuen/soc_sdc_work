@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.15。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.16。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -345,6 +345,14 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `STAGE2_MAX_SEGMENT_PAIRS=500000`。上限仍然是硬限制；脚本不会截断或静默
   丢弃超限约束，仍会保留原命令并进入 review。若 PT 内存或运行时间压力较大，
   可在本次 run 的顶部设置区或 `stage2_delay::build` 参数中临时调回较小值。
+- v0.9.16 修复 terminal harden input 边界误报。若 top 的 `-from/-to` 路径到达
+  harden immediate input boundary，且该 harden 已 link、`get_pins` 唯一，PT 的
+  `all_fanout -flat -endpoints_only -from <boundary>` 只返回 boundary 自身，
+  则把该 boundary 视为最终 endpoint，保留原 top max/min delay 并生成
+  `top_startpoint -> harden_input_boundary`。该分支记录
+  `TERMINAL_HARDEN_INPUT`，不会生成 `boundary -> boundary`，也不会误报
+  `MISSING_HARDEN_SDC_ENDPOINT_NOT_FOUND`。若 PT 查询失败、返回多个 endpoint
+  或返回的唯一对象不是 boundary 自身，则继续走原有 review/递归规则。
 - `STAGE2_MAX_SEGMENT_PAIRS=500000`：控制单条 delay 命令最多 materialize 的
   pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
   此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
@@ -566,8 +574,11 @@ max_delay_used/max_delay_total/max_delay_usage/missing_sdc_stages
 - `stage_N_sdc_delay`：完整路径中第 N 段原生 SDC delay 数值；短路径填 `-`。
   若该段在对应 harden clean SDC 中缺失，Stage 2 会在计算总 delay 时按 0
   处理，但 summary CSV 仍填 `-`，后续 Excel 会显示为 `NOT FOUND` 红底。
-  缺失段只影响 delay 数值和 review 标记，不会把 harden input boundary
-  放宽成最终 endpoint。
+  缺失段只影响 delay 数值和 review 标记；普通 missing stage 不会把 harden input
+  boundary 放宽成最终 endpoint。v0.9.16 的唯一例外是 PT 明确证明该 linked
+  harden input boundary 本身就是 `-endpoints_only` 的唯一 endpoint，此时该
+  boundary 按 terminal endpoint 处理，并保留 top 到 boundary 的原始 max/min
+  约束。
 - `generated_cmd`：最终写入 `generated_e2e_delay.sdc` 或 final flatten SDC
   的静态约束命令。REVIEW 行填 `-`。
 - `review_reason`：MERGED 行为 `-`，RESIDUAL / REVIEW 行记录原因。
@@ -773,6 +784,21 @@ top_reg/Q -> harden_a/input_a -> harden_a/output_a -> top_output
   `all_fanout -flat -endpoints_only` 返回的对象；普通
   `all_fanout -flat` 中出现的组合逻辑 input pin 只作为中间 fanout 节点，
   不会被当成最终 endpoint。
+
+对于 top -> harden input 的 terminal 场景，若 harden clean SDC 没有对应的
+`harden_input -> endpoint` 段，Stage 2 会额外验证该 boundary 是否是 linked PT
+设计中的 terminal endpoint。验证必须同时满足：harden instance 恰好 link 一个
+cell、boundary `get_pins` 恰好解析一个同名 pin，且
+`all_fanout -flat -endpoints_only -from <boundary>` 的结果集合只有该 boundary
+自身。验证成功后输出例如：
+
+```tcl
+set_max_delay 8 -from [get_pins {u2_link_remote/o_link_die_id}] -to [get_pins {u7_tclf/die_num}]
+```
+
+不会输出 `set_max_delay ... -from [get_pins {u7_tclf/die_num}] -to
+[get_pins {u7_tclf/die_num}]`。查询状态会写入 trace/report 的
+`TERMINAL_HARDEN_INPUT`，便于与普通 endpoint-not-found review 区分。
 
 `open_to` 的覆盖规则：
 

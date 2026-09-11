@@ -164,7 +164,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.15"
+    variable VERSION "v0.9.16"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -197,6 +197,8 @@ namespace eval stage2_delay {
     variable startpoint_cache_status
     variable clock_startpoint_cache
     variable clock_startpoint_cache_status
+    variable terminal_harden_input_cache
+    variable terminal_harden_input_cache_status
     variable missing_harden_target_cache
     variable missing_top_target_cache
     variable parsed_command_segments
@@ -322,6 +324,8 @@ proc stage2_delay::reset_state {} {
     variable owner_harden_cache
     variable startpoint_cache
     variable startpoint_cache_status
+    variable terminal_harden_input_cache
+    variable terminal_harden_input_cache_status
     variable missing_harden_target_cache
     variable missing_top_target_cache
     variable parsed_command_segments
@@ -423,6 +427,10 @@ proc stage2_delay::reset_state {} {
         clock_startpoint_records_matched 0
         clock_startpoint_query_unknown 0
         clock_startpoint_expansion_limited 0
+        terminal_harden_input_queries 0
+        terminal_harden_input_confirmed 0
+        terminal_harden_input_unknown 0
+        terminal_harden_input_cache_hits 0
     }
     set command_seq 0
     set e2e_seq 0
@@ -446,6 +454,10 @@ proc stage2_delay::reset_state {} {
     array set clock_startpoint_cache {}
     array unset clock_startpoint_cache_status
     array set clock_startpoint_cache_status {}
+    array unset terminal_harden_input_cache
+    array set terminal_harden_input_cache {}
+    array unset terminal_harden_input_cache_status
+    array set terminal_harden_input_cache_status {}
     array unset missing_harden_target_cache
     array set missing_harden_target_cache {}
     array unset missing_top_target_cache
@@ -3977,6 +3989,26 @@ proc stage2_delay::match_delay_graph_segments {} {
         if {[is_harden_boundary_input_record $end_rec]} {
             set matched_hsegs [matching_harden_segments_for_boundary $end_rec $p(type)]
             if {[llength $matched_hsegs] == 0} {
+                array set terminal_status [pt_terminal_harden_input_status $end_rec]
+                if {$terminal_status(status) eq "confirmed"} {
+                    # PT has proved that this linked harden input is itself the
+                    # only endpoint.  Keep the top path and emit top ->
+                    # boundary directly; never synthesize boundary -> boundary.
+                    set p(terminal_harden_input) true
+                    set emitted_sig "TERMINAL_HARDEN_INPUT:$psig"
+                    if {![info exists emitted($emitted_sig)]} {
+                        set generated [emit_graph_terminal_cmd [array get p]]
+                        if {$generated ne ""} {
+                            set emitted($emitted_sig) 1
+                            mark_path_used [array get p] used_top used_harden
+                            add_report_item "TERMINAL_HARDEN_INPUT boundary=[record_full_name $end_rec] source=PT_FANOUT_SELF_ONLY total=$p(delay)"
+                        }
+                    }
+                    array unset terminal_status
+                    array unset p
+                    continue
+                }
+                array unset terminal_status
                 set bridged 0
                 foreach tseg [missing_harden_bridge_top_segments $end_rec $p(type)] {
                     array set t $tseg
@@ -4420,6 +4452,130 @@ proc stage2_delay::missing_top_targets_from_harden_output_boundary {boundary typ
         }
     }
     return [unique_records_by_name $boundary_targets]
+}
+
+proc stage2_delay::pt_terminal_harden_input_status {boundary} {
+    variable terminal_harden_input_cache
+    variable terminal_harden_input_cache_status
+
+    array set b $boundary
+    set boundary_name $b(full_name)
+    set harden_inst $b(owner_harden_inst)
+    array unset b
+
+    set cache_key [list $harden_inst $boundary_name]
+    if {[info exists terminal_harden_input_cache($cache_key)]} {
+        performance_stat_add terminal_harden_input_cache_hits
+        return $terminal_harden_input_cache($cache_key)
+    }
+
+    set result [list status not_terminal reason NOT_APPLICABLE boundary $boundary_name]
+    if {![is_harden_boundary_input_record $boundary]} {
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) not_applicable
+        return $result
+    }
+    if {$harden_inst eq ""} {
+        set result [list status unknown reason HARDEN_INSTANCE_NOT_FOUND boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+
+    foreach required {get_cells get_pins all_fanout foreach_in_collection sizeof_collection} {
+        if {[info commands $required] eq ""} {
+            set result [list status unknown reason "MISSING_PT_COMMAND:$required" boundary $boundary_name]
+            performance_stat_add terminal_harden_input_unknown
+            set terminal_harden_input_cache($cache_key) $result
+            set terminal_harden_input_cache_status($cache_key) unknown
+            return $result
+        }
+    }
+
+    performance_stat_add terminal_harden_input_queries
+    pt_trace "terminal harden input query boundary={$boundary_name} harden={$harden_inst}"
+    if {[catch {
+        set harden_cells [get_cells -quiet $harden_inst]
+        set harden_count [sizeof_collection $harden_cells]
+    } err]} {
+        set result [list status unknown reason "HARDEN_LINK_QUERY_FAILED:$err" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+    if {$harden_count != 1} {
+        set result [list status unknown reason "HARDEN_INSTANCE_NOT_LINKED:count=$harden_count" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+
+    if {[catch {
+        set start [get_pins -quiet $boundary_name]
+        set start_count [sizeof_collection $start]
+    } err]} {
+        set result [list status unknown reason "BOUNDARY_GETTER_FAILED:$err" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+    if {$start_count != 1} {
+        set result [list status unknown reason "BOUNDARY_GETTER_COUNT:$start_count" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+
+    set start_names {}
+    foreach_in_collection obj $start {
+        lappend start_names [collection_object_name $obj true]
+    }
+    if {[llength $start_names] != 1 || [lindex $start_names 0] ne $boundary_name} {
+        set result [list status unknown reason "BOUNDARY_GETTER_IDENTITY_MISMATCH" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+
+    set endpoint_names {}
+    if {[catch {
+        pt_trace "all_fanout -flat -endpoints_only -from {$boundary_name} for terminal harden input"
+        set endpoints [all_fanout -flat -endpoints_only -from $start]
+        set endpoint_count [sizeof_collection $endpoints]
+        foreach_in_collection obj $endpoints {
+            lappend endpoint_names [collection_object_name $obj true]
+        }
+    } err]} {
+        set result [list status unknown reason "TERMINAL_FANOUT_QUERY_FAILED:$err" boundary $boundary_name]
+        performance_stat_add terminal_harden_input_unknown
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) unknown
+        return $result
+    }
+
+    if {$endpoint_count == 1 && [llength $endpoint_names] == 1 &&
+        [lindex $endpoint_names 0] eq $boundary_name} {
+        set result [list status confirmed reason PT_FANOUT_SELF_ONLY boundary $boundary_name]
+        performance_stat_add terminal_harden_input_confirmed
+        pt_trace "terminal harden input confirmed boundary={$boundary_name} source=PT_FANOUT_SELF_ONLY"
+        trace_event TERMINAL_HARDEN_INPUT "boundary=$boundary_name harden=$harden_inst source=PT_FANOUT_SELF_ONLY"
+        set terminal_harden_input_cache($cache_key) $result
+        set terminal_harden_input_cache_status($cache_key) confirmed
+        return $result
+    }
+
+    set result [list status not_terminal reason "PT_FANOUT_NOT_SELF_ONLY:count=$endpoint_count endpoints=[join $endpoint_names ,]" boundary $boundary_name]
+    performance_stat_add terminal_harden_input_unknown
+    pt_trace "terminal harden input not confirmed boundary={$boundary_name} endpoint_count=$endpoint_count endpoints={[join $endpoint_names ,]}"
+    set terminal_harden_input_cache($cache_key) $result
+    set terminal_harden_input_cache_status($cache_key) not_terminal
+    return $result
 }
 
 proc stage2_delay::pt_harden_fanout_targets_from_boundary {boundary} {
@@ -5268,7 +5424,13 @@ proc stage2_delay::emit_graph_terminal_cmd {path} {
     variable options
     array set p $path
     set to_rec $p(end_record)
-    if {![validate_endpoint_record $to_rec]} {
+    set terminal_harden_input false
+    if {[info exists p(terminal_harden_input)] && [truthy $p(terminal_harden_input)]} {
+        array set terminal_status [pt_terminal_harden_input_status $to_rec]
+        set terminal_harden_input [expr {$terminal_status(status) eq "confirmed"}]
+        array unset terminal_status
+    }
+    if {![validate_endpoint_record $to_rec] && !$terminal_harden_input} {
         add_review "" "" "INVALID_TERMINAL_ENDPOINT" "recursive path terminal object is not a legal endpoint"
         array unset p
         return ""
@@ -6061,6 +6223,8 @@ proc stage2_delay::performance_stats_summary {} {
         clock_startpoint_queries clock_startpoint_records_examined
         clock_startpoint_records_matched clock_startpoint_query_unknown
         clock_startpoint_expansion_limited
+        terminal_harden_input_queries terminal_harden_input_confirmed
+        terminal_harden_input_unknown terminal_harden_input_cache_hits
     }
     set parts {}
     foreach name $names {

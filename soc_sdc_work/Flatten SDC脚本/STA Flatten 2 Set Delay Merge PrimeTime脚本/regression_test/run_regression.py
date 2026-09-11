@@ -507,7 +507,64 @@ def test_default_vendor_safety_limits_are_reported():
     require_ok(result)
     assert_contains(result["report"], "Max endpoints                  : 10000")
     assert_contains(result["report"], "Max segment pairs               : 500000")
-    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.15")
+    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.16")
+
+
+def test_terminal_harden_input_boundary_is_final_endpoint():
+    """A linked harden input with only itself as PT endpoint is terminal."""
+    prelude = r'''
+array set ::PT_MOCK_DIRECTIONS {
+    u_src_reg/Q out
+    u_h0/die_num in
+}
+
+proc get_cells {args} {
+    return [list [lindex $args end]]
+}
+
+proc all_fanout {args} {
+    set from [lindex $args end]
+    set name [lindex $from 0]
+    if {$name eq "u_h0/die_num"} {
+        if {[lsearch -exact $args "-endpoints_only"] >= 0} {
+            return [list u_h0/die_num]
+        }
+        return [list u_h0/die_num]
+    }
+    return {}
+}
+'''
+    result = run_case(
+        "terminal_harden_input_boundary",
+        "\n".join([
+            "set_max_delay 2.0 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/die_num]",
+            "set_min_delay 0.5 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/die_num]",
+            "",
+        ]),
+        "",
+        prelude=prelude,
+    )
+    require_ok(result)
+    assert_contains(
+        result["out_sdc"],
+        "set_max_delay 2 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/die_num}]",
+    )
+    assert_contains(
+        result["out_sdc"],
+        "set_min_delay 0.5 -from [get_pins {u_src_reg/Q}] -to [get_pins {u_h0/die_num}]",
+    )
+    assert_not_contains(
+        result["out_sdc"],
+        "-from [get_pins {u_h0/die_num}] -to [get_pins {u_h0/die_num}]",
+    )
+    assert_not_contains(result["review"], "MISSING_HARDEN_SDC_ENDPOINT_NOT_FOUND")
+    assert_contains(result["report"], "TERMINAL_HARDEN_INPUT boundary=u_h0/die_num")
+    assert_contains(result["trace"], "TERMINAL_HARDEN_INPUT")
+    assert_contains(result["report"], "Merged constraints              : 2")
+    assert_contains(os.path.join(result["summary"], "top.csv"), "u_h0/die_num")
+    assert_not_contains(os.path.join(result["summary"], "top.csv"), "NOT FOUND")
+    validate_static_sdc(result["out_sdc"])
+    validate_static_sdc(result["final"])
 
 
 def test_complete_complete_merge():
@@ -4658,6 +4715,7 @@ def main():
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_report_accepts_large_csv_field,
         test_default_vendor_safety_limits_are_reported,
+        test_terminal_harden_input_boundary_is_final_endpoint,
         test_complete_complete_merge,
         test_live_trace_records_invalid_startpoint_object,
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
