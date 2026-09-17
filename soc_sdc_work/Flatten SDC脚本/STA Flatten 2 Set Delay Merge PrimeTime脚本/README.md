@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.16。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.17。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -353,6 +353,9 @@ set STAGE2_SPARSE_MATRIX_PRUNE true
   `TERMINAL_HARDEN_INPUT`，不会生成 `boundary -> boundary`，也不会误报
   `MISSING_HARDEN_SDC_ENDPOINT_NOT_FOUND`。若 PT 查询失败、返回多个 endpoint
   或返回的唯一对象不是 boundary 自身，则继续走原有 review/递归规则。
+- v0.9.17 增加受控的 `-to [get_clocks ...]` endpoint 展开及跨 harden merge。
+  具体范围、STA 判据和保留规则见下方“Clock-to 展开规则”；并非所有 clock-to
+  约束都能自动合并，不能证明等价的情况仍保留原文并 review。
 - `STAGE2_MAX_SEGMENT_PAIRS=500000`：控制单条 delay 命令最多 materialize 的
   pair 数，对应 build option `-max_segment_pairs`。结构直通和稀疏连通性计划优先于
   此上限；稀疏 retained pair 不超过上限时只 materialize retained 集。若 retained
@@ -870,6 +873,50 @@ D_total_min = D_top_min + D_harden_min
 累加，但不会在报告中伪装成真实 0；报告里仍用 `NOT FOUND` 标识。缺失末端
 stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束。
 
+## Clock-to 展开规则（v0.9.17）
+
+`set_max_delay/set_min_delay -to [get_clocks cap_clk]` 选择由该 clock 捕获的
+路径，不代表 clock 的 source pin。Stage 2 在 top 和 harden clean SDC 中均可
+尝试转换，但只处理以下可核验的范围：
+
+- `-to` 为精确 clock 名（含精确 clock list）；PT 返回的名字必须与请求集合完全一致。
+- `-from` 为显式、精确的 pin/port 或其 list；harden `get_ports` 先映射到实例 pin。
+  本版本不展开 open-from、clock-to-clock 或 wildcard/dynamic from。
+- 对每个 from 执行 `all_fanout -flat -endpoints_only -trace_arcs all`，收集完整
+  endpoint 集合，不查询或截断最差 timing paths，也不退回普通 full-fanout。
+- 所有候选 endpoint 必须是普通边沿触发 FF 的输入 data pin，且该 cell 只有一个
+  PT 有效 clock pin；从这个 clock pin 读取 `clocks`，不读取 D pin 的 `clocks`
+  充当捕获时钟。此判据面向普通 FF data check，不是任意宏单元/自定义 timing check
+  的通用等价证明；这类设计仍需专门的 PT 验证。
+- endpoint 的捕获 clocks 全部属于原 selector 时可以展开；全部不属于时排除。
+  若既包含选中 clock 又包含其他 clock，整条命令进入 `CLOCK_TO_AMBIGUOUS_CAPTURE`
+  review，防止用 D pin 替代后扩大捕获时钟范围。generated clock 按其实际名称独立匹配，
+  不自动把 master clock 当作 generated clock。
+
+普通 latch、async/recovery、clock-gating endpoint、输出 port、无逻辑的 harden
+input、多个有效 clock pin、属性缺失、查询失败或无匹配 endpoint 均不在本版本的
+自动转换范围内。任何候选无法核验时，整条原约束保留，不输出半个 endpoint 集合。
+日志和 review 使用 `CLOCK_TO_*` 原因，例如 `CLOCK_TO_ENDPOINT_UNSUPPORTED`、
+`CLOCK_TO_CAPTURE_UNKNOWN`、`CLOCK_TO_QUERY_FAILED`。
+
+证明通过后，endpoint 进入原有 direct/recursive merge：harden input 到 clock 可以
+与上游 top delay 合并；top 的 harden output 到 clock 可以与前级 harden delay
+跨实例连接。已经是完整内部路径的 top 约束仍 passthrough，保留原 clock 写法。
+只有成功生成 E2E 后才消费源约束；部分 merge 的剩余 pair 使用已核验的 pin selector
+重写，保留原 delay、through 顺序和 flags。edge-specific option 和 delay option
+不匹配仍按既有规则 review。
+
+`MAX_ENDPOINTS` 同时限制单条 clock-to 的 seed 数和各 seed fanout 返回数之和
+（重复 endpoint 在查询计数中也计入，默认 10000）；最终 from × to 仍受
+`STAGE2_MAX_SEGMENT_PAIRS` 限制。超过上限不会截断原命令。
+`CLOCK_TO_FANOUT_BEGIN/END` 记录查询规模；`CLOCK_TO_ENDPOINT_PROOF` 记录每个
+endpoint 的捕获 clocks；`CLOCK_TO_EXPANDED` 表示展开成功，
+`CLOCK_TO_EXPANSION_REVIEW` 给出保留原因和对象。
+
+等价范围以当前已 link、时钟已建立的 PT 数据库为准；后续改变 clocks、case analysis
+或设计后应重新运行。发布回归使用 tclsh/PT API mock 检查解析、合并、失败保护和输出；
+不能替代内网真实 PT 设计上的 exception coverage/timing 检查。
+
 ## 不自动合并的情况
 
 以下情况会进入 review 或 passthrough：
@@ -888,7 +935,8 @@ stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束
 - max/min 类型不一致。
 - 参与同一 E2E 数值累加的 delay option 不一致，例如只有部分 segment 带
   `-ignore_clock_latency`。
-- `-from`、`-to`、`-through` 中出现 clock 或未知对象。
+- `-from`、`-to` 中的 clock 未通过受控展开证明，或 `-through` 中出现 clock，
+  或存在未知对象。v0.9.14 的 clock-from 和 v0.9.17 的 clock-to 支持范围见版本说明。
 - edge-specific option，例如 `-rise_from`、`-fall_to`、`-rise`、`-fall`。
 - 生成后的 `-from` 不是合法 startpoint。
 - 生成后的 `-to` 不是合法 endpoint。

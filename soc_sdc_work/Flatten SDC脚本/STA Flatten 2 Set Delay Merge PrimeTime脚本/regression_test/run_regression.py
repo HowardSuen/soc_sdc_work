@@ -599,7 +599,7 @@ def test_default_vendor_safety_limits_are_reported():
     require_ok(result)
     assert_contains(result["report"], "Max endpoints                  : 10000")
     assert_contains(result["report"], "Max segment pairs               : 500000")
-    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.16")
+    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.17")
 
 
 def test_terminal_harden_input_boundary_is_final_endpoint():
@@ -4799,6 +4799,225 @@ proc report_clock {args} {
     assert_contains(result["report"], "Clock review enabled            : false")
 
 
+CLOCK_TO_PRELUDE = r'''
+set ::CAPTURE_CLOCKS {cap_clk}
+set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D}
+set ::CAPTURE_FAILURE ""
+proc get_clocks {args} {
+    set result {}
+    foreach name [lindex $args end] {
+        if {$name eq "*"} { return {cap_clk other_clk} }
+        if {$name in {cap_clk other_clk}} { lappend result $name }
+    }
+    return $result
+}
+proc get_cells {args} {
+    if {[lsearch -exact $args -of_objects] >= 0} {
+        return [file dirname [lindex $args end]]
+    }
+    return [lindex $args end]
+}
+rename get_pins clock_to_default_get_pins
+proc get_pins {args} {
+    if {[lsearch -exact $args -filter] >= 0} {
+        if {$::CAPTURE_FAILURE eq "multi_pin"} { return {ff/CP ff/CP2} }
+        set idx [lsearch -exact $args -of_objects]
+        return [list [lindex $args [expr {$idx + 1}]]/CP]
+    }
+    return [clock_to_default_get_pins {*}$args]
+}
+rename get_attribute clock_to_default_get_attribute
+proc get_attribute {obj attr} {
+    set name [lindex $obj 0]
+    if {$attr eq "object_class"} {
+        if {[string first / $name] >= 0} { return pin }
+        return port
+    }
+    if {$attr eq "is_data_pin"} {
+        if {$::CAPTURE_FAILURE eq "non_data"} { return false }
+        return true
+    }
+    if {$attr eq "is_rise_edge_triggered"} {
+        if {$::CAPTURE_FAILURE eq "latch"} { return false }
+        return true
+    }
+    if {$attr eq "is_fall_edge_triggered"} { return false }
+    if {$attr eq "clocks"} {
+        if {$::CAPTURE_FAILURE eq "attribute"} { error "clock attribute unavailable" }
+        if {[info exists ::CAPTURE_BY_PIN($name)]} { return $::CAPTURE_BY_PIN($name) }
+        if {[string match */CP $name]} { return $::CAPTURE_CLOCKS }
+        error "Data pin clocks must not be used as capture-clock evidence"
+    }
+    return [clock_to_default_get_attribute $obj $attr]
+}
+proc all_fanout {args} {
+    if {[lsearch -exact $args -trace_arcs] >= 0} {
+        if {$::CAPTURE_FAILURE eq "fanout"} { error "fanout failed" }
+        if {[lsearch -exact $args -endpoints_only] < 0 ||
+            [lindex $args [expr {[lsearch -exact $args -trace_arcs] + 1}]] ne "all"} {
+            error "incomplete fanout query"
+        }
+    }
+    return $::CAPTURE_ENDPOINTS
+}
+proc get_timing_paths {args} { error "Sampling timing paths is forbidden" }
+'''
+
+
+def test_clock_to_harden_max_min_merge_and_flags():
+    for kind in ('max', 'min'):
+        for flag in ('', ' -ignore_clock_latency', ' -datapath_only'):
+            original = ('set_%s_delay 5 -from [get_ports cfg_i] '
+                        '-to [get_clocks cap_clk]%s' % (kind, flag))
+            result = run_case(
+                'clock_to_merge_' + kind + (flag or '_plain').replace(' ', '_'),
+                'set_%s_delay 2 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]%s\n' % (kind, flag),
+                original + '\n', prelude=CLOCK_TO_PRELUDE)
+            require_ok(result)
+            assert_contains(result['trace'], 'CLOCK_TO_EXPANDED')
+            assert_contains(result['out_sdc'], 'set_%s_delay 7 -from [get_pins {u_src_reg/Q}] -through [get_pins {u_h0/cfg_i}] -to [get_pins {u_h0/u_reg/D}]%s' % (kind, flag))
+            assert_contains(result['removed'], original)
+            if original in delay_command_lines(result['final']):
+                raise AssertionError('Consumed clock command still active')
+            validate_static_sdc(result['final'])
+
+
+def test_clock_to_all_selected_capture_clocks_merge():
+    result = run_case(
+        'clock_to_multiple_selected',
+        'set_max_delay 2 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n',
+        'set_max_delay 5 -from [get_pins u_h0/cfg_i] -to [list [get_clocks cap_clk] [get_clocks other_clk]]\n',
+        prelude=CLOCK_TO_PRELUDE + '\nset ::CAPTURE_CLOCKS {cap_clk other_clk}\n')
+    require_ok(result)
+    assert_contains(result['out_sdc'], 'set_max_delay 7 ')
+    assert_not_contains(result['review'], 'CLOCK_TO_')
+
+
+def test_clock_to_unsafe_proof_preserves_whole_command():
+    variants = [
+        ('mixed', 'set ::CAPTURE_CLOCKS {cap_clk other_clk}', 'CLOCK_TO_AMBIGUOUS_CAPTURE'),
+        ('disjoint', 'set ::CAPTURE_CLOCKS {other_clk}', 'CLOCK_TO_NO_MATCHING_ENDPOINT'),
+        ('empty', 'set ::CAPTURE_CLOCKS {}', 'CLOCK_TO_CAPTURE_UNKNOWN'),
+        ('attribute', 'set ::CAPTURE_FAILURE attribute', 'CLOCK_TO_QUERY_FAILED'),
+        ('fanout', 'set ::CAPTURE_FAILURE fanout', 'CLOCK_TO_QUERY_FAILED'),
+        ('multi_pin', 'set ::CAPTURE_FAILURE multi_pin', 'CLOCK_TO_CAPTURE_UNKNOWN'),
+        ('latch', 'set ::CAPTURE_FAILURE latch', 'CLOCK_TO_ENDPOINT_UNSUPPORTED'),
+        ('async', 'set ::CAPTURE_FAILURE non_data', 'CLOCK_TO_ENDPOINT_UNSUPPORTED'),
+        ('no_endpoint', 'set ::CAPTURE_ENDPOINTS {}', 'CLOCK_TO_NO_MATCHING_ENDPOINT'),
+        ('mixed_endpoint', 'set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D output_port}', 'CLOCK_TO_ENDPOINT_UNSUPPORTED'),
+        ('late_unknown', 'set ::PT_MOCK_DIRECTIONS(u_h0/z_unused) in\nset ::CAPTURE_ENDPOINTS {u_h0/u_reg/D u_h0/z_unused}', 'CLOCK_TO_ENDPOINT_UNSUPPORTED'),
+        ('missing_command', 'rename all_fanout {}', 'CLOCK_TO_QUERY_UNAVAILABLE'),
+    ]
+    for name, setup, reason in variants:
+        original = 'set_max_delay 5 -from [get_pins u_h0/cfg_i] -to [get_clocks cap_clk]'
+        result = run_case('clock_to_review_' + name, '', original + '\n',
+                          prelude=CLOCK_TO_PRELUDE + '\n' + setup + '\n')
+        require_ok(result)
+        assert_contains(result['review'], reason)
+        assert_contains(result['trace'], 'CLOCK_TO_EXPANSION_REVIEW')
+        if original not in delay_command_lines(result['final']):
+            raise AssertionError('Failed proof modified original constraint: ' + name)
+        if delay_command_lines(result['out_sdc']):
+            raise AssertionError('Failed proof emitted a partial merge: ' + name)
+
+
+def test_clock_to_limits_and_selectors_are_conservative():
+    variants = [
+        ('missing_clock', '[get_pins u_h0/cfg_i]', '[get_clocks absent]', '', [], 'CLOCK_TO_SELECTOR_UNRESOLVED'),
+        ('open_from', '', '[get_clocks cap_clk]', '', [], 'CLOCK_TO_FROM_UNSUPPORTED'),
+        ('clock_from', '[get_clocks cap_clk]', '[get_clocks cap_clk]', '', [], 'CLOCK_TO_FROM_UNSUPPORTED'),
+        ('wildcard_from', '[get_pins u_h0/cfg_*]', '[get_clocks cap_clk]', '', [], 'CLOCK_TO_FROM_UNSUPPORTED'),
+        ('endpoint_limit', '[get_pins u_h0/cfg_i]', '[get_clocks cap_clk]',
+         'set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D u_h0/u_cfg_reg/D}', ['-max_endpoints', '1'], 'CLOCK_TO_ENDPOINT_LIMIT'),
+        ('pair_limit', '[list [get_pins u_h0/cfg_i] [get_pins u_h0/other_i]]', '[get_clocks cap_clk]',
+         'set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D u_h0/u_cfg_reg/D}', ['-max_segment_pairs', '3'], 'MATRIX_EXPANSION_LIMIT'),
+    ]
+    for name, start, end, setup, options, reason in variants:
+        original = 'set_max_delay 5%s -to %s' % (' -from ' + start if start else '', end)
+        result = run_case('clock_to_bound_' + name, '', original + '\n',
+                          extra_build_args=options, prelude=CLOCK_TO_PRELUDE + '\n' + setup + '\n')
+        require_ok(result)
+        assert_contains(result['review'], reason)
+        if original not in delay_command_lines(result['final']):
+            raise AssertionError('Unsafe clock selector was consumed: ' + name)
+
+
+def test_clock_to_partial_merge_rewrites_only_unconsumed_pairs():
+    original = 'set_max_delay 5 -from [list [get_pins u_h0/cfg_i] [get_pins u_h0/other_i]] -to [get_clocks cap_clk]'
+    result = run_case(
+        'clock_to_partial',
+        'set_max_delay 2 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n',
+        original + '\n', prelude=CLOCK_TO_PRELUDE)
+    require_ok(result)
+    assert_contains(result['out_sdc'], 'set_max_delay 7 ')
+    assert_contains(result['final'], 'set_max_delay 5 -from [get_pins {u_h0/other_i}] -to [get_pins {u_h0/u_reg/D}]')
+    assert_contains(result['final'], 'STAGE2_REWRITTEN')
+    validate_static_sdc(result['final'])
+
+
+def test_clock_to_complete_endpoint_set_filters_unselected_domains():
+    result = run_case(
+        'clock_to_complete_endpoint_set',
+        'set_max_delay 2 -from [get_pins u_src_reg/Q] -to [get_pins u_h0/cfg_i]\n',
+        'set_max_delay 5 -from [get_pins u_h0/cfg_i] -through [get_pins u_h0/filter/Y] -to [get_clocks cap_clk]\n',
+        prelude=CLOCK_TO_PRELUDE + r'''
+set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D u_h0/u_cfg_reg/D u_h0/u_mode_reg/D}
+set ::CAPTURE_BY_PIN(u_h0/u_mode_reg/CP) {other_clk}
+''')
+    require_ok(result)
+    generated = delay_command_lines(result['out_sdc'])
+    if len(generated) != 2:
+        raise AssertionError('Must emit both selected endpoints, not a worst-path sample')
+    for endpoint in ('u_h0/u_reg/D', 'u_h0/u_cfg_reg/D'):
+        assert_contains(result['out_sdc'], '-to [get_pins {%s}]' % endpoint)
+    assert_not_contains(result['out_sdc'], 'u_h0/u_mode_reg/D')
+    for command in generated:
+        assert_text_contains(command, '-through [get_pins {u_h0/filter/Y}]')
+    validate_static_sdc(result['final'])
+
+
+def test_clock_to_unresolved_capture_name_aborts_after_valid_endpoint():
+    original = 'set_max_delay 5 -from [get_pins u_h0/cfg_i] -to [get_clocks cap_clk]'
+    result = run_case('clock_to_unresolved_name', '', original + '\n', prelude=CLOCK_TO_PRELUDE + r'''
+set ::CAPTURE_ENDPOINTS {u_h0/u_reg/D u_h0/u_mode_reg/D}
+set ::CAPTURE_BY_PIN(u_h0/u_reg/CP) {_selUnresolved}
+rename get_attribute clock_to_named_get_attribute
+proc get_attribute {obj attr} {
+    if {$obj eq "_selUnresolved" && $attr eq "full_name"} { error "unknown object name" }
+    return [clock_to_named_get_attribute $obj $attr]
+}
+''')
+    require_ok(result)
+    assert_contains(result['review'], 'CLOCK_TO_QUERY_FAILED')
+    if original not in delay_command_lines(result['final']):
+        raise AssertionError('Unresolved capture clock caused partial consumption')
+
+
+def test_clock_to_top_complete_path_preserves_native_selector():
+    original = 'set_max_delay 0.5 -from [get_pins u_src_reg/CP] -to [get_clocks cap_clk] -ignore_clock_latency'
+    result = run_case('clock_to_complete_top', original + '\n', '', prelude=CLOCK_TO_PRELUDE)
+    require_ok(result)
+    assert_contains(result['trace'], 'CLOCK_TO_EXPANDED')
+    assert_not_contains(result['review'], 'CLOCK_OR_UNKNOWN_OBJECT')
+    if original not in delay_command_lines(result['final']):
+        raise AssertionError('Complete native clock constraint should stay unchanged')
+    if delay_command_lines(result['out_sdc']):
+        raise AssertionError('Complete top path requires no delay merge')
+
+
+def test_clock_to_cross_harden_output_chain():
+    result = run_case(
+        'clock_to_output_chain',
+        'set_max_delay 2 -from [get_pins u_up/data_o] -to [get_clocks cap_clk]\n',
+        '', extra_hardens=[('up', 'u_up', 'up',
+                            'set_max_delay 3 -from [get_pins u_up/u_reg/Q] -to [get_pins u_up/data_o]\n')],
+        prelude=CLOCK_TO_PRELUDE)
+    require_ok(result)
+    assert_contains(result['trace'], 'CLOCK_TO_EXPANDED')
+    assert_contains(result['out_sdc'], 'set_max_delay 5 -from [get_pins {u_up/u_reg/Q}] -through [get_pins {u_up/data_o}] -to [get_pins {u_h0/u_reg/D}]')
+    validate_static_sdc(result['final'])
+
+
 def main():
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
@@ -4815,6 +5034,15 @@ def main():
         test_pt_proven_input_clock_pin_is_accepted_as_startpoint,
         test_recursive_pt_proven_input_clock_pin_is_accepted,
         test_exact_clock_from_selector_expands_scoped_pt_startpoints,
+        test_clock_to_harden_max_min_merge_and_flags,
+        test_clock_to_all_selected_capture_clocks_merge,
+        test_clock_to_unsafe_proof_preserves_whole_command,
+        test_clock_to_limits_and_selectors_are_conservative,
+        test_clock_to_partial_merge_rewrites_only_unconsumed_pairs,
+        test_clock_to_cross_harden_output_chain,
+        test_clock_to_complete_endpoint_set_filters_unselected_domains,
+        test_clock_to_unresolved_capture_name_aborts_after_valid_endpoint,
+        test_clock_to_top_complete_path_preserves_native_selector,
         test_clock_from_skips_unclocked_primary_input_startpoint,
         test_exact_clock_from_selector_limit_preserves_original,
         test_clock_from_startpoints_only_failure_preserves_original,

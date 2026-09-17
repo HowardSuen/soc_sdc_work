@@ -164,7 +164,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.16"
+    variable VERSION "v0.9.17"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -1213,6 +1213,8 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
     set open_to_inferred false
     set open_to_seed_records {}
     set clock_from_expanded false
+    set clock_to_expanded false
+    set clock_to_reason ""
     set clock_expansion_reason ""
     if {$structural_passthrough} {
         set from_records $raw_from_records
@@ -1294,7 +1296,26 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
     # explicit endpoints are available, resolve that domain to the bounded set
     # of PT startpoints that actually reach those endpoints.  Do not use the
     # source port as a replacement: that would change clock-to-Q path semantics.
+    # Keep capture-clock selection separate from launch-clock expansion.  A
+    # failed capture proof must leave the entire original command untouched.
+    if {[clock_expression_is_exact $to_expr $raw_to_records]} {
+        array set capture_plan [expand_clock_to_endpoints $raw_to_records $from_expr $from_records $cmd_id]
+        if {$capture_plan(status) eq "resolved"} {
+            set to_records $capture_plan(records)
+            set clock_to_expanded true
+            trace_event CLOCK_TO_EXPANDED \
+                "source=$source id=$cmd_id endpoints=[llength $to_records] proof=single_clock_pin_ff original_clock_selector={$to_expr}"
+            add_report_item "CLOCK_TO_EXPANDED source=$source id=$cmd_id endpoints=[llength $to_records] proof=single_clock_pin_ff"
+        } else {
+            set clock_to_reason $capture_plan(reason)
+            trace_event CLOCK_TO_EXPANSION_REVIEW \
+                "source=$source id=$cmd_id reason=$clock_to_reason detail={$capture_plan(detail)} original=preserved"
+            add_report_item "CLOCK_TO_EXPANSION_REVIEW source=$source id=$cmd_id reason=$clock_to_reason detail={$capture_plan(detail)} original=preserved"
+        }
+        array unset capture_plan
+    }
     if {$source eq "top" && $from_expr ne "" && $to_expr ne "" &&
+        ![has_clock_or_unknown $raw_to_records] &&
         [clock_expression_is_exact $from_expr $raw_from_records]} {
         array set clock_plan [expand_clock_from_startpoints $raw_from_records $to_records $cmd_id]
         if {$clock_plan(status) eq "resolved"} {
@@ -1323,6 +1344,10 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         set status "review"
         set reason "EDGE_SPECIFIC_OPTION"
     }
+    if {$clock_to_reason ne ""} {
+        set status "review"
+        set reason $clock_to_reason
+    }
     set kind [expr {$from_expr eq "" ? "open_from" : "complete"}]
     return [list \
         id $cmd_id \
@@ -1346,6 +1371,7 @@ proc stage2_delay::segment_from_words {words source file line cmd_id original ha
         split_total 1 \
         harden_inst $harden_inst \
         clock_from_expanded $clock_from_expanded \
+        clock_to_expanded $clock_to_expanded \
         clock_expansion_reason $clock_expansion_reason \
         class "" \
         boundary_pins {} \
@@ -2958,6 +2984,13 @@ proc stage2_delay::classify_top_segment {seg} {
         return "TOP_TO_DIRECTION_UNKNOWN"
     }
     if {![is_harden_boundary_input_record [array get to]]} {
+        if {[info exists s(clock_to_expanded)] && [truthy $s(clock_to_expanded)] &&
+            [top_from_is_harden_boundary_output [array get s]] &&
+            [validate_endpoint_record [array get to]]} {
+            array unset to
+            array unset s
+            return "chain_top_candidate"
+        }
         if {[is_harden_boundary_output_record [array get to]] || [top_from_is_harden_boundary_output [array get s]]} {
             array unset to
             array unset s
@@ -5074,6 +5107,160 @@ proc stage2_delay::clock_expression_is_exact {expr records} {
     return 1
 }
 
+proc stage2_delay::clock_to_seed_expression_is_exact {expr} {
+    set expr [string trim $expr]
+    if {[string length $expr] < 2 || [string index $expr 0] ne "\[" ||
+        [string index $expr end] ne "\]"} { return 0 }
+    set words [tokenize_words [string range $expr 1 end-1]]
+    set getter [lindex $words 0]
+    if {$getter eq "list"} {
+        if {[llength $words] < 2} { return 0 }
+        foreach item [lrange $words 1 end] {
+            if {![clock_to_seed_expression_is_exact $item]} { return 0 }
+        }
+        return 1
+    }
+    if {$getter ni {get_pins get_ports}} { return 0 }
+    foreach word [lrange $words 1 end] {
+        if {$word in {-quiet -exact}} { continue }
+        if {[string match "-*" $word] ||
+            ![structural_exact_pin_name [strip_braces $word]]} { return 0 }
+    }
+    return [expr {[llength [parse_object_expr_records $expr]] > 0}]
+}
+
+proc stage2_delay::expand_clock_to_endpoints {clocks from_expr seeds cmd_id} {
+    if {[catch {set records [prove_clock_to_endpoints $clocks $from_expr $seeds $cmd_id]} detail]} {
+        set reason CLOCK_TO_QUERY_FAILED
+        if {![catch {set tag [lindex $detail 0]}] && [string match CLOCK_TO_* $tag]} {
+            set reason $tag
+        }
+        return [list status review records {} reason $reason detail $detail]
+    }
+    return [list status resolved records $records reason "" detail ""]
+}
+
+proc stage2_delay::clock_to_collection_names {objects} {
+    set names {}
+    foreach_in_collection obj $objects {
+        lappend names [collection_object_name $obj true]
+    }
+    if {[llength $names] != [sizeof_collection $objects] ||
+        [llength [lsort -unique $names]] != [llength $names]} {
+        error [list CLOCK_TO_QUERY_FAILED incomplete_clock_collection]
+    }
+    return [lsort $names]
+}
+
+proc stage2_delay::prove_clock_to_endpoints {clock_records from_expr seeds cmd_id} {
+    variable options
+    # This proof is deliberately restricted to explicit pin/port launches and
+    # ordinary flip-flop data endpoints.  Port output delays, latches, async
+    # checks and gating checks need different capture-clock evidence.
+    if {![clock_to_seed_expression_is_exact $from_expr] || [llength $seeds] == 0} {
+        error [list CLOCK_TO_FROM_UNSUPPORTED explicit_exact_pin_or_port_required]
+    }
+    foreach required {get_clocks get_pins get_cells get_attribute all_fanout sizeof_collection foreach_in_collection} {
+        if {[info commands $required] eq ""} {
+            error [list CLOCK_TO_QUERY_UNAVAILABLE $required]
+        }
+    }
+    set requested [expected_record_names $clock_records]
+    set selected [get_clocks -quiet $requested]
+    if {[sizeof_collection $selected] != [llength $requested] ||
+        [clock_to_collection_names $selected] ne $requested} {
+        error [list CLOCK_TO_SELECTOR_UNRESOLVED requested=$requested]
+    }
+    set candidates [dict create]
+    set examined 0
+    if {[llength $seeds] > $options(-max_endpoints)} {
+        error [list CLOCK_TO_ENDPOINT_LIMIT seed_count]
+    }
+    foreach seed $seeds {
+        array set r $seed
+        if {$r(object_class) ni {pin port} || ![structural_exact_pin_name $r(full_name)]} {
+            error [list CLOCK_TO_FROM_UNSUPPORTED $r(full_name)]
+        }
+        array set start [pt_collection_for_records [list $seed] clock-to-seed]
+        if {!$start(ok)} { error [list CLOCK_TO_SEED_UNRESOLVED $start(reason)] }
+        trace_event CLOCK_TO_FANOUT_BEGIN "id=$cmd_id seed={$r(full_name)} trace_arcs=all"
+        # Do not fall back to full fanout or sampled get_timing_paths.  'all'
+        # also avoids silently dropping endpoints behind disabled/case arcs.
+        set endpoints [all_fanout -flat -endpoints_only -trace_arcs all -from $start(collection)]
+        set count [sizeof_collection $endpoints]
+        incr examined $count
+        trace_event CLOCK_TO_FANOUT_END "id=$cmd_id seed={$r(full_name)} count=$count examined=$examined"
+        if {$examined > $options(-max_endpoints)} {
+            error [list CLOCK_TO_ENDPOINT_LIMIT examined=$examined]
+        }
+        set visited 0
+        foreach_in_collection obj $endpoints {
+            incr visited
+            set name [collection_object_name $obj true]
+            if {$name eq "" || ![structural_exact_pin_name $name]} {
+                error [list CLOCK_TO_ENDPOINT_UNKNOWN unnamed_or_non_exact]
+            }
+            set rec [pt_object_record_from_collection $obj]
+            dict set candidates [record_identity_key $rec] $rec
+        }
+        if {$visited != $count} { error [list CLOCK_TO_ENDPOINT_UNKNOWN incomplete_iteration] }
+        array unset r
+        array unset start
+    }
+    set matched {}
+    foreach key [lsort [dict keys $candidates]] {
+        set rec [dict get $candidates $key]
+        array set e $rec
+        if {$e(object_class) ne "pin" || $e(direction) ne "in" ||
+            [is_immediate_harden_pin_record $rec]} {
+            error [list CLOCK_TO_ENDPOINT_UNSUPPORTED $e(full_name)]
+        }
+        array set target [pt_collection_for_records [list $rec] clock-to-endpoint]
+        if {!$target(ok)} { error [list CLOCK_TO_ENDPOINT_UNKNOWN $e(full_name)] }
+        if {![truthy [get_attribute $target(collection) is_data_pin]]} {
+            error [list CLOCK_TO_ENDPOINT_UNSUPPORTED $e(full_name) not_ff_data_pin]
+        }
+        set cells [get_cells -quiet -of_objects $target(collection)]
+        if {[sizeof_collection $cells] != 1} {
+            error [list CLOCK_TO_CAPTURE_UNKNOWN $e(full_name) cell_not_unique]
+        }
+        set rising [get_attribute $cells is_rise_edge_triggered]
+        set falling [get_attribute $cells is_fall_edge_triggered]
+        if {![truthy $rising] && ![truthy $falling]} {
+            error [list CLOCK_TO_ENDPOINT_UNSUPPORTED $e(full_name) not_edge_triggered_ff]
+        }
+        # A single active clock pin avoids guessing which of several cell
+        # clock pins constrains this particular data pin (e.g. RAM/macro).
+        set cp [get_pins -quiet -of_objects $cells -filter {is_clock_pin == true}]
+        if {[sizeof_collection $cp] != 1} {
+            error [list CLOCK_TO_CAPTURE_UNKNOWN $e(full_name) clock_pin_not_unique]
+        }
+        set capture [get_attribute $cp clocks]
+        set capture_names [clock_to_collection_names $capture]
+        if {[llength $capture_names] == 0 ||
+            [llength $capture_names] != [sizeof_collection $capture]} {
+            error [list CLOCK_TO_CAPTURE_UNKNOWN $e(full_name) no_capture_clocks]
+        }
+        set inside 0
+        set outside 0
+        foreach name $capture_names {
+            if {[lsearch -exact $requested $name] >= 0} { incr inside } else { incr outside }
+        }
+        if {$inside > 0 && $outside > 0} {
+            error [list CLOCK_TO_AMBIGUOUS_CAPTURE $e(full_name) clocks=$capture_names selected=$requested]
+        }
+        if {$inside > 0} {
+            lappend matched [mark_pt_endpoint_record $rec]
+        }
+        trace_event CLOCK_TO_ENDPOINT_PROOF \
+            "id=$cmd_id endpoint={$e(full_name)} capture_clocks={$capture_names} selected=[expr {$inside > 0}]"
+        array unset e
+        array unset target
+    }
+    if {[llength $matched] == 0} { error [list CLOCK_TO_NO_MATCHING_ENDPOINT no_proven_capture_endpoint] }
+    return $matched
+}
+
 proc stage2_delay::pt_clock_names_for_startpoint {rec} {
     array set r $rec
     set class $r(object_class)
@@ -6314,6 +6501,7 @@ proc stage2_delay::review_severity {reason} {
         HARDEN_FROM_DIRECTION_UNKNOWN
     }
     if {[lsearch -exact $error_reasons $reason] >= 0 ||
+        [string match "CLOCK_TO_*" $reason] ||
         [string match "INVALID_*" $reason] ||
         [string match "*DIRECTION_UNKNOWN" $reason]} {
         return ERROR
@@ -6362,6 +6550,9 @@ proc stage2_delay::review_action {reason} {
             return "原约束已保留；检查矩阵对象集合，确认后提高 STAGE2_MAX_SEGMENT_PAIRS 或拆分约束"
         }
         default {
+            if {[string match "CLOCK_TO_*" $reason]} {
+                return "原 clock 约束已保留；检查 CLOCK_TO_EXPANSION_REVIEW 的 endpoint、捕获时钟及 PT 查询，不要用 clock source pin 替代"
+            }
             if {[string match "TOO_MANY_*" $reason]} {
                 return "检查对象展开数量和 max_endpoints/max_enum_objects 设置"
             }
