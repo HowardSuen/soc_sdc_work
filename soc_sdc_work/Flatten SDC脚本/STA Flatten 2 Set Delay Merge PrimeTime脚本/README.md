@@ -645,7 +645,17 @@ python3 run_stage2_report.py ./delay_path_summary \
   -o ./aie_top.xlsx
 ```
 
-Excel 每个 CSV sheet 对应一个 worksheet。每个 worksheet 只保留路径 review
+报告脚本 v0.1.9 会在折叠相同 E2E ID 后自动分表。Excel 每张 worksheet
+最多 1,048,576 行，其中两行是表头，因此默认每表最多 1,048,574 行数据。
+超过时依次生成 `top`、`top_2`、`top_3` 等工作表，保留顺序、全部数据、
+合并高亮、两行表头、冻结窗格及筛选。长名称和大小写重名会自动避让。
+各分表 A1 的使用率仍代表整个来源 CSV，不是该分页单独的统计。
+可用 `--max_rows_per_sheet 100000` 提前分表；参数只计数据行，允许范围
+为 1 至 1,048,574。用法和默认输出文件名保持兼容 Python 3.6。
+分表解决 Excel 行数限制；当前普通 openpyxl workbook 仍在内存中构建，
+总内存需求随整个报告数据量增长。
+
+每个 worksheet 只保留路径 review
 需要的内容：
 
 ```text

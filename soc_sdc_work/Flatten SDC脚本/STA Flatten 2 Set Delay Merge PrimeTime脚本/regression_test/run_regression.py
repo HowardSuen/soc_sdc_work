@@ -498,6 +498,98 @@ def test_report_accepts_large_csv_field():
     workbook.close()
 
 
+def test_report_sheet_row_limit_boundaries():
+    spec = importlib.util.spec_from_file_location("stage2_report_limits", REPORT_TOOL)
+    report = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report)
+    limit = 1048574
+    assert report.MAX_DATA_ROWS == limit
+    for count, expected in (
+        (limit - 1, [(0, limit - 1)]),
+        (limit, [(0, limit)]),
+        (limit + 1, [(0, limit), (limit, limit + 1)]),
+        (2 * limit, [(0, limit), (limit, 2 * limit)]),
+    ):
+        assert list(report.sheet_row_ranges(count)) == expected
+    for invalid in (0, -1, limit + 1):
+        try:
+            list(report.sheet_row_ranges(1, invalid))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Invalid sheet capacity accepted: %s" % invalid)
+
+
+def test_report_split_sheets_preserve_rows_styles_and_usage():
+    from openpyxl import load_workbook
+
+    case_dir = os.path.join(WORK, "report_split_sheets")
+    summary_dir = os.path.join(case_dir, "delay_path_summary")
+    os.makedirs(summary_dir)
+    names = ["top", "TOP_2", "x" * 31, "empty"]
+    with open(os.path.join(summary_dir, "00_index.csv"), "w", newline="") as fout:
+        writer = csv.writer(fout)
+        writer.writerow(["sheet", "file", "max_delay_used", "max_delay_total"])
+        for idx, name in enumerate(names):
+            writer.writerow([name, "%d.csv" % idx, "2", "5"])
+    fields = ["e2e_id", "merge_status", "cmd_id", "stage_1_sdc_delay",
+              "stage_1_from", "stage_1_to", "stage_2_sdc_delay",
+              "stage_2_from", "stage_2_to", "seg_1_cmd_id", "seg_2_cmd_id"]
+    for idx, name in enumerate(names):
+        with open(os.path.join(summary_dir, "%d.csv" % idx), "w", newline="") as fout:
+            writer = csv.DictWriter(fout, fieldnames=fields)
+            writer.writeheader()
+            if name == "empty":
+                continue
+            for number in range(5):
+                writer.writerow(dict(zip(fields, [
+                    "E%d" % number, "MERGED", "C1", "1", "src", "boundary",
+                    "-", "boundary", "dst", "C1", "C2"])))
+            # A late duplicate must combine highlighting with E0 on page 1.
+            writer.writerow(dict(zip(fields, [
+                "E0", "MERGED", "C2", "1", "src", "boundary",
+                "-", "boundary", "dst", "C1", "C2"])))
+    for capacity, parts in ((2, [2, 2, 1]), (5, [5])):
+        output = os.path.join(case_dir, "split_%d.xlsx" % capacity)
+        proc = subprocess.Popen(
+            [sys.executable, REPORT_TOOL, summary_dir, "-o", output,
+             "--max_rows_per_sheet", str(capacity)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=case_dir,
+        )
+        stdout, stderr = proc.communicate()
+        if proc.returncode:
+            raise AssertionError("Report split failed: %r %r" % (stdout, stderr))
+        workbook = load_workbook(output)
+        assert len(workbook.sheetnames) == 3 * len(parts) + 1
+        assert len(set(name.lower() for name in workbook.sheetnames)) == len(workbook.sheetnames)
+        assert all(len(name) <= 31 for name in workbook.sheetnames)
+        if capacity == 2:
+            assert workbook.sheetnames[:3] == ["top", "top_2", "top_3"]
+        for source in range(3):
+            pages = workbook.worksheets[source * len(parts):(source + 1) * len(parts)]
+            ids = []
+            for page, count in zip(pages, parts):
+                assert page.max_row == count + 2
+                assert page["A1"].value == "E2E ID\nMax Delay Used: 2/5"
+                assert page["B1"].value == "Start Point"
+                assert page["E1"].value == "End Point"
+                assert str(page.merged_cells) == "B1:D1 E1:G1"
+                assert page.freeze_panes == "B3"
+                assert page.auto_filter.ref == "A2:G%d" % (count + 2)
+                assert page.column_dimensions["B"].width == 24
+                assert page.row_dimensions[3].height == 44
+                for row in range(3, count + 3):
+                    ids.append(page.cell(row, 1).value)
+                    assert page.cell(row, 2).fill.fgColor.rgb == "00FFF2CC"
+                    assert page.cell(row, 7).value == "NOT FOUND"
+                    assert page.cell(row, 7).fill.fgColor.rgb == "00F4CCCC"
+            assert ids == ["E%d" % number for number in range(5)]
+            assert pages[0]["E3"].fill.fgColor.rgb == "00FFF2CC"
+            assert pages[0]["E4"].fill.fgColor.rgb == "00FFFFFF"
+        assert workbook.worksheets[-1].max_row == 3
+        workbook.close()
+
+
 def test_default_vendor_safety_limits_are_reported():
     result = run_case(
         "default_vendor_safety_limits",
@@ -4714,6 +4806,8 @@ def main():
     tests = [
         test_release_identity_is_reconstructed_without_plaintext_constant,
         test_report_accepts_large_csv_field,
+        test_report_sheet_row_limit_boundaries,
+        test_report_split_sheets_preserve_rows_styles_and_usage,
         test_default_vendor_safety_limits_are_reported,
         test_terminal_harden_input_boundary_is_final_endpoint,
         test_complete_complete_merge,

@@ -20,7 +20,10 @@ except ImportError as exc:
     )
 
 
-VERSION = "v0.1.8"
+VERSION = "v0.1.9"
+EXCEL_MAX_ROWS = 1048576
+HEADER_ROWS = 2
+MAX_DATA_ROWS = EXCEL_MAX_ROWS - HEADER_ROWS
 TOOL_NAME = "run_stage2_report.py"
 STAGE_NAME = "STA Flatten 2 Set Delay Merge PrimeTime Report"
 
@@ -113,7 +116,14 @@ def parse_args(argv):
         default="",
         help="Optional integration_delay_merge.rpt path used to infer top module.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--max_rows_per_sheet", type=int, default=MAX_DATA_ROWS,
+        help="Maximum data rows per worksheet (excluding two header rows). Default: %(default)s",
+    )
+    args = parser.parse_args(argv)
+    if not 1 <= args.max_rows_per_sheet <= MAX_DATA_ROWS:
+        parser.error("--max_rows_per_sheet must be between 1 and %d" % MAX_DATA_ROWS)
+    return args
 
 
 def configure_csv_field_size_limit():
@@ -191,7 +201,7 @@ def safe_sheet_name(name, used):
     base = base[:31]
     candidate = base
     idx = 1
-    while candidate in used:
+    while candidate.lower() in {title.lower() for title in used}:
         suffix = "_%d" % idx
         candidate = (base[: 31 - len(suffix)] + suffix)[:31]
         idx += 1
@@ -490,19 +500,41 @@ def style_data_cell(cell, value, highlighted):
         cell.fill = FILL_NEUTRAL
 
 
-def write_sheet(workbook, sheet_name, rows, used_sheet_names, index_item):
-    ws = workbook.create_sheet(safe_sheet_name(sheet_name, used_sheet_names))
-    max_stage = sheet_stage_count(rows)
-    titles = group_titles(max_stage)
+def sheet_row_ranges(row_count, max_rows_per_sheet=MAX_DATA_ROWS):
+    if not 1 <= max_rows_per_sheet <= MAX_DATA_ROWS:
+        raise ValueError("max_rows_per_sheet must be between 1 and %d" % MAX_DATA_ROWS)
+    for start in range(0, row_count, max_rows_per_sheet):
+        yield start, min(start + max_rows_per_sheet, row_count)
+
+
+def write_sheet(workbook, sheet_name, rows, used_sheet_names, index_item,
+                max_rows_per_sheet=MAX_DATA_ROWS):
+    titles = group_titles(sheet_stage_count(rows))
+    # Collapse across the entire source before splitting, so repeated E2E IDs
+    # and their combined highlights cannot be separated across worksheets.
+    display_rows = collapsed_display_rows(rows or [{}])
+    first_ws = None
+    for part, (start, end) in enumerate(
+            sheet_row_ranges(len(display_rows), max_rows_per_sheet), start=1):
+        suffix = "_%d" % part if part > 1 else ""
+        name = sheet_name[:31 - len(suffix)] + suffix if suffix else sheet_name
+        ws = workbook.create_sheet(safe_sheet_name(name, used_sheet_names))
+        write_sheet_page(ws, titles, display_rows, start, end, index_item)
+        if first_ws is None:
+            first_ws = ws
+        if len(display_rows) > max_rows_per_sheet:
+            print("INFO: Sheet %s -> %s: data rows %d-%d of %d" % (
+                sheet_name, ws.title, start + 1, end, len(display_rows)))
+    return first_ws
+
+
+def write_sheet_page(ws, titles, display_rows, start, end, index_item):
     group_count = len(titles)
     write_group_headers(ws, titles, index_item)
 
-    if not rows:
-        rows = [{}]
-
-    display_rows = collapsed_display_rows(rows)
-
-    for row_idx, item in enumerate(display_rows, start=3):
+    for item_idx in range(start, end):
+        row_idx = item_idx - start + HEADER_ROWS + 1
+        item = display_rows[item_idx]
         row = item["row"]
         highlights = combined_highlighted_groups(item["rows"], group_count)
         style_data_cell(
@@ -538,7 +570,7 @@ def write_sheet(workbook, sheet_name, rows, used_sheet_names, index_item):
     return ws
 
 
-def build_workbook(summary_dir):
+def build_workbook(summary_dir, max_rows_per_sheet=MAX_DATA_ROWS):
     rows = index_rows(summary_dir)
     workbook = Workbook()
     workbook.remove(workbook.active)
@@ -553,7 +585,7 @@ def build_workbook(summary_dir):
         if not os.path.exists(csv_path):
             raise SystemExit("ERROR: sheet CSV not found: %s" % csv_path)
         sheet_rows = read_csv_dicts(csv_path)
-        write_sheet(workbook, sheet, sheet_rows, used_sheet_names, item)
+        write_sheet(workbook, sheet, sheet_rows, used_sheet_names, item, max_rows_per_sheet)
 
     if not workbook.sheetnames:
         raise SystemExit("ERROR: no workbook sheets were created from %s" % summary_dir)
@@ -576,7 +608,7 @@ def main(argv):
     if not out_xlsx.endswith(".xlsx"):
         out_xlsx += ".xlsx"
 
-    workbook = build_workbook(summary_dir)
+    workbook = build_workbook(summary_dir, args.max_rows_per_sheet)
     parent = os.path.dirname(out_xlsx)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent)
