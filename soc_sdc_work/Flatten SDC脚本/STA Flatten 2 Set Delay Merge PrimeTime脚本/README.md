@@ -10,7 +10,7 @@ top delay 段和 harden 内部 delay 段合并成静态 end-to-end
 git 仓库做备份。提交时只纳入本次 Stage 2 相关文件，避免混入其他目录的
 临时文件或未确认改动。
 
-本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.17。Stage 1 以当前目录为准：
+本脚本按本目录中的规则文档实现。当前脚本版本为 v0.9.18。Stage 1 以当前目录为准：
 
 ```text
 ../STA Flatten 1 Harden DC SDC Clean 脚本/
@@ -873,6 +873,72 @@ D_total_min = D_top_min + D_harden_min
 累加，但不会在报告中伪装成真实 0；报告里仍用 `NOT FOUND` 标识。缺失末端
 stage 时，只有 PT 能继续推导出合法 endpoint 才会生成最终约束。
 
+## Top port bus merge（v0.9.18）
+
+最终 flatten SDC 的 `TOP_REMAINING_SDC` 新增非 max/min-delay 的 top port
+bus 压缩，默认开启；不修改输入 top/vendor SDC、不处理 harden SDC，
+也不处理 `set_max_delay/set_min_delay`（它们继续走原 delay merge 流程）。
+
+```tcl
+# top 中同值、同选项、连续的完整 bit 约束
+set_load 0.05 [get_ports {a[0]}]
+set_load 0.05 [get_ports {a[1]}]
+set_load 0.05 [get_ports {a[2]}]
+# 当 PT 实际端口集合恰为以上三个 bit 时，最终输出：
+set_load 0.05 [get_ports {a[*]}]
+```
+
+此功能不局限于 `set_load`，但需要区分两种压缩：
+
+- **单条命令内集合压缩**：对静态 `set_* / remove_* / reset_* / create_*`
+  命令中的显式 `get_ports` 对象参数，检查每个 bus 的完整 bit 列表，等价时
+  替换为 `bus[*]`。也支持由 `[list [get_ports ...] ...]` 组成的 port 参数、
+  同一集合中的多个 bus 及未压缩的 scalar。保留命令调用次数及其他参数。
+- **相邻命令合并**：对下表中的逐对象约束，除一个 port 参数的 bit 外，其他
+  token 必须完全一致；只对同一个 bus 的互不重叠成员合并。其他 port 参数
+  保持原样，不能把 `a[0]→b[0]、a[1]→b[1]` 改成 `a[*]→b[*]`。
+
+| 相邻合并类别 | 已支持命令 |
+| --- | --- |
+| 负载、驱动和电气限制 | `set_load`、`set_drive`、`set_driving_cell`、`set_input_transition`、`set_max_transition`、`set_min_transition`、`set_max_capacitance`、`set_min_capacitance`、`set_max_fanout`、`set_port_fanout_number`、`set_resistance` |
+| I/O delay | `set_input_delay`、`set_output_delay`、`remove_input_delay`、`remove_output_delay` |
+| 逻辑与 case | `set_case_analysis`、`remove_case_analysis`、`set_logic_zero/one/dc` |
+| 路径例外 | `set_false_path`、`set_multicycle_path`、`set_disable_timing` |
+| 时钟及理想网络 | `set_clock_latency/transition/uncertainty/sense`、`set_sense`、`set_ideal_network/latency/transition`、`set_propagated_clock`、`remove_clock_latency/transition/uncertainty`、`remove_ideal_network`、`remove_propagated_clock` |
+| 其他逐对象属性 | `set_dont_touch_network`、`set_dont_touch`、`set_timing_derate` |
+
+`create_clock` 等创建对象的命令和未知 vendor proc 不跨命令合并：多次调用可能
+创建、替换不同对象，不能仅凭文本相同认定等价；符合静态语法的单条集合仍可压缩。
+对于输入/输出 delay，clock、rise/fall、min/max、`-add_delay` 等选项必须完全
+一致。重复对象不合并，保证重复的 additive/increment 调用不被去重。
+
+安全判据和运行行为：
+
+1. PT 中分别查询显式成员和 `get_ports {bus[*]}`，比较排序后的**完整名字集合**，
+   而非只比较位宽或数量。任一 getter 失败、对象名不可解析、集合缺 bit/多匹配，
+   都保留原文。查询结果仅在本次压缩阶段缓存。
+2. 至少 2 个 bit；允许非零起始下标和稀疏下标，但必须覆盖 PT 中该 selector
+   返回的全部 bit。单条候选集合和 PT 返回集合均受 `MAX_ENDPOINTS` 限制。
+3. 只解析静态 Tcl，不执行输入 SDC。变量、`expr`、filter/regexp getter、已有
+   wildcard、复杂拼接等保留原文。标量/单维数字 bus 是自动压缩范围。
+4. 只合并连续命令；注释、空行、其他命令都是屏障。反斜杠续行可处理；含分号的
+   复合行和 Tcl 控制块不改写。文件开头常见的 `current_design <top>`，若字面
+   名称与当前 linked PT design 一致，可以继续压缩；已知 top 作用域下无参数的
+   `current_instance` 也作为安全屏障处理。遇到 `source`、无法核验的作用域/设计切换、控制流或未知
+   Tcl 调用后，不再对该文件剩余部分压缩，以免用 top 对象证明其他作用域。
+5. 新 wildcard getter 不保留 `-exact`（否则不能展开）；顶层约束参数及其值
+   保留。输出 getter 已由 PT 核验集合等价。设计端口变化后应重新生成 flatten SDC。
+
+顶部设置 `STAGE2_TOP_PORT_BUS_MERGE=true`；对应 build 参数
+`-top_port_bus_merge true`。设为 `false` 可关闭本功能，和已有
+`STAGE2_COMPACT_BUS`/open-to 压缩相互独立。
+
+`stage2_live.log` 和 `integration_delay_merge.rpt` 记录：
+`TOP_PORT_BUS_MERGE`（命令、合并数量和输出）、`TOP_PORT_BUS_KEEP`（集合不等价
+或 PT 查询失败）、`TOP_PORT_BUS_SCOPE_KEEP`（后续作用域无法证明）和
+`TOP_PORT_BUS_SUMMARY`（压缩 selector 数、减少的命令数）。这些是格式压缩记录，
+不计入 delay merge 的 consumed/review 统计，也不改变 delay CSV 的含义。
+
 ## Clock-to 展开规则（v0.9.17）
 
 `set_max_delay/set_min_delay -to [get_clocks cap_clk]` 选择由该 clock 捕获的
@@ -1026,6 +1092,7 @@ PT_QUERY: all_fanin -to {u_h0/u_reg/D}
 -max_chain_depth 6
 -compact_bus true
 -compact_bus_min_members 4
+-top_port_bus_merge true
 -batch_open_to_query true
 -metadata_batch_enabled true
 -metadata_batch_size 128

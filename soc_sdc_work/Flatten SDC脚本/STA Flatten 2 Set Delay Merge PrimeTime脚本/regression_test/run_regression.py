@@ -599,7 +599,7 @@ def test_default_vendor_safety_limits_are_reported():
     require_ok(result)
     assert_contains(result["report"], "Max endpoints                  : 10000")
     assert_contains(result["report"], "Max segment pairs               : 500000")
-    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.17")
+    assert_contains(result["out_sdc"], "# E2E_DELAY_MERGE_VERSION  : v0.9.18")
 
 
 def test_terminal_harden_input_boundary_is_final_endpoint():
@@ -5018,6 +5018,295 @@ def test_clock_to_cross_harden_output_chain():
     validate_static_sdc(result['final'])
 
 
+TOP_PORT_BUS_PRELUDE = r'''
+set ::BUS_PORTS {a[0] a[1] a[2] b[0] b[1] b[2] scalar}
+set ::BUS_QUERY_FAILURE ""
+set ::BUS_QUERIES 0
+proc get_ports {args} {
+    incr ::BUS_QUERIES
+    set names {}
+    foreach pattern [lindex $args end] {
+        if {[string range $pattern end-2 end] eq {[*]}} {
+            if {$::BUS_QUERY_FAILURE eq "error"} { error "mock bus query failed" }
+            set base [string range $pattern 0 end-3]
+            foreach name $::BUS_PORTS {
+                if {[regexp {^(.*)\[[0-9]+\]$} $name -> nbase] && $nbase eq $base} {
+                    lappend names $name
+                }
+            }
+            if {$::BUS_QUERY_FAILURE eq "overmatch"} { lappend names other }
+            if {$::BUS_QUERY_FAILURE eq "same_count_wrong_names"} { set names {a[0] a[1] other} }
+        } elseif {[lsearch -exact $::BUS_PORTS $pattern] >= 0} {
+            lappend names $pattern
+        }
+    }
+    return [lsort -unique $names]
+}
+proc get_clocks {args} { return [lindex $args end] }
+rename get_attribute port_bus_default_get_attribute
+proc get_attribute {obj attr} {
+    if {$attr eq "direction" && [lsearch -exact $::BUS_PORTS $obj] >= 0} { return out }
+    if {$attr eq "full_name" && $::BUS_QUERY_FAILURE eq "unnamed"} { error "unresolved collection" }
+    return [port_bus_default_get_attribute $obj $attr]
+}
+'''
+
+
+TOP_PORT_BUS_EQUIVALENCE = r'''
+# Execute original and generated SDC with an independent constraint recorder.
+# Expand each port argument, including from/to products, and compare every
+# (command, options, value, concrete objects) application with multiplicity.
+proc recorder_port_members {arg} {
+    if {[lsearch -exact $::BUS_PORTS $arg] >= 0} { return [list $arg] }
+    set out {}
+    foreach member $arg {
+        if {$member eq $arg} { return {} }
+        set nested [recorder_port_members $member]
+        if {[llength $nested] == 0} { return {} }
+        lappend out {*}$nested
+    }
+    return $out
+}
+proc record_port_constraint {command args} {
+    set products [list [list $command]]
+    foreach arg $args {
+        set ports [recorder_port_members $arg]
+        if {[llength $ports] > 0} { set choices $ports } else { set choices [list $arg] }
+        set next {}
+        foreach prefix $products {
+            foreach choice $choices { lappend next [concat $prefix [list $choice]] }
+        }
+        set products $next
+    }
+    lappend ::BUS_EVENTS {*}$products
+}
+foreach command {
+    set_load set_input_delay set_output_delay set_drive set_driving_cell
+    set_input_transition set_max_transition set_min_capacitance set_max_fanout
+    set_case_analysis set_logic_zero set_false_path set_multicycle_path
+    set_clock_latency set_timing_derate remove_input_delay set_custom_vendor
+    create_clock
+} {
+    proc $command {args} [format {record_port_constraint %s {*}$args} $command]
+}
+set ::BUS_EVENTS {}
+source $::stage2_delay::options(-top_sdc)
+set original_events [lsort $::BUS_EVENTS]
+set ::BUS_EVENTS {}
+source $::stage2_delay::options(-out_final_sdc)
+if {[lsort $::BUS_EVENTS] ne $original_events} {
+    error "PORT_BUS_SEMANTIC_MISMATCH original=$original_events final=[lsort $::BUS_EVENTS]"
+}
+puts "PORT_BUS_EQUIVALENCE_PASS events=[llength $original_events]"
+'''
+
+
+def port_bus_case(name, top, extra_prelude='', extra_args=None, equivalence=True, harden=''):
+    result = run_case('top_port_bus_' + name, top, harden,
+                      prelude=TOP_PORT_BUS_PRELUDE + '\n' + extra_prelude,
+                      extra_build_args=['-generate_clock_group_review', 'false'] + (extra_args or []),
+                      post_build_tcl=TOP_PORT_BUS_EQUIVALENCE if equivalence else '')
+    require_ok(result)
+    if equivalence:
+        assert_text_contains(result['stdout'], 'PORT_BUS_EQUIVALENCE_PASS')
+    case_dir = os.path.dirname(result['final'])
+    if read_file(os.path.join(case_dir, 'top.sdc')) != top:
+        raise AssertionError('Input top SDC was modified')
+    if read_file(os.path.join(case_dir, 'harden.sdc')) != harden:
+        raise AssertionError('Input harden SDC was modified')
+    return result
+
+
+def test_top_port_bus_multiple_constraint_families():
+    templates = [
+        'set_load -min -pin_load 0.05 %s',
+        'set_input_delay -clock [get_clocks clk] -rise -max -add_delay 0.2 %s',
+        'set_output_delay -clock [get_clocks clk] -fall -min 0.3 %s',
+        'set_drive 0.1 %s',
+        'set_driving_cell -lib_cell BUF -pin Z %s',
+        'set_input_transition -rise 0.4 %s',
+        'set_max_transition 0.5 %s',
+        'set_min_capacitance 0.1 %s',
+        'set_max_fanout 8 %s',
+        'set_case_analysis 1 %s',
+        'set_logic_zero %s',
+        'set_false_path -from %s -to [get_pins u_h0/u_reg/D]',
+        'set_multicycle_path 2 -setup -from [get_ports scalar] -to %s',
+        'set_clock_latency -source -early 0.1 %s',
+        'set_timing_derate -increment -early 0.01 %s',
+        'remove_input_delay %s',
+    ]
+    for idx, template in enumerate(templates):
+        top = '\n'.join(template % ('[get_ports {a[%d]}]' % bit) for bit in range(3)) + '\n'
+        result = port_bus_case('family_%02d' % idx, top)
+        assert_contains(result['final'], template % '[get_ports {a[*]}]')
+        assert_contains(result['report'], 'commands_removed=2')
+        assert_contains(result['trace'], 'TOP_PORT_BUS_MERGE')
+
+
+def test_top_port_bus_single_command_generic_collections():
+    commands = [
+        'set_custom_vendor -mode {any literal} [get_ports -quiet -exact {a[0] a[1] a[2] scalar}]',
+        'create_clock -name BUSCLK -period 10 [get_ports {a[0] a[1] a[2]}]',
+        'set_false_path -from [get_ports {a[0] a[1] a[2]}] -to [get_ports {b[0] b[1] b[2]}]',
+        'set_load 0.1 [list [get_ports {a[0]}] [get_ports {a[1]}] [get_ports {a[2]}]]',
+    ]
+    for idx, command in enumerate(commands):
+        result = port_bus_case('single_%d' % idx, command + '\n')
+        assert_contains(result['final'], 'a[*]')
+        assert_contains(result['report'], 'commands_removed=0')
+
+
+def test_top_port_bus_missing_bits_values_options_and_clocks():
+    variants = [
+        'set_load 0.1 [get_ports {a[0]}]\nset_load 0.1 [get_ports {a[1]}]\n',
+        'set_load 0.1 [get_ports {a[0]}]\nset_load 0.1 [get_ports {a[1]}]\nset_load 0.2 [get_ports {a[2]}]\n',
+        'set_load -min 0.1 [get_ports {a[0]}]\nset_load -min 0.1 [get_ports {a[1]}]\nset_load -max 0.1 [get_ports {a[2]}]\n',
+        'set_input_delay -clock [get_clocks clk] 1 [get_ports {a[0]}]\nset_input_delay -clock [get_clocks clk] 1 [get_ports {a[1]}]\nset_input_delay -clock [get_clocks other] 1 [get_ports {a[2]}]\n',
+        'set_input_delay -rise 1 [get_ports {a[0]}]\nset_input_delay -rise 1 [get_ports {a[1]}]\nset_input_delay -fall 1 [get_ports {a[2]}]\n',
+    ]
+    for idx, top in enumerate(variants):
+        result = port_bus_case('mismatch_%d' % idx, top)
+        assert_not_contains(result['final'], 'a[*]')
+        assert_contains(result['final'], top.rstrip())
+
+
+def test_top_port_bus_no_cartesian_widening_or_duplicate_loss():
+    diagonal = '\n'.join('set_false_path -from [get_ports {a[%d]}] -to [get_ports {b[%d]}]' % (i, i) for i in range(3)) + '\n'
+    result = port_bus_case('diagonal', diagonal)
+    assert_contains(result['final'], diagonal.rstrip())
+    assert_not_contains(result['final'], 'a[*]')
+    # Keep every repeated additive application, not just unique constraints.
+    repeated = '\n'.join('set_input_delay -add_delay 1 [get_ports {a[%d]}]' % i for i in (0, 0, 1, 2, 2)) + '\n'
+    result = port_bus_case('duplicates', repeated)
+    assert_contains(result['final'], 'a[*]')
+    assert_text_contains(result['stdout'], 'PORT_BUS_EQUIVALENCE_PASS events=5')
+    for command in ('create_clock -name c -period 10', 'set_custom_vendor -mode test'):
+        top = '\n'.join(command + ' [get_ports {a[%d]}]' % i for i in range(3)) + '\n'
+        result = port_bus_case('non_distributive_' + command.split()[0], top)
+        assert_contains(result['final'], top.rstrip())
+        assert_not_contains(result['final'], 'a[*]')
+
+
+def test_top_port_bus_query_failures_preserve_original():
+    top = '\n'.join('set_load 0.1 [get_ports {a[%d]}]' % i for i in range(3)) + '\n'
+    for mode in ('error', 'overmatch', 'same_count_wrong_names', 'unnamed'):
+        result = port_bus_case('query_' + mode, top,
+                              extra_prelude='set ::BUS_QUERY_FAILURE %s' % mode, equivalence=False)
+        assert_contains(result['final'], top.rstrip())
+        assert_contains(result['report'], 'TOP_PORT_BUS_KEEP')
+        assert_not_contains(result['final'], 'a[*]')
+    for setup in ('rename get_ports {}', 'rename foreach_in_collection {}'):
+        result = port_bus_case('missing_' + setup.split()[1], top, extra_prelude=setup, equivalence=False)
+        assert_contains(result['final'], top.rstrip())
+
+
+def test_top_port_bus_barriers_scope_dynamic_and_multiline():
+    first = 'set_load 0.1 [get_ports {a[0]}]\n'
+    rest = 'set_load 0.1 [get_ports {a[1]}]\nset_load 0.1 [get_ports {a[2]}]\n'
+    for idx, barrier in enumerate(('# keep this comment\n', '\n', 'set x 1\n', 'set_load 0.2 [get_ports scalar]\n')):
+        top = first + barrier + rest
+        result = port_bus_case('barrier_%d' % idx, top)
+        assert_contains(result['final'], top.rstrip())
+        assert_not_contains(result['final'], 'a[*]')
+    whole = 'set_load 0.1 [get_ports {a[0] a[1] a[2]}]\n'
+    for idx, prefix in enumerate(('current_instance u_h0\n', 'source vendor.tcl\n',
+                                 'if {1} {current_instance u_h0}\n', 'set x [current_instance u_h0]\n',
+                                 'vendor_setup\n')):
+        result = port_bus_case('scope_%d' % idx, prefix + whole, equivalence=False)
+        assert_contains(result['final'], (prefix + whole).rstrip())
+        assert_not_contains(result['final'], 'a[*]')
+    opaque = ['if {1} {\n' + whole + '}\n',
+              'set_load $load [get_ports {a[0] a[1] a[2]}]\n',
+              'set_load 0.1 [get_ports {a[0]}]; set_load 0.1 [get_ports {a[1] a[2]}]\n']
+    for idx, top in enumerate(opaque):
+        result = port_bus_case('opaque_%d' % idx, top, equivalence=False)
+        assert_contains(result['final'], top.rstrip())
+    multiline = ''.join('set_load \\\n  0.1 [get_ports {a[%d]}]\n' % i for i in range(3))
+    result = port_bus_case('multiline', multiline)
+    assert_contains(result['final'], 'set_load 0.1 [get_ports {a[*]}]')
+
+
+def test_top_port_bus_nonzero_sparse_indices_and_multibus():
+    for suffix, bits in (('nonzero', (4, 5, 6)), ('sparse', (0, 2, 7))):
+        top = '\n'.join('set_load 0.1 [get_ports {a[%d]}]' % i for i in bits) + '\n'
+        setup = 'set ::BUS_PORTS {%s}' % ' '.join('a[%d]' % i for i in bits)
+        result = port_bus_case(suffix, top, extra_prelude=setup)
+        assert_contains(result['final'], 'set_load 0.1 [get_ports {a[*]}]')
+    top = 'set_load 0.1 [get_ports {a[0] a[1] a[2] b[0] b[1] b[2] scalar}]\n'
+    result = port_bus_case('multibus', top)
+    assert_contains(result['final'], '[get_ports {a[*] b[*] scalar}]')
+
+
+def test_top_port_bus_option_limits_and_harden_unchanged():
+    top = '\n'.join('set_load 0.1 [get_ports {a[%d]}]' % i for i in range(3)) + '\n'
+    result = port_bus_case('disabled', top, extra_args=['-top_port_bus_merge', 'false'])
+    assert_contains(result['final'], top.rstrip())
+    assert_not_contains(result['trace'], 'TOP_PORT_BUS_MERGE')
+    result = port_bus_case('limit', top, extra_args=['-max_endpoints', '2'])
+    assert_contains(result['final'], top.rstrip())
+    harden = 'set_load 0.4 [get_ports {a[0] a[1] a[2]}]\n'
+    result = port_bus_case('harden', top, harden=harden, equivalence=False)
+    assert_contains(result['final'], 'set_load 0.1 [get_ports {a[*]}]')
+    assert_contains(result['final'], harden.rstrip())
+    # Directly test the non-delay pass so the existing delay pipeline cannot
+    # hide an accidental change to max/min commands.
+    post = r'''
+foreach cmd {set_max_delay set_min_delay} {
+    set original [format {%s 1 -from [get_ports {a[0] a[1] a[2]}] -to [get_pins {u_h0/u_reg/D}]} $cmd]
+    if {[stage2_delay::compact_top_port_commands $original] ne $original} {
+        error "delay command was modified by the non-delay bus pass"
+    }
+}
+'''
+    result = run_case('top_port_bus_delay_exclusion', '', '', prelude=TOP_PORT_BUS_PRELUDE,
+                      extra_build_args=['-generate_clock_group_review', 'false'], post_build_tcl=post)
+    require_ok(result)
+
+
+def test_top_port_bus_large_bus_queries_are_bounded_and_cached():
+    count = 1024
+    ports = ['data[%d]' % i for i in range(count)]
+    top = '\n'.join('set_load 0.1 [get_ports {%s}]' % p for p in ports) + '\n'
+    # A second command family on the same bus reuses set-equivalence proof.
+    top += '\n'.join('set_drive 0.2 [get_ports {%s}]' % p for p in ports) + '\n'
+    result = run_case('top_port_bus_scale', top, '',
+                      prelude=TOP_PORT_BUS_PRELUDE + '\nset ::BUS_PORTS {%s}' % ' '.join(ports),
+                      extra_build_args=['-generate_clock_group_review', 'false'],
+                      post_build_tcl='puts "PORT_QUERY_COUNT=$::BUS_QUERIES"\n' + TOP_PORT_BUS_EQUIVALENCE)
+    require_ok(result)
+    assert_contains(result['final'], 'set_load 0.1 [get_ports {data[*]}]')
+    assert_contains(result['final'], 'set_drive 0.2 [get_ports {data[*]}]')
+    assert_contains(result['report'], 'commands_removed=2046')
+    assert_text_contains(result['stdout'], 'PORT_QUERY_COUNT=2')
+    assert_text_contains(result['stdout'], 'PORT_BUS_EQUIVALENCE_PASS events=2048')
+
+
+def test_top_port_bus_complex_getters_are_not_reinterpreted():
+    variants = [
+        'set_load 0.1 [get_ports -filter true {a[0] a[1] a[2]}]',
+        'set_load 0.1 [get_ports -regexp {a[0] a[1] a[2]}]',
+        'set_load 0.1 [get_ports {a[*]}]',
+        'set_load [expr {0.05 * 2}] [get_ports {a[0] a[1] a[2]}]',
+        'set_load 0.1 [get_ports {a[0]}{a[1] a[2]}]',
+    ]
+    for idx, top in enumerate(variants):
+        result = port_bus_case('complex_getter_%d' % idx, top + '\n', equivalence=False)
+        assert_contains(result['final'], top)
+        assert_not_contains(result['trace'], 'TOP_PORT_BUS_MERGE')
+
+
+def test_top_port_bus_verified_top_header_is_supported():
+    body = '\n'.join('set_load 0.1 [get_ports {a[%d]}]' % i for i in range(3)) + '\n'
+    top = 'set sdc_version 2.1\ncurrent_design current_integration_top\ncurrent_instance\n' + body
+    result = port_bus_case('top_header', top, equivalence=False)
+    assert_contains(result['final'], 'current_design current_integration_top\ncurrent_instance\n')
+    assert_contains(result['final'], 'set_load 0.1 [get_ports {a[*]}]')
+    result = port_bus_case('other_design_header', 'current_design other\n' + body, equivalence=False)
+    assert_contains(result['final'], body.rstrip())
+    assert_contains(result['trace'], 'TOP_PORT_BUS_SCOPE_KEEP')
+
+
 def main():
     if os.path.isdir(WORK):
         shutil.rmtree(WORK)
@@ -5043,6 +5332,17 @@ def main():
         test_clock_to_complete_endpoint_set_filters_unselected_domains,
         test_clock_to_unresolved_capture_name_aborts_after_valid_endpoint,
         test_clock_to_top_complete_path_preserves_native_selector,
+        test_top_port_bus_multiple_constraint_families,
+        test_top_port_bus_single_command_generic_collections,
+        test_top_port_bus_missing_bits_values_options_and_clocks,
+        test_top_port_bus_no_cartesian_widening_or_duplicate_loss,
+        test_top_port_bus_query_failures_preserve_original,
+        test_top_port_bus_barriers_scope_dynamic_and_multiline,
+        test_top_port_bus_nonzero_sparse_indices_and_multibus,
+        test_top_port_bus_option_limits_and_harden_unchanged,
+        test_top_port_bus_large_bus_queries_are_bounded_and_cached,
+        test_top_port_bus_complex_getters_are_not_reinterpreted,
+        test_top_port_bus_verified_top_header_is_supported,
         test_clock_from_skips_unclocked_primary_input_startpoint,
         test_exact_clock_from_selector_limit_preserves_original,
         test_clock_from_startpoints_only_failure_preserves_original,

@@ -111,6 +111,10 @@ set ::STAGE2_SPARSE_MATRIX_PRUNE true
 # if the linked PT version rejects the collection form.
 set ::STAGE2_COMPACT_BUS true
 set ::STAGE2_COMPACT_BUS_MIN_MEMBERS 4
+
+# Compress exact, complete top-port buses in non-max/min-delay commands of
+# TOP_REMAINING_SDC. This is independent of delay/open-to bus compression.
+set ::STAGE2_TOP_PORT_BUS_MERGE true
 set ::STAGE2_BATCH_OPEN_TO_QUERY true
 
 # When reverse all_fanin cannot identify a harden boundary input, the legacy
@@ -164,7 +168,7 @@ set ::OUT_CLOCK_GROUP_REVIEW_SDC ""
 set ::STAGE2_SCRIPT_FILE [file normalize [info script]]
 
 namespace eval stage2_delay {
-    variable VERSION "v0.9.17"
+    variable VERSION "v0.9.18"
     variable TOOL_NAME "run_stage2_merge_delay.tcl"
     variable STAGE_NAME "STA Flatten 2 Set Delay Merge PrimeTime"
 
@@ -239,6 +243,7 @@ namespace eval stage2_delay {
         -sparse_matrix_prune "true"
         -compact_bus "true"
         -compact_bus_min_members 4
+        -top_port_bus_merge "true"
         -batch_open_to_query "true"
         -batch_boundary_fanout_query "true"
         -boundary_fanout_batch_size 16
@@ -6957,6 +6962,7 @@ proc stage2_delay::write_report {path} {
     puts $fout "Partial merge policy            : $options(-partial_merge_policy)"
     puts $fout "Bus compression                 : $options(-compact_bus)"
     puts $fout "Bus compression minimum members : $options(-compact_bus_min_members)"
+    puts $fout "Top port bus merge              : $options(-top_port_bus_merge)"
     puts $fout "Batch open-to PT query          : $options(-batch_open_to_query)"
     puts $fout "Batch boundary fanout query     : $options(-batch_boundary_fanout_query)"
     puts $fout "Boundary fanout batch size      : $options(-boundary_fanout_batch_size)"
@@ -7050,7 +7056,11 @@ proc stage2_delay::write_final_sdc {path} {
     puts $fout ""
 
     write_final_section_header $fout "TOP_REMAINING_SDC" $options(-top_sdc)
-    puts $fout [remaining_sdc_text $options(-top_sdc)]
+    set top_remaining [remaining_sdc_text $options(-top_sdc)]
+    if {[truthy $options(-top_port_bus_merge)]} {
+        set top_remaining [compact_top_port_commands $top_remaining]
+    }
+    puts $fout $top_remaining
     puts $fout ""
 
     write_final_section_header $fout "GENERATED_E2E_DELAY_SDC" $options(-out_e2e_sdc)
@@ -7465,6 +7475,320 @@ proc stage2_delay::csv_quote {value} {
     return "\"$value\""
 }
 
+proc stage2_delay::port_bus_static_literal {word} {
+    # Do not evaluate input Tcl. Braced literals are safe; unquoted/quoted
+    # words must contain no substitution, escapes, or command separators.
+    if {[string first "\\" $word] >= 0} { return 0 }
+    if {[string index $word 0] eq "\{" && [string index $word end] eq "\}"} {
+        return [info complete "list $word"]
+    }
+    if {[string index $word 0] eq "\"" && [string index $word end] eq "\""} {
+        set word [string range $word 1 end-1]
+    }
+    return [expr {![regexp {[\s$\[\]{}";#]} $word]}]
+}
+
+proc stage2_delay::port_bus_static_getter {word} {
+    if {[string index $word 0] ne "\[" || [string index $word end] ne "\]"} { return {} }
+    set inner [string trim [string range $word 1 end-1]]
+    set words [tokenize_words $inner]
+    regsub -all {\s+} $inner { } normalized
+    regsub -all {\s+} [join $words " "] { } joined
+    if {$normalized ne $joined} { return {} }
+    set getter [lindex $words 0]
+    if {$getter eq "list"} {
+        set names {}
+        foreach part [lrange $words 1 end] {
+            set item [port_bus_static_getter $part]
+            if {$item eq "" || [dict get $item getter] ne "get_ports"} { return {} }
+            lappend names {*}[dict get $item names]
+        }
+        if {[llength $names] == 0} { return {} }
+        return [dict create getter get_ports names $names]
+    }
+    if {$getter ni {get_ports get_pins get_clocks get_cells get_nets}} { return {} }
+    set names {}
+    foreach arg [lrange $words 1 end] {
+        if {$arg in {-quiet -exact}} { continue }
+        if {[string match "-*" $arg]} { return {} }
+        if {![port_bus_static_literal $arg]} { return {} }
+        set value [strip_braces $arg]
+        if {[catch {llength $value}]} { return {} }
+        foreach name $value {
+            if {![regexp {^[[:alnum:]_./:+-]+(\[[0-9]+\])*$} $name]} { return {} }
+            lappend names $name
+        }
+    }
+    if {[llength $names] == 0} { return {} }
+    return [dict create getter $getter names $names]
+}
+
+proc stage2_delay::port_bus_command_plan {raw} {
+    # info complete in the outer scanner keeps control/proc bodies opaque.
+    # Semicolon lines and comments are barriers, not rewritten substrings.
+    regsub -all {\\\r?\n[ \t]*} $raw { } logical
+    set logical [string trim $logical]
+    if {[regexp {[;#]} $logical]} { return {} }
+    set words [tokenize_words $logical]
+    set command [lindex $words 0]
+    if {![regexp {^(set|remove|reset|create)_[a-zA-Z0-9_]+$} $command] ||
+        $command in {set_max_delay set_min_delay}} { return {} }
+    regsub -all {\s+} $logical { } normalized
+    regsub -all {\s+} [join $words " "] { } joined
+    if {$normalized ne $joined} { return {} }
+    set slots [dict create]
+    for {set idx 1} {$idx < [llength $words]} {incr idx} {
+        set word [lindex $words $idx]
+        if {[port_bus_static_literal $word]} { continue }
+        set item [port_bus_static_getter $word]
+        if {$item eq ""} { return {} }
+        if {[dict get $item getter] eq "get_ports"} {
+            dict set slots $idx [dict get $item names]
+        }
+    }
+    if {[dict size $slots] == 0} { return {} }
+    return [dict create words $words slots $slots raws [list $raw] varying -1]
+}
+
+proc stage2_delay::port_bus_distributive_command {command} {
+    # Cross-command union needs a semantic rule. Object-creating commands
+    # (especially create_clock) and arbitrary vendor procs are NOT covered by
+    # mere textual equality. They may still compact a collection in one call.
+    return [expr {$command in {
+        set_load set_drive set_driving_cell set_input_transition
+        set_input_delay set_output_delay set_max_transition set_min_transition
+        set_max_capacitance set_min_capacitance set_max_fanout
+        set_port_fanout_number set_case_analysis set_logic_zero set_logic_one
+        set_logic_dc set_false_path set_multicycle_path set_disable_timing
+        set_clock_latency set_clock_transition set_clock_uncertainty
+        set_clock_sense set_sense set_ideal_network set_ideal_latency
+        set_ideal_transition set_propagated_clock set_dont_touch_network
+        set_dont_touch set_timing_derate set_resistance
+        remove_input_delay remove_output_delay remove_case_analysis
+        remove_clock_latency remove_clock_transition remove_clock_uncertainty
+        remove_ideal_network remove_propagated_clock
+    }}]
+}
+
+proc stage2_delay::port_bus_single_base {names} {
+    set base ""
+    foreach name $names {
+        if {![regexp {^([[:alnum:]_./:+-]+)\[[0-9]+\]$} $name -> current]} { return "" }
+        if {$base ne "" && $current ne $base} { return "" }
+        set base $current
+    }
+    return $base
+}
+
+proc stage2_delay::port_bus_join_plans {pending next} {
+    variable options
+    set words [dict get $pending words]
+    set other [dict get $next words]
+    if {![port_bus_distributive_command [lindex $words 0]] ||
+        [llength $words] != [llength $other]} { return {} }
+    set differing {}
+    for {set idx 0} {$idx < [llength $words]} {incr idx} {
+        if {[lindex $words $idx] ne [lindex $other $idx]} { lappend differing $idx }
+    }
+    # Never replace a diagonal from/to relation by its Cartesian product.
+    if {[llength $differing] != 1} { return {} }
+    set idx [lindex $differing 0]
+    if {![dict exists $pending slots $idx] || ![dict exists $next slots $idx] ||
+        ([dict get $pending varying] >= 0 && [dict get $pending varying] != $idx)} { return {} }
+    set names [dict get $pending slots $idx]
+    set extra [dict get $next slots $idx]
+    set base [port_bus_single_base $names]
+    if {$base eq "" || $base ne [port_bus_single_base $extra]} { return {} }
+    set union [concat $names $extra]
+    # Disjoint objects preserve additive/increment flags and repeated calls.
+    if {[llength $union] > $options(-max_endpoints) ||
+        [llength $union] != [llength [lsort -unique $union]]} { return {} }
+    dict set pending slots $idx $union
+    dict set pending varying $idx
+    dict lappend pending raws {*}[dict get $next raws]
+    return $pending
+}
+
+proc stage2_delay::port_bus_query_names {patterns} {
+    variable options
+    foreach required {get_ports sizeof_collection foreach_in_collection} {
+        if {[info commands $required] eq ""} { error "missing_command:$required" }
+    }
+    set objects [get_ports -quiet $patterns]
+    set count [sizeof_collection $objects]
+    if {$count > $options(-max_endpoints)} { error "port_collection_limit:$count" }
+    set names {}
+    foreach_in_collection obj $objects {
+        lappend names [collection_object_name $obj true]
+    }
+    if {[llength $names] != $count || [llength [lsort -unique $names]] != $count} {
+        error "incomplete_port_collection"
+    }
+    return [lsort $names]
+}
+
+proc stage2_delay::port_bus_compact_names {names cache_name} {
+    upvar 1 $cache_name cache
+    variable options
+    if {[llength $names] < 2 || [llength $names] > $options(-max_endpoints) ||
+        [llength $names] != [llength [lsort -unique $names]]} { return $names }
+    set groups [dict create]
+    foreach name $names {
+        set base [port_bus_single_base [list $name]]
+        if {$base ne ""} { dict lappend groups $base $name }
+    }
+    set replacements [dict create]
+    dict for {base members} $groups {
+        if {[llength $members] < 2} { continue }
+        set selector "${base}\[*\]"
+        set expected [lsort $members]
+        set key [list $selector $expected]
+        if {![dict exists $cache $key]} {
+            set reason ""
+            if {[catch {
+                set actual [port_bus_query_names [list $selector]]
+                set explicit [port_bus_query_names $members]
+            } detail]} {
+                set reason "PT_QUERY_FAILED:$detail"
+            } elseif {$actual ne $expected || $explicit ne $expected} {
+                set reason PORT_SET_MISMATCH
+            }
+            dict set cache $key [expr {$reason eq ""}]
+            if {$reason ne ""} {
+                trace_event TOP_PORT_BUS_KEEP "selector={$selector} reason={$reason} original=preserved"
+                add_report_item "TOP_PORT_BUS_KEEP selector={$selector} reason={$reason} original=preserved"
+            }
+        }
+        if {[dict get $cache $key]} { dict set replacements $base $selector }
+    }
+    set out {}
+    set emitted [dict create]
+    foreach name $names {
+        set base [port_bus_single_base [list $name]]
+        if {[dict exists $replacements $base]} {
+            if {![dict exists $emitted $base]} {
+                lappend out [dict get $replacements $base]
+                dict set emitted $base 1
+            }
+        } else { lappend out $name }
+    }
+    return $out
+}
+
+proc stage2_delay::port_bus_emit_plan {plan cache_name stats_name} {
+    upvar 1 $cache_name cache $stats_name stats
+    set words [dict get $plan words]
+    set varying [dict get $plan varying]
+    set raws [dict get $plan raws]
+    if {$varying >= 0} {
+        set names [dict get $plan slots $varying]
+        if {[port_bus_compact_names $names cache] eq $names} {
+            set out ""
+            foreach raw $raws {
+                append out [port_bus_emit_plan [port_bus_command_plan $raw] cache stats]
+            }
+            return $out
+        }
+    }
+    set changed 0
+    dict for {idx names} [dict get $plan slots] {
+        set compact [port_bus_compact_names $names cache]
+        if {$compact ne $names} {
+            # -exact cannot be kept on a wildcard query. PT has already proved
+            # that both the explicit names and the new selector are identical.
+            lset words $idx "\[get_ports \{[join $compact { }]\}\]"
+            incr changed
+        }
+    }
+    if {!$changed} { return [join $raws ""] }
+    dict incr stats selectors $changed
+    dict incr stats commands_removed [expr {[llength $raws] - 1}]
+    set message "command=[lindex $words 0] original_commands=[llength $raws] compacted_selectors=$changed result={[join $words { }]}"
+    trace_event TOP_PORT_BUS_MERGE $message
+    add_report_item "TOP_PORT_BUS_MERGE $message"
+    return "[join $words { }]\n"
+}
+
+proc stage2_delay::compact_top_port_commands {text} {
+    # A separate non-evaluating scanner preserves original text, comments and
+    # Tcl blocks. It does not use the delay scanner's line-offset fallback.
+    set out ""
+    set buf ""
+    set pending {}
+    set cache [dict create]
+    set stats [dict create selectors 0 commands_removed 0]
+    set top_scope 1
+    set lines [split $text "\n"]
+    set last [expr {[llength $lines] - 1}]
+    for {set line 0} {$line <= $last} {incr line} {
+        append buf [lindex $lines $line]
+        if {$line < $last} { append buf "\n" }
+        if {![info complete $buf]} { continue }
+        set plan {}
+        if {$top_scope} { set plan [port_bus_command_plan $buf] }
+        # Scope/database-changing Tcl is deliberately opaque. Once encountered,
+        # current linked top objects cannot prove the rest of this file's scope.
+        set scope_words [tokenize_words [string trim $buf]]
+        set head [lindex $scope_words 0]
+        set was_top_scope $top_scope
+        set safe_root_header 0
+        if {$top_scope && $head eq "current_instance" && [llength $scope_words] == 1} {
+            set safe_root_header 1
+        }
+        if {$top_scope && $head eq "current_design" && [llength $scope_words] == 2 &&
+            [port_bus_static_literal [lindex $scope_words 1]]} {
+            # DC write_sdc commonly starts with current_design <top>. Accept
+            # only a literal name verified against the current linked design.
+            if {![catch {set linked_top [collection_object_name [current_design] true]}]} {
+                set safe_root_header [expr {[strip_braces [lindex $scope_words 1]] eq $linked_top}]
+            }
+        }
+        if {!$safe_root_header && $head in {current_instance current_design source eval uplevel namespace
+            link read_verilog read_db read_ddc read_sdc create_port remove_port
+            rename_object change_names if foreach for while switch catch try}} {
+            set top_scope 0
+            set plan {}
+        }
+        # Unknown Tcl calls may change current_instance or the linked design.
+        # Literal variable assignments and proc definitions do not execute a
+        # body and are safe barriers; computed assignments are opaque.
+        if {!$safe_root_header && $head ne "" && ![string match "#*" $head] &&
+            ![regexp {^(set|remove|reset|create)_[a-zA-Z0-9_]+$} $head] &&
+            $head ne "proc"} {
+            set safe_set [expr {$head eq "set" && [llength $scope_words] == 3}]
+            if {$safe_set} {
+                foreach word [lrange $scope_words 1 end] {
+                    if {![port_bus_static_literal $word]} { set safe_set 0 }
+                }
+            }
+            if {!$safe_set} { set top_scope 0; set plan {} }
+        }
+        if {$was_top_scope && !$top_scope} {
+            set message "line=[expr {$line + 1}] command={$head} reason=OPAQUE_SCOPE_OR_DESIGN_CHANGE remaining_top_text=preserved"
+            trace_event TOP_PORT_BUS_SCOPE_KEEP $message
+            add_report_item "TOP_PORT_BUS_SCOPE_KEEP $message"
+        }
+        if {$pending ne "" && $plan ne ""} {
+            set joined [port_bus_join_plans $pending $plan]
+            if {$joined ne ""} {
+                set pending $joined
+                set buf ""
+                continue
+            }
+        }
+        if {$pending ne ""} {
+            append out [port_bus_emit_plan $pending cache stats]
+            set pending {}
+        }
+        if {$plan ne ""} { set pending $plan } else { append out $buf }
+        set buf ""
+    }
+    if {$pending ne ""} { append out [port_bus_emit_plan $pending cache stats] }
+    append out $buf
+    add_report_item "TOP_PORT_BUS_SUMMARY enabled=true [join_kv $stats]"
+    return $out
+}
+
 proc stage2_delay::remaining_sdc_text {path} {
     variable consumed_source_files
 
@@ -7827,6 +8151,7 @@ proc stage2_delay::run_from_user_settings {} {
     set sparse_matrix_prune [global_setting STAGE2_SPARSE_MATRIX_PRUNE true]
     set compact_bus [global_setting STAGE2_COMPACT_BUS true]
     set compact_bus_min_members [global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS 4]
+    set top_port_bus_merge [global_setting STAGE2_TOP_PORT_BUS_MERGE true]
     set batch_open_to_query [global_setting STAGE2_BATCH_OPEN_TO_QUERY true]
     set batch_boundary_fanout_query [global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY true]
     set boundary_fanout_batch_size [global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE 16]
@@ -7868,6 +8193,7 @@ proc stage2_delay::run_from_user_settings {} {
     set_global_setting MAX_CHAIN_DEPTH $max_chain_depth
     set_global_setting STAGE2_COMPACT_BUS $compact_bus
     set_global_setting STAGE2_COMPACT_BUS_MIN_MEMBERS $compact_bus_min_members
+    set_global_setting STAGE2_TOP_PORT_BUS_MERGE $top_port_bus_merge
     set_global_setting STAGE2_BATCH_OPEN_TO_QUERY $batch_open_to_query
     set_global_setting STAGE2_BATCH_BOUNDARY_FANOUT_QUERY $batch_boundary_fanout_query
     set_global_setting STAGE2_BOUNDARY_FANOUT_BATCH_SIZE $boundary_fanout_batch_size
@@ -7898,6 +8224,7 @@ proc stage2_delay::run_from_user_settings {} {
     puts "INFO: Top port map mode   : $top_port_boundary_map_mode"
     puts "INFO: Recursive mode      : $recursive_chain_mode"
     puts "INFO: Bus compression     : $compact_bus (min members=$compact_bus_min_members)"
+    puts "INFO: Top port bus merge  : $top_port_bus_merge"
     puts "INFO: Batch open-to query : $batch_open_to_query"
     puts "INFO: Boundary fanout     : $batch_boundary_fanout_query (size=$boundary_fanout_batch_size min=$boundary_fanout_batch_min_members)"
     puts "INFO: Metadata batch      : $metadata_batch_enabled (size=$metadata_batch_size)"
@@ -7940,6 +8267,7 @@ proc stage2_delay::run_from_user_settings {} {
         -sparse_matrix_prune $sparse_matrix_prune \
         -compact_bus $compact_bus \
         -compact_bus_min_members $compact_bus_min_members \
+        -top_port_bus_merge $top_port_bus_merge \
         -batch_open_to_query $batch_open_to_query \
         -batch_boundary_fanout_query $batch_boundary_fanout_query \
         -boundary_fanout_batch_size $boundary_fanout_batch_size \
